@@ -4,6 +4,6 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "@edgeone/pages-blob": "^1.0.0"
+    "@edgeone/pages-blob": "^0.0.18"
   }
 }
