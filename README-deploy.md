@@ -14,7 +14,7 @@
 | CF 组件 | 腾讯侧替代 |
 |---|---|
 | `export default { fetch }` 入口 | `onRequest(context)` 桥接（`functions/api/[[default]].js` 尾部） |
-| Durable Object `DownloadGate` | EdgeOne KV（绑定名 **`CSH_STATE`**），同协议 shim：`idFromName().fetch()` 调用面不变 |
+| Durable Object `DownloadGate` | 状态存储二选一（自动优先级）：① EdgeOne KV（绑定名 **`CSH_STATE`**）；② EdgeOne Blob（`@edgeone/pages-blob`，命名空间 `csh-state`，免审批免配置，首次调用自动创建）。两者同协议 shim：`idFromName().fetch()` 调用面不变 |
 | `cloudflare:sockets` TCP 中继 | OSS V4 预签名直连 HTTPS（`ossSignedUrl` + 重写的 `relayOpen` / `relayListDetailed`） |
 | `scheduled` cron（孤儿回收） | 懒触发：`/api/dl-ticket` 每 20 分钟搭车执行一次 `runGc`；`/api/gc` 手动接口保留 |
 | Response.json 兼容性 | 运行时头部有 polyfill |
@@ -22,7 +22,7 @@
 ## 控制台配置步骤
 
 1. 创建 Pages 项目并导入本目录（Git 集成或直接上传）。
-2. **KV**：创建命名空间 → 绑定到项目，变量名必须填 `CSH_STATE`。
+2. **状态存储（默认零配置）**：代码自动走 Blob 存储（`getStore('csh-state')`），无需申请审批，部署后发首个闸门请求即自动建命名空间。可选优化：若已开通 EdgeOne KV，创建命名空间 → 绑定变量名 `CSH_STATE`，代码即自动优先 KV（切换当日每日配额计数清零一次，持久登记表无需迁移）。
 3. **环境变量**：按下表逐项配置（与 CF Worker 绑定同名同值）。
 
 ### 环境变量清单（原 CF `classhub` 绑定）
