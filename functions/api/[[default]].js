@@ -2258,8 +2258,41 @@ const KV_CFG = 'gate:cfg'
 const KV_SUBMIT = 'gate:submit'
 const KV_HB = 'gate:hb'
 
-function gateKv() {
-  return typeof CSH_STATE !== 'undefined' ? CSH_STATE : null
+let blobKvPromise = null
+
+function blobKey(key) {
+  return String(key).split('/').map(encodeURIComponent).join('/')
+}
+
+async function blobKv() {
+  if (!blobKvPromise) {
+    blobKvPromise = (async () => {
+      try {
+        const mod = await import('@edgeone/pages-blob')
+        const store = mod.getStore('csh-state')
+        return {
+          async get(key) {
+            const v = await store.get(blobKey(key), { type: 'text', consistency: 'strong' })
+            return v === undefined ? null : v
+          },
+          async put(key, value) {
+            await store.set(blobKey(key), String(value))
+          },
+          async delete(key) {
+            await store.delete(blobKey(key))
+          },
+        }
+      } catch (err) {
+        return null
+      }
+    })()
+  }
+  return blobKvPromise
+}
+
+async function gateKv() {
+  if (typeof CSH_STATE !== 'undefined' && CSH_STATE) return CSH_STATE
+  return blobKv()
 }
 
 async function kvJson(kv, key) {
@@ -2872,7 +2905,7 @@ async function workerFetch(request, env, ctx) {
 
 async function handleStatus(request, env) {
   const started = Date.now()
-  const kv = gateKv()
+  const kv = await gateKv()
   const out = { ok: true, time: new Date().toISOString(), runtime: 'edgeone-pages', services: {}, stats: null, lastGc: null }
   out.services.kv = false
   if (kv) {
@@ -2920,7 +2953,7 @@ async function handleStatus(request, env) {
 
 export async function onRequest(context) {
   const env = Object.assign({}, context.env || {})
-  const kv = gateKv()
+  const kv = await gateKv()
   env.DL_GATE = makeGate(kv)
   const ctx = {
     waitUntil(p) {
