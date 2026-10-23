@@ -5,5 +5,8 @@
   "type": "module",
   "dependencies": {
     "@edgeone/pages-blob": "^0.0.18"
+  },
+  "devDependencies": {
+    "edgeone": "^1.0.27"
   }
 }
