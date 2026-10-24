@@ -1,6 +1,14 @@
 
 const CATEGORIES = ['system', 'schedule', 'teaching', 'other']
 
+// 投稿「系统」多选：platforms 是平台 key 数组（与站点 软件数据/platforms.json 对齐），
+// 首页「系统」筛选直接用；_系统版本 是审核用元数据（平台 key → 版本 key 数组），
+// 审核合并进站点数据时会被 review-submission.yml 剥掉，不会污染软件数据
+const PLATFORM_KEY_RE = /^[a-z0-9][a-z0-9.-]{0,30}$/
+const MAX_PLATFORMS_PER_APP = 16
+const MAX_VERSIONS_PER_PLATFORM = 32
+const PLATFORMS_JSON_PATH = '软件数据/platforms.json'
+
 const ECHO_MAX_LEN = 200
 const ECHO_MARKER = '回声洞'
 
@@ -413,6 +421,61 @@ function collectOssKeys(data) {
   return [...new Set(keys.filter(Boolean))]
 }
 
+/** 平台 key 归一化：小写、去重、限量；非数组按「旧版投稿」处理返回空数组 */
+function normalizePlatforms(raw) {
+  if (!Array.isArray(raw)) return []
+  const out = []
+  for (const item of raw) {
+    const key = typeof item === 'string' ? item.trim().toLowerCase() : ''
+    if (!key || out.includes(key)) continue
+    out.push(key)
+    if (out.length >= MAX_PLATFORMS_PER_APP) break
+  }
+  return out
+}
+
+/**
+ * 读取站点 软件数据/platforms.json 拿到已定义的平台 key 集合。
+ * 任何失败（网络/文件不存在/JSON 坏）都返回 null，由调用方跳过核对——
+ * 形状校验已经过 gate，这里只是防乱填 key 污染首页筛选的兜底。
+ */
+async function knownPlatformKeys(env) {
+  try {
+    const apiBase = `https://api.github.com/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/contents`
+    const res = await fetch(`${apiBase}/${encodePath(PLATFORMS_JSON_PATH)}?ref=${env.GITHUB_BRANCH}`, {
+      headers: githubHeaders(env),
+    })
+    if (!res.ok) return null
+    const info = await res.json()
+    const list = JSON.parse(atob(String(info.content || '').replace(/\s/g, '')))
+    if (!Array.isArray(list)) return null
+    return new Set(list.map((item) => item && item.key).filter((key) => typeof key === 'string'))
+  } catch (err) {
+    console.error('platforms.json fetch failed:', err && err.message)
+    return null
+  }
+}
+
+/** _系统版本 落库前的清洗：只保留已选平台下的合法版本 key，空结果返回 null */
+function sanitizePlatformMeta(raw, allowedPlatforms) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const out = {}
+  for (const [pk, versions] of Object.entries(raw)) {
+    if (!PLATFORM_KEY_RE.test(pk)) continue
+    if (allowedPlatforms.length && !allowedPlatforms.includes(pk)) continue
+    if (!Array.isArray(versions)) continue
+    const list = []
+    for (const v of versions) {
+      const key = typeof v === 'string' ? v.trim().toLowerCase() : ''
+      if (!key || !PLATFORM_KEY_RE.test(key) || list.includes(key)) continue
+      list.push(key)
+      if (list.length >= MAX_VERSIONS_PER_PLATFORM) break
+    }
+    if (list.length) out[pk] = list
+  }
+  return Object.keys(out).length ? out : null
+}
+
 function pickNum(cfgValue, envValue, fallback) {
   for (const v of [cfgValue, envValue]) {
     if (v === null || v === undefined || v === '') continue
@@ -800,6 +863,44 @@ function validate(d) {
     })
   }
 
+  // platforms：新版投稿页多选「系统」后提交的平台 key 数组。
+  // 缺省（null/undefined）视为旧版投稿，只有 system 文本，由审核流按文案兜底推导，不报错
+  if (d.platforms !== undefined && d.platforms !== null) {
+    if (!Array.isArray(d.platforms)) {
+      errors.push('platforms 必须是数组')
+    } else if (d.platforms.length > MAX_PLATFORMS_PER_APP) {
+      errors.push(`platforms 最多 ${MAX_PLATFORMS_PER_APP} 个`)
+    } else {
+      // 大小写变体放行（落库前会统一小写），非字符串/空串/含非法字符仍拦下
+      for (const key of d.platforms) {
+        const k = typeof key === 'string' ? key.trim().toLowerCase() : ''
+        if (!PLATFORM_KEY_RE.test(k)) {
+          errors.push(`platforms 含非法平台标识：${String(key).slice(0, 20)}`)
+          break
+        }
+      }
+    }
+  }
+
+  // _系统版本：审核用元数据，平台 key → 版本 key 数组；只校验形状，值是否真实由 knownPlatformKeys 兜
+  if (d._系统版本 !== undefined && d._系统版本 !== null) {
+    if (typeof d._系统版本 !== 'object' || Array.isArray(d._系统版本)) {
+      errors.push('_系统版本 格式不正确')
+    } else {
+      for (const [pk, versions] of Object.entries(d._系统版本)) {
+        if (!PLATFORM_KEY_RE.test(String(pk).trim().toLowerCase()) ||
+            !Array.isArray(versions) || versions.length > MAX_VERSIONS_PER_PLATFORM) {
+          errors.push('_系统版本 格式不正确')
+          break
+        }
+        if (versions.some((v) => !PLATFORM_KEY_RE.test(typeof v === 'string' ? v.trim().toLowerCase() : ''))) {
+          errors.push('_系统版本 含非法版本标识')
+          break
+        }
+      }
+    }
+  }
+
   return errors
 }
 
@@ -888,6 +989,24 @@ async function handleSubmit(request, env) {
   )
   const idAlreadyExists = appsCheckRes.ok
 
+  // platforms 与站点 platforms.json 核对：形状不合法已在 validate 拦掉，这里防乱填 key
+  // （前端只发已定义的 key，对不上多半是旧缓存页面或手工构造的请求）。读不到清单就跳过
+  const platforms = normalizePlatforms(data.platforms)
+  if (platforms.length) {
+    const known = await knownPlatformKeys(env)
+    if (known) {
+      const unknownKeys = platforms.filter((key) => !known.has(key))
+      if (unknownKeys.length) {
+        return json(
+          { error: `platforms 含站点未定义的平台：${unknownKeys.join('、')}，请刷新页面后重新选择` },
+          400,
+          request,
+          env
+        )
+      }
+    }
+  }
+
   const downloads = (data.downloads || [])
     .filter(x => x && x.url)
     .map(x => {
@@ -922,6 +1041,8 @@ async function handleSubmit(request, env) {
   }
   const notice = cleanText(data.notice, 1000)
   if (notice) fileContent.notice = notice
+  // platforms 原样进入站点数据（首页「系统」筛选用）；旧版投稿没有这个字段时不写
+  if (platforms.length) fileContent.platforms = platforms
   const store = cleanText(data.store, 1000)
   if (store) fileContent.store = store
   const maintainerNote = cleanText(data.维护备注, 1000)
@@ -947,19 +1068,20 @@ async function handleSubmit(request, env) {
 
 
 
-  const SUBMISSION_META_KEYS = new Set(['_联系方式'])
+  const SUBMISSION_META_KEYS = new Set(['_联系方式', '_系统版本'])
   for (const key of Object.keys(data)) {
     if (!SUBMISSION_META_KEYS.has(key) || key in submissionContent) continue
     const value = data[key]
     if (typeof value === 'string') {
-
-
-
       const limit = key === '_联系方式' ? 4000 : 300
       const cleaned = cleanText(value, limit)
       if (cleaned) submissionContent[key] = cleaned
     } else if (typeof value === 'number' || typeof value === 'boolean') {
       submissionContent[key] = value
+    } else if (key === '_系统版本') {
+      // 审核 Issue 里展示「每个平台勾了哪些版本」；合并时随 _ 前缀一起被剥掉
+      const meta = sanitizePlatformMeta(value, platforms)
+      if (meta) submissionContent[key] = meta
     }
   }
 
