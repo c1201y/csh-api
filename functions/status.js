@@ -3,7 +3,7 @@ const STATUS_HTML = `<!doctype html>
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>班级小屋 · 后端状态</title>
+<title>ClassSoftwareHub · 后端状态</title>
 <style>
 :root { color-scheme: light dark; }
 body { font-family: system-ui, "Microsoft YaHei", sans-serif; margin: 0; background: #f6f7f9; color: #1c1e21; }
@@ -35,7 +35,7 @@ h2 { font-size: 13px; color: #888; margin: 0 0 10px; font-weight: 600; letter-sp
 </head>
 <body>
 <main>
-  <h1>班级小屋 · 后端状态</h1>
+  <h1>ClassSoftwareHub · 后端状态</h1>
   <div class="sub" id="meta">加载中…</div>
   <div id="banner" class="card">…</div>
   <div class="card">
