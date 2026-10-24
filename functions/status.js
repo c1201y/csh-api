@@ -139,7 +139,16 @@ async function refresh() {
     svc.appendChild(row('GitHub API', badge(d.services.githubApi), d.services.githubConfig ? '' : '未配置 Token（匿名探测）'))
     svc.appendChild(row('加速签名配置', badge(d.services.signConfig), d.services.signConfig ? '' : '未配置'))
     var dl = d.dl || {}
-    svc.appendChild(row('下载通道', badgeText(dl.relayReady ? 'ECS 中继' : 'OSS 直连', dl.relayReady ? 'ok' : 'warn'), '模式 ' + (dl.mode || '-')))
+    var relayCell = '未配置', relayCls = 'warn', relayNote = '未设置 RELAY_HOST'
+    if (dl.relayConfigured) {
+      if (dl.relayStatus === 200) { relayCell = '正常'; relayCls = 'ok'; relayNote = '内网取流 · 不计 OSS 公网流量' }
+      else if (dl.relayStatus === 401 || dl.relayStatus === 403) { relayCell = '令牌被拒'; relayCls = 'bad'; relayNote = 'HTTP ' + dl.relayStatus + ' · 已自动回落方法二' }
+      else if (dl.relayStatus === 0) { relayCell = '不可达'; relayCls = 'bad'; relayNote = '网络不通 · 已自动回落方法二' }
+      else { relayCell = '异常 HTTP ' + dl.relayStatus; relayCls = 'bad'; relayNote = '已自动回落方法二' }
+    }
+    svc.appendChild(row('ECS 中继（方法一）', badgeText(relayCell, relayCls), relayNote))
+    svc.appendChild(row('后端直连 OSS（方法二）', badgeText(dl.backendReady ? '可用' : '未配置', dl.backendReady ? 'ok' : 'warn'), dl.backendReady ? '中继不可用时自动接手' : '未配置 OSS 密钥'))
+    svc.appendChild(row('当前下载模式', badgeText(String(dl.mode || '-'), dl.mode === 'direct' ? 'warn' : 'ok'), dl.mode === 'direct' ? '浏览器直连 OSS 签名链接' : '经后端 /api/dl 转发'))
     renderFeatures(feat)
     var extra = document.getElementById('extra')
     extra.innerHTML = ''
@@ -148,8 +157,8 @@ async function refresh() {
       extra.appendChild(row('OSS 文件总数', badge(true, String(d.ossFiles != null ? d.ossFiles : (d.ossObjectsProbed || 0))), '桶内全部对象'))
       var pend = d.stats.pending || 0
       extra.appendChild(row('待认领对象', badgeText(String(pend), pend === 0 ? 'ok' : 'warn'), pend === 0 ? '无孤儿' : '未同步/未认领'))
-      extra.appendChild(row('本月中继用量', badge(true, fmtBytes(d.stats.relay))))
-      extra.appendChild(row('本月直连用量', badge(true, fmtBytes(d.stats.direct))))
+      extra.appendChild(row('本月中继用量', badge(true, fmtBytes(d.stats.relay)), 'ECS 内网取流 · 不计费'))
+      extra.appendChild(row('本月 OSS 公网用量', badge(true, fmtBytes(d.stats.direct)), '浏览器直连 + 后端直连'))
     } else {
       extra.appendChild(row('统计信息', badge(false, '不可用'), '状态存储未就绪'))
     }

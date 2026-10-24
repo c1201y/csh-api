@@ -1155,9 +1155,12 @@ function dlFileName(key, override) {
   return clean || 'download'
 }
 
-async function dlTicketSig(env, exp, fpHash, key) {
+async function dlTicketSig(env, exp, fpHash, key, mode) {
   const secret = textEncoder.encode(String(env.DL_SIGN_SECRET || ''))
-  return toHex(await hmacSha256(secret, `${exp}|${fpHash}|${key}`)).slice(0, 32)
+  // mode 进签名：/api/dl 据此跳过不可用的上游。历史票据不带 m（等价 mode 为空），
+  // 负载与旧版一致，仍在 15 分钟有效期内自然放行。
+  const payload = mode ? `${exp}|${fpHash}|${key}|${mode}` : `${exp}|${fpHash}|${key}`
+  return toHex(await hmacSha256(secret, payload)).slice(0, 32)
 }
 
 function indexOfCrlfCrlf(buf) {
@@ -1234,17 +1237,32 @@ async function wrapUpstream(res, method) {
   return { status: res.status, headers: hdrs, reader: res.body.getReader(), socket: sock, first: new Uint8Array(0) }
 }
 
-async function relayOpen(env, key, method, range) {
-  const relay = relayHttpBase(env)
+/**
+ * 取流入口，承载两条方法：
+ *   prefer='relay'（默认）—— 先走 ECS 中继（内网取流，不计 OSS 公网流量）；
+ *       中继网络不可达，或给出非确定性回答（5xx / 401 / 404…）时回落 OSS 签名直连；
+ *   prefer='oss' —— 只用 OSS 签名直连，即「后端直连 OSS」方法，
+ *       供 auto 选路在中继不可用时使用，也用于强制对比测试。
+ */
+async function relayOpen(env, key, method, range, prefer) {
+  const relay = prefer === 'oss' ? null : relayHttpBase(env)
   if (relay) {
     const path = '/' + key.split('/').map(encodeURIComponent).join('/')
     const headers = { 'X-Api-Key': relay.token }
     if (range) headers['Range'] = range
+    let res = null
     try {
-      return await wrapUpstream(await fetch(relay.base + path, { method, headers }), method)
+      res = await fetch(relay.base + path, { method, headers })
     } catch (err) {
-      // 中继网络不可达 → 回落 OSS 签名直链
+      // 中继网络不可达 → 回落 OSS 签名直连
     }
+    // 2xx 与 416（对象在、只是区间不合法）视为中继的确定性回答，原样采用；
+    // 其余状态（中继故障、令牌被拒、对象视图不一致）一律回落 OSS——
+    // 下载可用性优先于通道纯粹性。
+    if (res && (res.status < 300 || res.status === 416)) {
+      return await wrapUpstream(res, method)
+    }
+    try { if (res && res.body) res.body.cancel() } catch (err) {}
   }
   let url
   try {
@@ -1259,6 +1277,36 @@ async function relayOpen(env, key, method, range) {
     return { status: 502, text: '存储暂不可用' }
   }
   return await wrapUpstream(res, method)
+}
+
+/**
+ * 直探测中继活路（不做 OSS 回落）：auto 选路用。
+ * 401/403 = 令牌被拒；5xx = 中继故障；网络异常 = 不可达；其余（含 404）算活。
+ */
+async function relayProbe(env, key) {
+  const relay = relayHttpBase(env)
+  if (!relay) return false
+  const path = key ? '/' + key.split('/').map(encodeURIComponent).join('/') : '/?list&max-keys=1'
+  try {
+    const res = await fetch(relay.base + path, { method: 'HEAD', headers: { 'X-Api-Key': relay.token } })
+    return res.status < 500 && res.status !== 401 && res.status !== 403
+  } catch (err) {
+    return false
+  }
+}
+
+/** 中继探测状态码：null = 未配置，0 = 网络不可达，其余为实际 HTTP 状态码 */
+async function relayProbeStatus(env) {
+  const relay = relayHttpBase(env)
+  if (!relay) return null
+  try {
+    const res = await fetch(`${relay.base}/?list&max-keys=1`, {
+      headers: { 'X-Api-Key': relay.token },
+    })
+    return res.status
+  } catch (err) {
+    return 0
+  }
 }
 
 function relayRespond(relay, method, fileName) {
@@ -1327,16 +1375,50 @@ function parseListXml(xml) {
   return { objects, nextToken: truncated ? decodeXml(nextM[1]) : '' }
 }
 
+/**
+ * 解析中继 `?list` 的响应。中继返回的是 JSON（数组或 `{ objects, isTruncated }`，
+ * 元素既可以是裸键串，也可以是 `{ key, size, lastModified }` 及其首字母大写形态）；
+ * 若中继换版本改成透传 OSS 的 XML，则退一级用 XML 再试。两者都解不动返回 null，
+ * 由调用方回落 OSS 列举 —— 清单以桶为准，猜不得。
+ *
+ * `truncated` 必须原样带出：这份清单会被用来判断「某个键到底在不在桶里」，
+ * 拿一份被截断的清单去判「不存在」，会把真实存在的对象误判成无主记录。
+ */
+function parseRelayList(text) {
+  let data = null
+  try {
+    data = JSON.parse(text)
+  } catch (err) {
+    const xml = parseListXml(text)
+    return xml.objects.length ? { objects: xml.objects, truncated: !!xml.nextToken } : null
+  }
+  const objs = Array.isArray(data) ? data : data?.objects || []
+  const objects = objs
+    .map((o) =>
+      typeof o === 'string'
+        ? { key: o, size: 0, lastModified: '' }
+        : {
+            key: o?.key || o?.Key || '',
+            size: Number(o?.size ?? o?.Size) || 0,
+            // 中继原样透传 OSS 的 ISO 串（上传完成时刻），交给 Date 解析
+            lastModified: o?.lastModified || o?.LastModified || '',
+          }
+    )
+    .filter((o) => typeof o.key === 'string' && o.key)
+  return { objects, truncated: data?.isTruncated === true || data?.truncated === true }
+}
+
 async function relayListDetailed(env, prefix) {
   const relay = relayHttpBase(env)
   if (relay) {
     try {
-      const res = await fetch(`${relay.base}/?list&prefix=${encodeURIComponent(prefix)}`, {
+      const q = prefix ? `?list&prefix=${encodeURIComponent(prefix)}` : '?list'
+      const res = await fetch(`${relay.base}/${q}`, {
         headers: { 'X-Api-Key': relay.token },
       })
       if (res.ok) {
-        const parsed = parseListXml(await res.text())
-        return { objects: parsed.objects, truncated: !!parsed.nextToken }
+        const parsed = parseRelayList(await res.text())
+        if (parsed) return parsed
       }
     } catch (err) {
       // 中继不可达 → 回落 OSS 列举
@@ -1388,7 +1470,7 @@ async function dlModeWanted(env) {
   const out = await registryOp(env, { op: 'cfg-get' })
   const stored = out && out.cfg && out.cfg.mode
   const raw = String(stored || env.DL_MODE || DL_MODE_DEFAULT).trim().toLowerCase()
-  return raw === 'relay' || raw === 'direct' ? raw : 'auto'
+  return raw === 'relay' || raw === 'backend' || raw === 'direct' ? raw : 'auto'
 }
 
 function gbToBytes(value) {
@@ -1473,64 +1555,56 @@ async function handleDlTicket(request, env, ctx) {
   const rec = await registryGet(env, key)
   const size = rec && Number.isFinite(Number(rec.size)) ? Number(rec.size) : 0
 
+  const preferRaw = String(data?.prefer || '').trim().toLowerCase()
   const want =
-    String(data?.prefer || '').trim().toLowerCase() === 'relay' || String(data?.prefer || '').trim().toLowerCase() === 'direct'
-      ? String(data.prefer).trim().toLowerCase()
-      : await dlModeWanted(env)
+    preferRaw === 'relay' || preferRaw === 'backend' || preferRaw === 'direct' ? preferRaw : await dlModeWanted(env)
   const stats = (await registryOp(env, { op: 'stats' })) || {}
   const relayUsed = Number(stats.relay) || 0
-  const directUsed = Number(stats.direct) || 0
   const relayCap = gbToBytes(env.DL_RELAY_MONTHLY_GB)
-  const directCap = gbToBytes(env.DL_DIRECT_MONTHLY_GB)
   const relayFull = relayCap > 0 && relayUsed >= relayCap
-  const directFull = directCap > 0 && directUsed >= directCap
 
   const exp = Math.floor(Date.now() / 1000) + DL_TICKET_TTL
-  const sig = await dlTicketSig(env, exp, fpHash, key)
   const origin = new URL(request.url).origin
-  const relayPath = relayReady
-    ? `${origin}/api/dl?k=${encodeURIComponent(key)}&e=${exp}&h=${fpHash}&s=${sig}` +
-      `&f=${encodeURIComponent(fp)}`
-    : null
-
+  // /api/dl 入口：中继与后端直连都走它，上游由票据里的 m 参数决定
+  const backendReady = relayReady || ossReady
 
   const directTtl = directTtlFor(size)
   const directPath = await buildDirectUrl(env, key, dlFileName(key), directTtl)
 
-
-  let mode = want === 'auto' ? (relayFull && !directFull ? 'direct' : 'relay') : want
-  if (mode === 'relay' && !relayPath) mode = 'direct'
-  if (mode === 'direct' && !directPath) mode = 'relay'
-  if (!relayPath && !directPath) {
+  // 双方法优先级（auto）：ECS 中继（内网取流，不计 OSS 公网）→ 后端直连 OSS → 浏览器直连
+  let mode
+  if (want === 'auto') {
+    if (relayReady && !relayFull) mode = 'relay'
+    else if (ossReady) mode = 'backend'
+    else mode = 'direct'
+  } else {
+    mode = want
+  }
+  if (mode === 'relay' && !relayReady) mode = ossReady ? 'backend' : 'direct'
+  if (mode === 'backend' && !ossReady) mode = relayReady ? 'relay' : 'direct'
+  if (mode === 'direct' && !directPath) mode = relayReady ? 'relay' : ossReady ? 'backend' : 'direct'
+  if (!backendReady && !directPath) {
     return json({ error: '下载服务暂时不可用' }, 503, request, env)
   }
 
-
-
-
-
-
-
-
-
-
-  if (want === 'auto' && mode === 'relay' && directPath) {
+  // auto + 中继：直探测活（不走内部回落），令牌被拒或不可达就转后端直连，
+  // 避免每个下载请求都先撞一次不可用的中继。
+  if (want === 'auto' && mode === 'relay' && backendReady) {
     let alive = false
     try {
-      const probe = await relayOpen(env, key, 'HEAD')
-      const status = probe.status || 0
-      alive = !!(probe.reader && status < 500 && status !== 401 && status !== 403)
-      if (probe.reader) {
-        try { probe.reader.releaseLock() } catch {}
-        try { probe.socket.close() } catch {}
-      }
+      alive = await relayProbe(env, key)
     } catch (err) {
       console.error('relay probe error:', err && err.message)
     }
-    if (!alive) mode = 'direct'
+    if (!alive) mode = ossReady ? 'backend' : 'direct'
   }
 
-  const url = mode === 'direct' ? directPath : relayPath
+  const sig = await dlTicketSig(env, exp, fpHash, key, mode === 'direct' ? '' : mode)
+  const url =
+    mode === 'direct'
+      ? directPath
+      : `${origin}/api/dl?k=${encodeURIComponent(key)}&e=${exp}&h=${fpHash}&s=${sig}` +
+        `&f=${encodeURIComponent(fp)}&m=${mode}`
 
 
   if (size > 0) {
@@ -1564,12 +1638,13 @@ async function handleDl(request, env) {
   const fpHash = url.searchParams.get('h') || ''
   const sig = url.searchParams.get('s') || ''
   const fp = url.searchParams.get('f') || ''
+  const mode = url.searchParams.get('m') || ''
 
   if (!dlKeyOk(key)) return json({ error: '下载地址无效' }, 400, request, env)
   if (!Number.isFinite(exp) || exp * 1000 < Date.now()) {
     return json({ error: '下载链接已过期，请回站点重新点击下载' }, 410, request, env)
   }
-  if (sig !== (await dlTicketSig(env, exp, fpHash, key))) {
+  if (sig !== (await dlTicketSig(env, exp, fpHash, key, mode))) {
     return json({ error: '下载地址无效' }, 403, request, env)
   }
   if (!fp || (await sha256Hex(fp)).slice(0, 16) !== fpHash) {
@@ -1579,7 +1654,8 @@ async function handleDl(request, env) {
   const method = request.method === 'HEAD' ? 'HEAD' : 'GET'
   let relay
   try {
-    relay = await relayOpen(env, key, method, request.headers.get('Range'))
+    // m=backend：票据签发时已探明中继不可用，直接走后端直连 OSS，不再撞中继
+    relay = await relayOpen(env, key, method, request.headers.get('Range'), mode === 'backend' ? 'oss' : 'relay')
   } catch (err) {
     console.error('relay error:', err && err.message)
     return json({ error: '下载服务暂时不可用' }, 502, request, env)
@@ -1863,7 +1939,7 @@ async function handleDlMode(request, env) {
         maxPerDay: pickNum(cfg && cfg.maxPerDay, env.SUBMIT_MAX_PER_DAY, SUBMIT_MAX_PER_DAY),
         lastGc: (cfg && cfg.lastGc) || null,
         updatedAt: (cfg && cfg.updatedAt) || null,
-        options: ['auto', 'relay', 'direct'],
+        options: ['auto', 'relay', 'backend', 'direct'],
       },
       200,
       request,
@@ -1886,8 +1962,8 @@ async function handleDlMode(request, env) {
     const raw = String(data.mode || '').trim().toLowerCase()
 
 
-    if (raw !== 'auto' && raw !== 'relay' && raw !== 'direct') {
-      return json({ error: 'mode 只接受 auto / relay / direct' }, 400, request, env)
+    if (raw !== 'auto' && raw !== 'relay' && raw !== 'backend' && raw !== 'direct') {
+      return json({ error: 'mode 只接受 auto / relay / backend / direct' }, 400, request, env)
     }
     patch.mode = raw
   }
@@ -2497,7 +2573,8 @@ async function gateRegistry(kv, body) {
     return { ok: true, count: filesOut.length, files: filesOut }
   }
   if (op === 'bytes-add') {
-    const mode = body.mode === 'direct' ? 'direct' : 'relay'
+    // relay = ECS 中继内网取流（不计 OSS 公网）；backend / direct 都经 OSS 公网，计入 direct
+    const mode = body.mode === 'relay' ? 'relay' : 'direct'
     const bytes = Math.max(0, Number(body.bytes) || 0)
     const month = gateMonth()
     const key = 'gate:m:' + month
@@ -3027,7 +3104,13 @@ async function handleStatus(request, env) {
     const c = await registryOp(env, { op: 'cfg-get' })
     if (c && c.cfg) out.lastGc = c.cfg.lastGc || null
   } catch (err) {}
-  out.dl = { mode: await dlModeWanted(env), relayReady: !!(env.RELAY_HOST && env.RELAY_TOKEN) }
+  const relayStatus = await relayProbeStatus(env)
+  out.dl = {
+    mode: await dlModeWanted(env),
+    relayConfigured: relayStatus !== null,
+    relayStatus,
+    backendReady: !!(env.OSS_BUCKET && env.OSS_ACCESS_KEY_ID && env.OSS_ACCESS_KEY_SECRET),
+  }
   const checks = [out.services.kv, out.services.oss, out.services.githubApi]
   out.ok = checks.every(Boolean)
   out.ms = Date.now() - started
