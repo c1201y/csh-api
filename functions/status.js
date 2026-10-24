@@ -19,6 +19,7 @@ h2 { font-size: 13px; color: #888; margin: 0 0 10px; font-weight: 600; letter-sp
 .badge { padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; flex-shrink: 0; }
 .ok { background: #e6f7e9; color: #167a2c; }
 .bad { background: #fdeaea; color: #b3261e; }
+.warn { background: #fff5e0; color: #9a6b00; }
 .kv { color: #666; font-size: 12px; }
 @media (prefers-color-scheme: dark) {
   body { background: #16181c; color: #e8eaed; }
@@ -28,6 +29,7 @@ h2 { font-size: 13px; color: #888; margin: 0 0 10px; font-weight: 600; letter-sp
   .row .mid { color: #7a8087; }
   .ok { background: #12351a; color: #6ee787; }
   .bad { background: #43201d; color: #ff9b93; }
+  .warn { background: #3a2f12; color: #ffc53d; }
 }
 </style>
 </head>
@@ -54,6 +56,12 @@ function badge(v, t, f) {
   var s = document.createElement('span')
   s.className = 'badge ' + (v ? 'ok' : 'bad')
   s.textContent = v ? (t || '可用') : (f || '不可用')
+  return s
+}
+function badgeText(text, cls) {
+  var s = document.createElement('span')
+  s.className = 'badge ' + (cls || 'ok')
+  s.textContent = text
   return s
 }
 function row(label, el, note, mid) {
@@ -136,7 +144,8 @@ async function refresh() {
     if (d.stats) {
       extra.appendChild(row('已登记文件', badge(true, String(d.stats.files)), '图标 ' + (d.stats.icons || 0)))
       extra.appendChild(row('OSS 文件总数', badge(true, String(d.ossFiles != null ? d.ossFiles : (d.ossObjectsProbed || 0))), '桶内全部对象'))
-      extra.appendChild(row('待认领对象', badge((d.stats.pending || 0) === 0, String(d.stats.pending || 0)), '0 = 无孤儿'))
+      var pend = d.stats.pending || 0
+      extra.appendChild(row('待认领对象', badgeText(String(pend), pend === 0 ? 'ok' : 'warn'), pend === 0 ? '无孤儿' : '未同步/未认领'))
       extra.appendChild(row('本月中继用量', badge(true, fmtBytes(d.stats.relay))))
       extra.appendChild(row('本月直连用量', badge(true, fmtBytes(d.stats.direct))))
     } else {
