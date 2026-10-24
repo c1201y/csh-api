@@ -1286,7 +1286,8 @@ async function relayListDetailed(env, prefix) {
   let token = ''
   const objects = []
   for (let page = 0; page < 20; page++) {
-    const q = { 'list-type': '2', prefix, 'max-keys': '1000' }
+    const q = { 'list-type': '2', 'max-keys': '1000' }
+    if (prefix) q.prefix = prefix
     if (token) q['continuation-token'] = token
     let res
     try {
