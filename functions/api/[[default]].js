@@ -1,5 +1,10 @@
 
-const CATEGORIES = ['system', 'schedule', 'teaching', 'other']
+// 必须与站点 软件数据/categories.json 的 key 保持一致（2026-10 前端改版后为以下六类）
+const CATEGORIES = ['classroom', 'office', 'system', 'media', 'network', 'utility']
+
+// 下载项 kind 白名单，与站点 downloadLink.ts 的 DECLARED 一致；
+// 不在白名单内的值不入库，详情页会按链接自动推断
+const DOWNLOAD_KINDS = ['file', 'store', 'netdisk', 'page']
 
 // 投稿「系统」多选：platforms 是平台 key 数组（与站点 软件数据/platforms.json 对齐），
 // 首页「系统」筛选直接用；_系统版本 是审核用元数据（平台 key → 版本 key 数组），
@@ -1020,6 +1025,8 @@ async function handleSubmit(request, env) {
 
       const hash = typeof x.hash === 'string' ? x.hash.replace(/[^0-9a-f]/gi, '').toLowerCase() : ''
       if (hash) item.hash = hash
+      const kind = typeof x.kind === 'string' ? x.kind.trim().toLowerCase() : ''
+      if (DOWNLOAD_KINDS.includes(kind)) item.kind = kind
       item.url = cleanText(x.url, 1000)
       return item
     })
