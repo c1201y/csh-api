@@ -1201,19 +1201,16 @@ async function ossSignedUrl(env, method, key, extraQuery) {
   return `https://${host}/${encKey}?${canonicalQuery}&x-oss-signature=${signature}`
 }
 
-async function relayOpen(env, key, method, range) {
-  let url
-  try {
-    url = await ossSignedUrl(env, method, key)
-  } catch (err) {
-    return { status: 503, text: '下载服务未配置' }
-  }
-  let res
-  try {
-    res = await fetch(url, { method, headers: range ? { Range: range } : {} })
-  } catch (err) {
-    return { status: 502, text: '存储暂不可用' }
-  }
+function relayHttpBase(env) {
+  const host = String(env.RELAY_HOST || '').trim()
+  const token = String(env.RELAY_TOKEN || '')
+  if (!host || !token) return null
+  const scheme = String(env.RELAY_SCHEME || 'http').trim() || 'http'
+  const port = Number(env.RELAY_PORT) || DL_RELAY_PORT
+  return { base: `${scheme}://${host}:${port}`, token }
+}
+
+async function wrapUpstream(res, method) {
   const hdrs = {}
   res.headers.forEach((v, k) => { hdrs[k.toLowerCase()] = v })
   const sock = {
@@ -1235,6 +1232,33 @@ async function relayOpen(env, key, method, range) {
     return { status: res.status, text: t.slice(0, 200) }
   }
   return { status: res.status, headers: hdrs, reader: res.body.getReader(), socket: sock, first: new Uint8Array(0) }
+}
+
+async function relayOpen(env, key, method, range) {
+  const relay = relayHttpBase(env)
+  if (relay) {
+    const path = '/' + key.split('/').map(encodeURIComponent).join('/')
+    const headers = { 'X-Api-Key': relay.token }
+    if (range) headers['Range'] = range
+    try {
+      return await wrapUpstream(await fetch(relay.base + path, { method, headers }), method)
+    } catch (err) {
+      // 中继网络不可达 → 回落 OSS 签名直链
+    }
+  }
+  let url
+  try {
+    url = await ossSignedUrl(env, method, key)
+  } catch (err) {
+    return { status: 503, text: '下载服务未配置' }
+  }
+  let res
+  try {
+    res = await fetch(url, { method, headers: range ? { Range: range } : {} })
+  } catch (err) {
+    return { status: 502, text: '存储暂不可用' }
+  }
+  return await wrapUpstream(res, method)
 }
 
 function relayRespond(relay, method, fileName) {
@@ -1282,7 +1306,42 @@ function relayRespond(relay, method, fileName) {
   return new Response(stream, { status: relay.status, headers: out })
 }
 
+function parseListXml(xml) {
+  const objects = []
+  const blocks = xml.split('<Contents>').slice(1)
+  for (const b of blocks) {
+    const keyM = /<Key>([\s\S]*?)<\/Key>/.exec(b)
+    const sizeM = /<Size>([\s\S]*?)<\/Size>/.exec(b)
+    const lmM = /<LastModified>([\s\S]*?)<\/LastModified>/.exec(b)
+    if (keyM) {
+      objects.push({
+        key: decodeXml(keyM[1]),
+        size: Number(sizeM ? sizeM[1] : 0) || 0,
+        lastModified: lmM ? lmM[1] : '',
+      })
+    }
+  }
+  const truncM = /<IsTruncated>([\s\S]*?)<\/IsTruncated>/.exec(xml)
+  const nextM = /<NextContinuationToken>([\s\S]*?)<\/NextContinuationToken>/.exec(xml)
+  const truncated = !!(truncM && truncM[1].trim() === 'true' && nextM)
+  return { objects, nextToken: truncated ? decodeXml(nextM[1]) : '' }
+}
+
 async function relayListDetailed(env, prefix) {
+  const relay = relayHttpBase(env)
+  if (relay) {
+    try {
+      const res = await fetch(`${relay.base}/?list&prefix=${encodeURIComponent(prefix)}`, {
+        headers: { 'X-Api-Key': relay.token },
+      })
+      if (res.ok) {
+        const parsed = parseListXml(await res.text())
+        return { objects: parsed.objects, truncated: !!parsed.nextToken }
+      }
+    } catch (err) {
+      // 中继不可达 → 回落 OSS 列举
+    }
+  }
   let token = ''
   const objects = []
   for (let page = 0; page < 20; page++) {
@@ -1297,26 +1356,10 @@ async function relayListDetailed(env, prefix) {
     }
     if (!res.ok) return null
     const xml = await res.text()
-    const blocks = xml.split('<Contents>').slice(1)
-    for (const b of blocks) {
-      const keyM = /<Key>([\s\S]*?)<\/Key>/.exec(b)
-      const sizeM = /<Size>([\s\S]*?)<\/Size>/.exec(b)
-      const lmM = /<LastModified>([\s\S]*?)<\/LastModified>/.exec(b)
-      if (keyM) {
-        objects.push({
-          key: decodeXml(keyM[1]),
-          size: Number(sizeM ? sizeM[1] : 0) || 0,
-          lastModified: lmM ? lmM[1] : '',
-        })
-      }
-    }
-    const truncM = /<IsTruncated>([\s\S]*?)<\/IsTruncated>/.exec(xml)
-    const nextM = /<NextContinuationToken>([\s\S]*?)<\/NextContinuationToken>/.exec(xml)
-    if (truncM && truncM[1].trim() === 'true' && nextM) {
-      token = decodeXml(nextM[1])
-    } else {
-      return { objects, truncated: false }
-    }
+    const parsed = parseListXml(xml)
+    objects.push(...parsed.objects)
+    if (!parsed.nextToken) return { objects, truncated: false }
+    token = parsed.nextToken
   }
   return { objects, truncated: true }
 }
@@ -2984,6 +3027,7 @@ async function handleStatus(request, env) {
     const c = await registryOp(env, { op: 'cfg-get' })
     if (c && c.cfg) out.lastGc = c.cfg.lastGc || null
   } catch (err) {}
+  out.dl = { mode: await dlModeWanted(env), relayReady: !!(env.RELAY_HOST && env.RELAY_TOKEN) }
   const checks = [out.services.kv, out.services.oss, out.services.githubApi]
   out.ok = checks.every(Boolean)
   out.ms = Date.now() - started
@@ -3000,7 +3044,7 @@ const ENV_DEFAULTS = {
   OSS_ENDPOINT: 'oss-cn-shanghai.aliyuncs.com',
   OSS_PUBLIC_BASE: 'https://classsoftwarehub.oss-cn-shanghai.aliyuncs.com',
   OSS_PREFIX: 'upload',
-  DL_MODE: 'direct',
+  DL_MODE: 'auto',
   DL_DAILY_LIMIT: '25',
   DL_DIRECT_MONTHLY_GB: '0',
   DL_RELAY_MONTHLY_GB: '0',

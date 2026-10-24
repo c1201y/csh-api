@@ -138,6 +138,8 @@ async function refresh() {
     svc.appendChild(row('OSS 对象存储', badge(d.services.oss), d.services.ossConfig ? (d.ossProbeMs ? d.ossProbeMs + 'ms · ' + (d.ossObjectsProbed || 0) + ' 个对象' : '') : '未配置密钥'))
     svc.appendChild(row('GitHub API', badge(d.services.githubApi), d.services.githubConfig ? '' : '未配置 Token（匿名探测）'))
     svc.appendChild(row('加速签名配置', badge(d.services.signConfig), d.services.signConfig ? '' : '未配置'))
+    var dl = d.dl || {}
+    svc.appendChild(row('下载通道', badgeText(dl.relayReady ? 'ECS 中继' : 'OSS 直连', dl.relayReady ? 'ok' : 'warn'), '模式 ' + (dl.mode || '-')))
     renderFeatures(feat)
     var extra = document.getElementById('extra')
     extra.innerHTML = ''
