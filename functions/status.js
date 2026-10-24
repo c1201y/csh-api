@@ -135,6 +135,7 @@ async function refresh() {
     extra.innerHTML = ''
     if (d.stats) {
       extra.appendChild(row('已登记文件', badge(true, String(d.stats.files)), '图标 ' + (d.stats.icons || 0)))
+      extra.appendChild(row('OSS 文件总数', badge(true, String(d.ossFiles != null ? d.ossFiles : (d.ossObjectsProbed || 0))), '桶内全部对象'))
       extra.appendChild(row('待认领对象', badge((d.stats.pending || 0) === 0, String(d.stats.pending || 0)), '0 = 无孤儿'))
       extra.appendChild(row('本月中继用量', badge(true, fmtBytes(d.stats.relay))))
       extra.appendChild(row('本月直连用量', badge(true, fmtBytes(d.stats.direct))))

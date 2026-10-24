@@ -2959,10 +2959,11 @@ async function handleStatus(request, env) {
   ]
   try {
     const t0 = Date.now()
-    const l = await relayListDetailed(env, 'icon/')
+    const l = await relayListDetailed(env, '')
     out.services.oss = l !== null
     out.ossProbeMs = Date.now() - t0
     out.ossObjectsProbed = l ? l.objects.length : 0
+    out.ossFiles = l ? l.objects.length : null
   } catch (err) {
     out.services.oss = false
   }
