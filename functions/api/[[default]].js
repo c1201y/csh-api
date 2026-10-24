@@ -1234,7 +1234,9 @@ async function wrapUpstream(res, method) {
     try { t = await res.text() } catch {}
     return { status: res.status, text: t.slice(0, 200) }
   }
-  return { status: res.status, headers: hdrs, reader: res.body.getReader(), socket: sock, first: new Uint8Array(0) }
+  // GET 成功：只交原生流，不取 reader（getReader 会锁住流，导致无法透传）。
+  // reader 留给 DELETE 等需要逐段读的调用方；body 缺失时调用方按空响应处理。
+  return { status: res.status, headers: hdrs, body: res.body, socket: sock, first: new Uint8Array(0) }
 }
 
 /**
@@ -1328,6 +1330,16 @@ function relayRespond(relay, method, fileName) {
     return new Response(null, { status: relay.status, headers: out })
   }
 
+  // 有原生上游流时直接透传：运行时的流转发无需手动 read，
+  // 也绕开了「read() 的块不保证是 Uint8Array」的格式差异（曾因按 .length
+  // 判断把块全部跳过，表现为 200 但 0 字节）。
+  if (relay.body) {
+    return new Response(relay.body, { status: relay.status, headers: out })
+  }
+  if (!relay.reader) {
+    return new Response(null, { status: relay.status, headers: out })
+  }
+
   const stream = new ReadableStream({
     start(controller) {
       if (relay.first && relay.first.length) controller.enqueue(relay.first)
@@ -1340,7 +1352,11 @@ function relayRespond(relay, method, fileName) {
           try { relay.socket.close() } catch {}
           return
         }
-        if (value && value.length) controller.enqueue(value)
+        if (value) {
+          // 运行时的块不保证是 Uint8Array（也可能是 ArrayBuffer）——统一成字节视图
+          const bytes = value instanceof Uint8Array ? value : new Uint8Array(value.buffer || value)
+          if (bytes.length) controller.enqueue(bytes)
+        }
       } catch (err) {
         controller.error(err)
         try { relay.socket.close() } catch {}
@@ -1660,7 +1676,7 @@ async function handleDl(request, env) {
     console.error('relay error:', err && err.message)
     return json({ error: '下载服务暂时不可用' }, 502, request, env)
   }
-  if (!relay.reader) {
+  if (!relay.reader && !relay.body) {
     return json({ error: relay.text || '下载失败' }, relay.status || 502, request, env)
   }
   return relayRespond(relay, method, dlFileName(key, url.searchParams.get('n')))
@@ -2806,11 +2822,11 @@ async function handleIcon(request, env, ctx) {
     console.error('icon relay error:', err && err.message)
     return json({ error: '图标服务暂时不可用' }, 502, request, env)
   }
-  if (!relay.reader) return json({ error: relay.text || '图标不存在' }, relay.status || 502, request, env)
+  if (!relay.reader && !relay.body) return json({ error: relay.text || '图标不存在' }, relay.status || 502, request, env)
 
   const size = Number(relay.headers['content-length'] || 0)
   if (size > ICON_MAX_BYTES) {
-    try { relay.reader.releaseLock() } catch {}
+    if (relay.reader) { try { relay.reader.releaseLock() } catch {} }
     try { relay.socket.close() } catch {}
     return json({ error: '图标文件过大' }, 413, request, env)
   }
@@ -3019,59 +3035,6 @@ async function workerFetch(request, env, ctx) {
     }
     if (url.pathname === '/api/announce/list' && request.method === 'GET') {
       return handleAnnounceList(request, env)
-    }
-
-    if (url.pathname === '/api/_debug-stream' && request.method === 'GET') {
-      const key = 'releases/2026/10/mv2hdd0g-v5evpz-哈希值.txt'
-      const info = {}
-      const signed = await ossSignedUrl(env, 'GET', key)
-      try {
-        const r1 = await fetch(signed, { method: 'GET', headers: {} })
-        info.status = r1.status
-        info.cl = r1.headers.get('content-length')
-        info.bodyNull = r1.body === null
-        try {
-          const rd = r1.body.getReader()
-          const first = await rd.read()
-          info.readerDone = first.done
-          info.readerLen = first.value ? first.value.length : -1
-          rd.releaseLock()
-        } catch (e) {
-          info.readerErr = String(e && e.message).slice(0, 100)
-        }
-      } catch (e) {
-        info.fetchErr = String(e && e.message).slice(0, 100)
-      }
-      try {
-        const r2 = await fetch(signed, { method: 'GET', headers: {} })
-        const buf = new Uint8Array(await new Response(r2.body, { status: 200 }).arrayBuffer())
-        info.passthroughLen = buf.length
-      } catch (e) {
-        info.passErr = String(e && e.message).slice(0, 100)
-      }
-      try {
-        const r3 = await fetch(signed, { method: 'GET', headers: {} })
-        const t = await r3.text()
-        info.textLen = t.length
-      } catch (e) {
-        info.textErr = String(e && e.message).slice(0, 100)
-      }
-      try {
-        const r4 = await fetch(signed, { method: 'GET', headers: {} })
-        const b = await r4.arrayBuffer()
-        info.abLen = b.byteLength
-      } catch (e) {
-        info.abErr = String(e && e.message).slice(0, 100)
-      }
-      try {
-        const r5 = await fetch(signed, { method: 'GET', headers: {} })
-        let n = 0
-        for await (const chunk of r5.body) n += chunk.length
-        info.iterLen = n
-      } catch (e) {
-        info.iterErr = String(e && e.message).slice(0, 100)
-      }
-      return json(info, 200, request, env)
     }
 
     return json({ error: 'Not Found' }, 404, request, env)
