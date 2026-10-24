@@ -3021,6 +3021,59 @@ async function workerFetch(request, env, ctx) {
       return handleAnnounceList(request, env)
     }
 
+    if (url.pathname === '/api/_debug-stream' && request.method === 'GET') {
+      const key = 'releases/2026/10/mv2hdd0g-v5evpz-哈希值.txt'
+      const info = {}
+      const signed = await ossSignedUrl(env, 'GET', key)
+      try {
+        const r1 = await fetch(signed, { method: 'GET', headers: {} })
+        info.status = r1.status
+        info.cl = r1.headers.get('content-length')
+        info.bodyNull = r1.body === null
+        try {
+          const rd = r1.body.getReader()
+          const first = await rd.read()
+          info.readerDone = first.done
+          info.readerLen = first.value ? first.value.length : -1
+          rd.releaseLock()
+        } catch (e) {
+          info.readerErr = String(e && e.message).slice(0, 100)
+        }
+      } catch (e) {
+        info.fetchErr = String(e && e.message).slice(0, 100)
+      }
+      try {
+        const r2 = await fetch(signed, { method: 'GET', headers: {} })
+        const buf = new Uint8Array(await new Response(r2.body, { status: 200 }).arrayBuffer())
+        info.passthroughLen = buf.length
+      } catch (e) {
+        info.passErr = String(e && e.message).slice(0, 100)
+      }
+      try {
+        const r3 = await fetch(signed, { method: 'GET', headers: {} })
+        const t = await r3.text()
+        info.textLen = t.length
+      } catch (e) {
+        info.textErr = String(e && e.message).slice(0, 100)
+      }
+      try {
+        const r4 = await fetch(signed, { method: 'GET', headers: {} })
+        const b = await r4.arrayBuffer()
+        info.abLen = b.byteLength
+      } catch (e) {
+        info.abErr = String(e && e.message).slice(0, 100)
+      }
+      try {
+        const r5 = await fetch(signed, { method: 'GET', headers: {} })
+        let n = 0
+        for await (const chunk of r5.body) n += chunk.length
+        info.iterLen = n
+      } catch (e) {
+        info.iterErr = String(e && e.message).slice(0, 100)
+      }
+      return json(info, 200, request, env)
+    }
+
     return json({ error: 'Not Found' }, 404, request, env)
 }
 
