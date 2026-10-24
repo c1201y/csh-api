@@ -2917,9 +2917,46 @@ async function handleStatus(request, env) {
       out.kvError = String((err && err.message) || err).slice(0, 160)
     }
   }
-  out.services.ossConfig = !!(env.OSS_ACCESS_KEY_ID && env.OSS_ACCESS_KEY_SECRET && env.OSS_BUCKET)
+  const ossConfig = !!(env.OSS_ACCESS_KEY_ID && env.OSS_ACCESS_KEY_SECRET && env.OSS_BUCKET)
+  const githubConfig = !!(env.GITHUB_TOKEN && env.GITHUB_OWNER && env.GITHUB_REPO)
+  const gateOk = out.services.kv
+  const missingOss = ossConfig ? [] : ['OSS_ACCESS_KEY_ID/SECRET']
+  const missingGithub = githubConfig ? [] : ['GITHUB_TOKEN']
+  out.services.ossConfig = ossConfig
   out.services.signConfig = !!env.SIGN_API_KEY
-  out.services.githubConfig = !!(env.GITHUB_TOKEN && env.GITHUB_OWNER && env.GITHUB_REPO)
+  out.services.githubConfig = githubConfig
+  out.features = [
+    {
+      key: 'announce', name: '教室喊话',
+      ok: gateOk,
+      need: gateOk ? [] : ['状态存储（Blob/KV）'],
+    },
+    {
+      key: 'submit', name: '软件投稿',
+      ok: ossConfig && gateOk,
+      need: [].concat(missingOss, gateOk ? [] : ['状态存储']),
+    },
+    {
+      key: 'ossSign', name: '投稿直传签名',
+      ok: ossConfig,
+      need: missingOss,
+    },
+    {
+      key: 'echoCave', name: '回声洞提交',
+      ok: githubConfig,
+      need: missingGithub,
+    },
+    {
+      key: 'feedback', name: '问题反馈',
+      ok: githubConfig,
+      need: missingGithub,
+    },
+    {
+      key: 'dl', name: '下载闸门/加速',
+      ok: ossConfig && !!env.SIGN_API_KEY && gateOk,
+      need: [].concat(missingOss, env.SIGN_API_KEY ? [] : ['SIGN_API_KEY'], gateOk ? [] : ['状态存储']),
+    },
+  ]
   try {
     const t0 = Date.now()
     const l = await relayListDetailed(env, 'icon/')
@@ -2951,8 +2988,32 @@ async function handleStatus(request, env) {
   return json(out, out.ok ? 200 : 503, request, env)
 }
 
+const ENV_DEFAULTS = {
+  ALLOWED_ORIGIN: '*',
+  GITHUB_OWNER: 'c1201y',
+  GITHUB_REPO: 'classsoftwarehub',
+  GITHUB_BRANCH: 'main',
+  OSS_BUCKET: 'classsoftwarehub',
+  OSS_REGION: 'cn-shanghai',
+  OSS_ENDPOINT: 'oss-cn-shanghai.aliyuncs.com',
+  OSS_PUBLIC_BASE: 'https://classsoftwarehub.oss-cn-shanghai.aliyuncs.com',
+  OSS_PREFIX: 'upload',
+  DL_MODE: 'direct',
+  DL_DAILY_LIMIT: '25',
+  DL_DIRECT_MONTHLY_GB: '0',
+  DL_RELAY_MONTHLY_GB: '0',
+  GC_ORPHAN_MINUTES: '15',
+  GC_STALE_RECORD_HOURS: '24',
+  SUBMIT_REQUIRE_SOURCE: 'true',
+  SUBMIT_MAX_PER_DAY: '6',
+  SUBMIT_MAX_PENDING: '3',
+  DL_SIGN_SECRET: 'e6a1046a6a4af414f3c59981478058bc7741f142ac53c6c6b8478f7427d04763',
+  PURGE_TOKEN: 'b2db27acfc920621ed5c09ba4d7c6942ad5c24360530a920',
+  RELAY_TOKEN: 'a7k3m9p2q5r1t8v4x6z0b2d4f7h1j3l5',
+}
+
 export async function onRequest(context) {
-  const env = Object.assign({}, context.env || {})
+  const env = Object.assign({}, ENV_DEFAULTS, context.env || {})
   const kv = await gateKv()
   env.DL_GATE = makeGate(kv)
   const ctx = {
