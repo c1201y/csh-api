@@ -3096,11 +3096,356 @@ async function handleAnnounceList(request, env) {
   return json({ ok: true, devices: out.devices || [] }, 200, request, env)
 }
 
+// ══════════════════════════════════════════════════════════════════════
+// 正版校验
+//
+// 桌面端仓库公开，客户端里任何判定都能被改掉，所以判定放在服务端：
+// 官方包里由打包脚本注入一份构建签名（build-stamp.txt），请求头带上；
+// 服务端验签通过就下发短期令牌，非官方构建只能靠激活码换令牌。
+//
+// 协议与迁移顺序见 csh-win7-repo/docs/正版校验与服务端接入.md，
+// 客户端实现见 src/Services/License/。
+// ══════════════════════════════════════════════════════════════════════
+
+const LIC_ACTIVATE_PATH = '/api/license/activate'
+
+// 需要校验的路由。mirror-sign / dl / dl-ticket / icon / status 不在此列：
+// 网页端与下载链路也在用，且下载侧另有票据与限额。
+const LIC_GATED_PREFIXES = ['/api/submit', '/api/echocave', '/api/feedback', '/api/oss-sign', '/api/announce/']
+
+const LIC_CODE_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ'
+
+const LIC_CODE_EPOCH_MS = Date.UTC(2020, 0, 1)
+
+const LIC_CODE_LEN = 16
+
+const LIC_TRY_KEY = 'lic:try:'
+
+const LIC_DEVICE_KEY = 'lic:d:'
+
+const LIC_DENY_BODY = {
+  error: '您使用的 ClassSoftwareHub 不是正版，请输入激活码激活。',
+  code: 'csh_license_required',
+}
+
+function licEnforce(env) {
+  return String((env && env.CSH_LIC_ENFORCE) ?? '').toLowerCase() === 'true'
+}
+
+function licBytesFromHex(hex) {
+  const text = String(hex || '').trim().toLowerCase()
+  if (text.length === 0 || text.length % 2 !== 0 || !/^[0-9a-f]+$/.test(text)) return null
+  const out = new Uint8Array(text.length / 2)
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(text.slice(i * 2, i * 2 + 2), 16)
+  return out
+}
+
+function licHex(bytes) {
+  let out = ''
+  for (const b of bytes) out += b.toString(16).padStart(2, '0')
+  return out
+}
+
+function licSameBytes(a, b) {
+  if (!a || !b || a.length !== b.length) return false
+  let diff = 0
+  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i]
+  return diff === 0
+}
+
+function licBase32Encode(bytes) {
+  let bits = 0
+  let value = 0
+  let out = ''
+  for (const byte of bytes) {
+    value = (value << 8) | byte
+    bits += 8
+    while (bits >= 5) {
+      out += LIC_CODE_ALPHABET[(value >>> (bits - 5)) & 31]
+      bits -= 5
+    }
+  }
+  if (bits > 0) out += LIC_CODE_ALPHABET[(value << (5 - bits)) & 31]
+  return out
+}
+
+function licBase32Decode(text) {
+  const out = []
+  let bits = 0
+  let value = 0
+  for (const ch of String(text || '').toUpperCase()) {
+    const index = LIC_CODE_ALPHABET.indexOf(ch)
+    if (index < 0) continue
+    value = (value << 5) | index
+    bits += 5
+    if (bits >= 8) {
+      out.push((value >>> (bits - 8)) & 255)
+      bits -= 8
+    }
+  }
+  return Uint8Array.from(out)
+}
+
+function licB64Url(bytes) {
+  let binary = ''
+  for (const b of bytes) binary += String.fromCharCode(b)
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+
+function licB64UrlDecode(text) {
+  const padded = String(text || '').replace(/-/g, '+').replace(/_/g, '/')
+  const binary = atob(padded + '='.repeat((4 - (padded.length % 4)) % 4))
+  const out = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i)
+  return out
+}
+
+/** 构建签名 = HMAC-SHA256(CSH_BUILD_SECRET, "v1|<buildId>")，与打包脚本同一算法。 */
+async function licVerifyBuild(buildId, signature, env) {
+  if (!buildId || !signature) return false
+  if (buildId.length > 96 || buildId.indexOf('|') >= 0) return false
+
+  const provided = licBytesFromHex(signature)
+  if (!provided || provided.length !== 32) return false
+
+  const payload = `v1|${buildId}`
+  const secrets = [env.CSH_BUILD_SECRET, env.CSH_BUILD_SECRET_OLD]
+  for (const secret of secrets) {
+    if (!secret) continue
+    const mac = new Uint8Array(await hmacSha256(textEncoder.encode(String(secret)), payload))
+    if (licSameBytes(mac, provided)) return true
+  }
+  return false
+}
+
+/**
+ * 激活码：16 个字符（Crockford base32 去掉 I/L/O/U）。
+ * payload 5 字节 = 签发起始日（自 2020-01-01 的天数, uint16 BE）+ 序列号（uint24 BE）
+ * mac     5 字节 = HMAC-SHA256(CSH_LICENSE_SECRET, "code|<payload hex>")[0..5]
+ * 纯离线校验，不建表；作废靠换密钥或维护黑名单。
+ */
+async function licVerifyCode(code, env) {
+  const raw = licBase32Decode(code)
+  if (raw.length !== 10) return { ok: false, reason: 'format' }
+
+  const payload = raw.slice(0, 5)
+  const mac = raw.slice(5)
+  const expected = new Uint8Array(
+    await hmacSha256(textEncoder.encode(String(env.CSH_LICENSE_SECRET)), `code|${licHex(payload)}`)
+  )
+  if (!licSameBytes(expected.slice(0, 5), mac)) return { ok: false, reason: 'signature' }
+
+  const days = (payload[0] << 8) | payload[1]
+  const serial = (payload[2] << 16) | (payload[3] << 8) | payload[4]
+  return { ok: true, issuedAt: LIC_CODE_EPOCH_MS + days * 86400000, serial }
+}
+
+/** 令牌 = base64url(payloadJSON) + "." + base64url(HMAC-SHA256(secret, payloadJSON)[0..16]) */
+async function licIssueToken(device, hint, days, env) {
+  const lifespan = Number(days > 0 ? days : (env.CSH_LICENSE_DAYS || 365))
+  const payload = {
+    v: 1,
+    d: String(device || '').slice(0, 64),
+    e: lifespan > 0 ? Math.floor(Date.now() / 1000) + lifespan * 86400 : 0,
+    n: String(hint || '').slice(0, 16),
+  }
+  const body = textEncoder.encode(JSON.stringify(payload))
+  const mac = new Uint8Array(await hmacSha256(textEncoder.encode(String(env.CSH_LICENSE_SECRET)), body))
+  return { token: `${licB64Url(body)}.${licB64Url(mac.slice(0, 16))}`, payload }
+}
+
+async function licVerifyToken(token, device, env) {
+  if (!token || token.indexOf('.') < 0) return null
+
+  const parts = String(token).split('.')
+  if (parts.length !== 2) return null
+
+  let body
+  let mac
+  try {
+    body = licB64UrlDecode(parts[0])
+    mac = licB64UrlDecode(parts[1])
+  } catch {
+    return null
+  }
+  if (body.length === 0 || mac.length !== 16) return null
+
+  const expected = new Uint8Array(await hmacSha256(textEncoder.encode(String(env.CSH_LICENSE_SECRET)), body))
+  if (!licSameBytes(expected.slice(0, 16), mac)) return null
+
+  let payload
+  try {
+    payload = JSON.parse(new TextDecoder().decode(body))
+  } catch {
+    return null
+  }
+  if (!payload || payload.v !== 1) return null
+  if (payload.d && payload.d !== device) return null
+  if (payload.e && payload.e * 1000 <= Date.now()) return null
+  return payload
+}
+
+/**
+ * 网页端豁免：浏览器发起的请求没有构建签名，靠来源与 fetch 元数据识别。
+ * ⚠️ sec-fetch-mode 是浏览器的禁止修改头，普通 HTTP 客户端不会带 —— 提高伪造门槛，不是安全边界。
+ */
+function licBrowserAllowed(request, env) {
+  if (!request.headers.get('sec-fetch-mode')) return false
+
+  const raw = request.headers.get('origin') || request.headers.get('referer') || ''
+  let host
+  try {
+    host = new URL(raw).hostname.toLowerCase()
+  } catch {
+    return false
+  }
+
+  const list = String(env.CSH_LIC_BROWSER_ORIGINS || '')
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean)
+  return list.some((allowed) => host === allowed || host.endsWith('.' + allowed))
+}
+
+/** 旧客户端豁免窗口：完全不带构建标识的版本在截止日前照常放行。 */
+function licLegacyOpen(env) {
+  const until = String(env.CSH_LIC_LEGACY_UNTIL || '').trim()
+  if (!until) return false
+  const at = Date.parse(until)
+  return Number.isFinite(at) && Date.now() < at
+}
+
+/**
+ * 闸门。返回 null = 放行；{ deny } = 直接回绝；{ headers } = 放行并把响应头合并进真实响应
+ * （官方构建首次访问时下发短期令牌，客户端存下后就不再重复验签）。
+ */
+async function licenseGuard(request, env) {
+  const url = new URL(request.url)
+  if (!LIC_GATED_PREFIXES.some((prefix) => url.pathname === prefix || url.pathname.startsWith(prefix))) {
+    return null
+  }
+
+  const device = String(request.headers.get('x-csh-device') || '').slice(0, 64)
+  const build = String(request.headers.get('x-csh-build') || '').trim()
+  const signature = String(request.headers.get('x-csh-sig') || '').trim()
+
+  if (env.CSH_LICENSE_SECRET) {
+    const payload = await licVerifyToken(request.headers.get('x-csh-lic'), device, env)
+    if (payload) return null
+  }
+
+  let headers = null
+  if (build && await licVerifyBuild(build, signature, env)) {
+    if (env.CSH_LICENSE_SECRET) {
+      // 官方构建只发短期令牌：密钥轮换或构建号作废后，最多一个周期自然失效
+      const issued = await licIssueToken(device, 'official', Number(env.CSH_OFFICIAL_TOKEN_DAYS || 30), env)
+      headers = { 'X-CSH-Lic': issued.token, 'X-CSH-Lic-Exp': String(issued.payload.e) }
+    } else {
+      headers = null
+    }
+    return headers ? { headers } : null
+  }
+
+  const exempt = (!build && licLegacyOpen(env)) || licBrowserAllowed(request, env)
+  if (exempt) return null
+
+  if (!licEnforce(env)) {
+    console.warn(`license: would deny ${url.pathname} build=${build || '(none)'}`)
+    return null
+  }
+
+  return { deny: json(LIC_DENY_BODY, 403, request, env) }
+}
+
+/** POST /api/license/activate —— 激活码换令牌。兑换本身不能要求授权，否则死循环。 */
+async function handleLicenseActivate(request, env) {
+  if (request.method !== 'POST') return json({ error: '只接受 POST' }, 405, request, env)
+  if (!env.CSH_LICENSE_SECRET) return json({ error: '激活服务未配置' }, 503, request, env)
+
+  let body
+  try {
+    body = await request.json()
+  } catch {
+    return json({ error: '请求格式错误' }, 400, request, env)
+  }
+
+  const code = String(body?.code || '').replace(/[^0-9A-Za-z]/g, '').toUpperCase()
+  const device = String(body?.device || '').slice(0, 64)
+  if (code.length !== LIC_CODE_LEN) {
+    return json({ error: `激活码长度不对（应为 ${LIC_CODE_LEN} 个字符）。` }, 400, request, env)
+  }
+  if (!device) return json({ error: '缺少设备码。' }, 400, request, env)
+
+  // 防爆破：同一来源每日尝试次数上限
+  const srcRaw = request.headers.get('x-forwarded-for') || request.headers.get('eagleeye-real-ip') || 'unknown'
+  const src = (await sha256Hex(String(srcRaw).split(',')[0].trim())).slice(0, 24)
+  const kv = await gateKv()
+  const day = gateDay()
+  const tryKey = LIC_TRY_KEY + day + ':' + src
+  if (kv) {
+    let rec = (await kvJson(kv, tryKey)) || null
+    if (!alive(rec) || rec.day !== day) rec = { day, n: 0, _exp: Date.now() + 36 * 3600 * 1000 }
+    const limit = Math.max(1, Number(env.CSH_LIC_TRY_PER_DAY) || 30)
+    if (rec.n >= limit) {
+      return json({ error: '今日激活尝试次数过多，请明天再试或把设备码发给开发者。' }, 429, request, env)
+    }
+    rec.n = Number(rec.n) + 1
+    try { await kvSave(kv, tryKey, rec) } catch {}
+  }
+
+  const check = await licVerifyCode(code, env)
+  if (!check.ok) {
+    return json({ error: check.reason === 'signature' ? '激活码无效。' : '激活码格式不对。' }, 400, request, env)
+  }
+
+  const issued = await licIssueToken(device, code.slice(-4), undefined, env)
+
+  if (kv) {
+    try {
+      await kvSave(kv, LIC_DEVICE_KEY + device, {
+        at: Date.now(),
+        tail: code.slice(-4),
+        serial: check.serial,
+        build: String(body?.build || '').slice(0, 96),
+        ver: String(body?.version || '').slice(0, 32),
+        _exp: Date.now() + 400 * 24 * 3600 * 1000,
+      })
+    } catch {}
+  }
+
+  return json({
+    success: true,
+    message: '激活成功。',
+    token: issued.token,
+    expiresAt: issued.payload.e,
+  }, 200, request, env)
+}
+
 async function workerFetch(request, env, ctx) {
     if (request.method === 'OPTIONS') {
       return new Response(null, { headers: corsHeaders(request, env) })
     }
 
+    const url = new URL(request.url)
+
+    if (url.pathname === LIC_ACTIVATE_PATH) return handleLicenseActivate(request, env)
+
+    const gate = await licenseGuard(request, env)
+    if (gate && gate.deny) return gate.deny
+
+    const response = await routeRequest(request, env, ctx)
+    if (!gate || !gate.headers) return response
+
+    try {
+      const merged = new Response(response.body, response)
+      for (const [name, value] of Object.entries(gate.headers)) merged.headers.set(name, value)
+      return merged
+    } catch {
+      return response
+    }
+}
+
+async function routeRequest(request, env, ctx) {
     const url = new URL(request.url)
 
     if (url.pathname === '/api/status' && request.method === 'GET') return handleStatus(request, env)
@@ -3191,6 +3536,13 @@ async function handleStatus(request, env) {
   out.services.ossConfig = ossConfig
   out.services.signConfig = !!env.SIGN_API_KEY
   out.services.githubConfig = githubConfig
+  out.services.licenseConfig = !!(env.CSH_BUILD_SECRET && env.CSH_LICENSE_SECRET)
+  out.license = {
+    enforce: licEnforce(env),
+    buildSecret: !!env.CSH_BUILD_SECRET,
+    licenseSecret: !!env.CSH_LICENSE_SECRET,
+    legacyUntil: String(env.CSH_LIC_LEGACY_UNTIL || '') || null,
+  }
   out.features = [
     {
       key: 'announce', name: '教室喊话',
@@ -3281,6 +3633,13 @@ const ENV_DEFAULTS = {
   SUBMIT_REQUIRE_SOURCE: 'true',
   SUBMIT_MAX_PER_DAY: '6',
   SUBMIT_MAX_PENDING: '3',
+  // 正版校验：默认处于观察期（只记日志不拦），确认官方客户端都带构建签名后再改 true
+  CSH_LIC_ENFORCE: 'false',
+  CSH_LICENSE_DAYS: '365',
+  CSH_OFFICIAL_TOKEN_DAYS: '30',
+  CSH_LIC_LEGACY_UNTIL: '',
+  CSH_LIC_BROWSER_ORIGINS: 'classsoftwarehub.cn,www.classsoftwarehub.cn',
+  CSH_LIC_TRY_PER_DAY: '30',
 }
 
 export async function onRequest(context) {

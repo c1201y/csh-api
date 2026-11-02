@@ -43,6 +43,23 @@
 | `RELAY_HOST` / `RELAY_PORT` / `RELAY_TOKEN` | 密钥/文本 | 中继相关；腾讯侧文件操作已改直连，可留空 |
 | `SIGN_API_KEY` | 密钥 | 同 CF 原值 |
 
+### 正版校验相关（桌面端构建签名 / 激活码）
+
+| 名称 | 类型 | 说明 |
+|---|---|---|
+| `CSH_BUILD_SECRET` | 密钥 | 官方构建签名密钥；必须与桌面端打包用的值一致（桌面端 `.secrets/build-secret.txt`） |
+| `CSH_BUILD_SECRET_OLD` | 密钥 | 上一把构建密钥，轮换过渡期用，平时留空 |
+| `CSH_LICENSE_SECRET` | 密钥 | 激活码与令牌签名密钥；**不要**与构建密钥相同 |
+| `CSH_LIC_ENFORCE` | 文本 | `true` 才真正拦截；默认 `false`（观察期，只在控制台打 `license: would deny`） |
+| `CSH_LIC_LEGACY_UNTIL` | 文本 | 旧客户端（不带 `X-CSH-Build`）豁免截止日，ISO 时间 |
+| `CSH_LIC_BROWSER_ORIGINS` | 文本 | 浏览器豁免域名，逗号分隔，默认 `classsoftwarehub.cn,www.classsoftwarehub.cn` |
+| `CSH_LICENSE_DAYS` / `CSH_OFFICIAL_TOKEN_DAYS` | 文本 | 激活令牌 / 官方自动签发令牌的有效天数（365 / 30） |
+| `CSH_LIC_TRY_PER_DAY` | 文本 | 同一来源每天激活尝试上限，默认 30 |
+
+上线顺序：先发带签名的桌面版 → 后端以 `CSH_LIC_ENFORCE=false` 部署并观察日志 → 确认无误后设
+`CSH_LIC_LEGACY_UNTIL` 与 `CSH_LIC_ENFORCE=true`。判定流程与环境变量含义见桌面端仓库
+`docs/正版校验与服务端接入.md`。
+
 ## 已知行为差异 / 风险
 
 1. **KV 最终一致**：原 Durable Object 是强一致单点；KV 为最终一致。每日配额（票据 25 次/设备/天）在极端并发下可能少量超发；文件登记表在低频管理操作下实际无竞争。原 15 分钟孤儿回收窗口不受影响。
