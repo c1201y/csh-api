@@ -51,6 +51,7 @@
 | `CSH_BUILD_SECRET_OLD` | 密钥 | 上一把构建密钥，轮换过渡期用，平时留空 |
 | `CSH_LICENSE_SECRET` | 密钥 | 激活码与令牌签名密钥；**不要**与构建密钥相同 |
 | `CSH_LIC_ENFORCE` | 文本 | `true` 才真正拦截；默认 `false`（观察期，只在控制台打 `license: would deny`） |
+| `CSH_LIC_ENFORCE_AT` | 文本 | 定时开闸：到该 ISO 时间点后 `enforce` 自动为 `true`，无需再次部署。与 `CSH_LIC_ENFORCE` 任一成立即生效 |
 | `CSH_LIC_LEGACY_UNTIL` | 文本 | 旧客户端（不带 `X-CSH-Build`）豁免截止日，ISO 时间 |
 | `CSH_LIC_BROWSER_ORIGINS` | 文本 | 浏览器豁免域名，逗号分隔，默认 `classsoftwarehub.cn,www.classsoftwarehub.cn` |
 | `CSH_LICENSE_DAYS` / `CSH_OFFICIAL_TOKEN_DAYS` | 文本 | 激活令牌 / 官方自动签发令牌的有效天数（365 / 30） |
@@ -59,6 +60,10 @@
 上线顺序：先发带签名的桌面版 → 后端以 `CSH_LIC_ENFORCE=false` 部署并观察日志 → 确认无误后设
 `CSH_LIC_LEGACY_UNTIL` 与 `CSH_LIC_ENFORCE=true`。判定流程与环境变量含义见桌面端仓库
 `docs/正版校验与服务端接入.md`。
+
+过渡期建议：把 `CSH_LIC_ENFORCE_AT` 设为截止日（如首批签名版发布后 30 天），`CSH_LIC_ENFORCE`
+保持 `false` 只观察；到点后自动开始拦截，不必再进控制台。要提前开闸就直接把 `CSH_LIC_ENFORCE`
+改成 `true`。`/api/status` 的 `license` 字段会同时给出 `enforce` 与 `enforceAt`。
 
 ## 已知行为差异 / 风险
 

@@ -3129,7 +3129,10 @@ const LIC_DENY_BODY = {
 }
 
 function licEnforce(env) {
-  return String((env && env.CSH_LIC_ENFORCE) ?? '').toLowerCase() === 'true'
+  if (String((env && env.CSH_LIC_ENFORCE) ?? '').toLowerCase() === 'true') return true
+  // 定时开闸：到点自动生效，避免「到日子还得有人记得去控制台改一下再重新部署」。
+  const at = Date.parse(String((env && env.CSH_LIC_ENFORCE_AT) || ''))
+  return Number.isFinite(at) && Date.now() >= at
 }
 
 function licBytesFromHex(hex) {
@@ -3549,6 +3552,7 @@ async function handleStatus(request, env) {
   out.services.licenseConfig = !!(env.CSH_BUILD_SECRET && env.CSH_LICENSE_SECRET)
   out.license = {
     enforce: licEnforce(env),
+    enforceAt: String(env.CSH_LIC_ENFORCE_AT || '') || null,
     buildSecret: !!env.CSH_BUILD_SECRET,
     licenseSecret: !!env.CSH_LICENSE_SECRET,
     legacyUntil: String(env.CSH_LIC_LEGACY_UNTIL || '') || null,
@@ -3645,6 +3649,7 @@ const ENV_DEFAULTS = {
   SUBMIT_MAX_PENDING: '3',
   // 正版校验：默认处于观察期（只记日志不拦），确认官方客户端都带构建签名后再改 true
   CSH_LIC_ENFORCE: 'false',
+  CSH_LIC_ENFORCE_AT: '',
   CSH_LICENSE_DAYS: '365',
   CSH_OFFICIAL_TOKEN_DAYS: '30',
   CSH_LIC_LEGACY_UNTIL: '',
