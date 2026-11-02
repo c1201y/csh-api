@@ -3649,7 +3649,9 @@ const ENV_DEFAULTS = {
   SUBMIT_MAX_PENDING: '3',
   // 正版校验：默认处于观察期（只记日志不拦），确认官方客户端都带构建签名后再改 true
   CSH_LIC_ENFORCE: 'false',
-  CSH_LIC_ENFORCE_AT: '',
+  // 定时开闸：首批带签名的桌面版发布于 2026-11-02，给 30 天缓冲，到点自动开始拦截。
+  // 要提前或延后，在控制台覆盖这个变量即可；想彻底关掉就把它设成空字符串。
+  CSH_LIC_ENFORCE_AT: '2026-12-02T00:00:00Z',
   CSH_LICENSE_DAYS: '365',
   CSH_OFFICIAL_TOKEN_DAYS: '30',
   CSH_LIC_LEGACY_UNTIL: '',
