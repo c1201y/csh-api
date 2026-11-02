@@ -3219,6 +3219,16 @@ async function licVerifyBuild(buildId, signature, env) {
 }
 
 /**
+ * 归一化用户提交的激活码：去分隔符、转大写，并剥掉签发工具加的可读前缀。
+ * 签发端输出 `CSH-XXXX-XXXX-XXXX-XXXX`，本体只有 16 位；用户从聊天窗口复制时
+ * 还会夹带空格、全角连字符，所以两端都按同一规则处理。
+ */
+function licNormalizeCode(input) {
+  const text = String(input || '').replace(/[^0-9A-Za-z]/g, '').toUpperCase()
+  return text.length === LIC_CODE_LEN + 3 && text.startsWith('CSH') ? text.slice(3) : text
+}
+
+/**
  * 激活码：16 个字符（Crockford base32 去掉 I/L/O/U）。
  * payload 5 字节 = 签发起始日（自 2020-01-01 的天数, uint16 BE）+ 序列号（uint24 BE）
  * mac     5 字节 = HMAC-SHA256(CSH_LICENSE_SECRET, "code|<payload hex>")[0..5]
@@ -3369,7 +3379,7 @@ async function handleLicenseActivate(request, env) {
     return json({ error: '请求格式错误' }, 400, request, env)
   }
 
-  const code = String(body?.code || '').replace(/[^0-9A-Za-z]/g, '').toUpperCase()
+  const code = licNormalizeCode(body?.code)
   const device = String(body?.device || '').slice(0, 64)
   if (code.length !== LIC_CODE_LEN) {
     return json({ error: `激活码长度不对（应为 ${LIC_CODE_LEN} 个字符）。` }, 400, request, env)
