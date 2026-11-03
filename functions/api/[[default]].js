@@ -2547,6 +2547,22 @@ async function blobKv() {
           async delete(key) {
             await store.delete(blobKey(key))
           },
+          // 枚举同前缀的键（Blob SDK 支持 list；键按段编码存储，这里还原回原始键）
+          async list(prefix) {
+            const res = await store.list({ prefix: blobKey(prefix), consistency: 'strong' })
+            return (res.blobs || []).map((b) =>
+              String(b.key || '')
+                .split('/')
+                .map((seg) => {
+                  try {
+                    return decodeURIComponent(seg)
+                  } catch {
+                    return seg
+                  }
+                })
+                .join('/')
+            )
+          },
         }
       } catch (err) {
         return null
@@ -3160,6 +3176,8 @@ const ADM_DEV_INDEX_KEY = 'lic:dev:idx'
 const ADM_BAN_KEY = 'lic:ban:'
 
 const ADM_FAIL_KEY = 'adm:fail:'
+
+const ADM_DEV_BACKFILL_KEY = 'lic:dev:backfill'
 
 function admUser(env) {
   return String((env && env.CSH_ADMIN_USER) || 'admin').trim().slice(0, 64) || 'admin'
@@ -3886,8 +3904,53 @@ async function handleAdminDevices(request, env) {
   const kv = await gateKv()
   if (!kv) return admJson({ error: '状态存储不可用' }, 503)
 
+  // 索引是后台上线后才维护的；老设备只留了 lic:d:<device> 记录，
+  // 首次打开设备页时扫一遍前缀补进索引（只跑一次，之后靠激活时增量写入）。
+  const backfilled = await licBackfillDevices(kv)
+
   const devices = await admIndex(kv, ADM_DEV_INDEX_KEY)
-  return admJson({ ok: true, devices })
+  return admJson({ ok: true, devices, backfilled })
+}
+
+/**
+ * 存量设备回填。扫描 lic:d: 前缀（Blob 存储支持 list；KV 绑定若不支持则跳过，
+ * 不影响增量路径）。已在新索引里的设备以索引为准，不覆盖。
+ */
+async function licBackfillDevices(kv) {
+  if (!kv || typeof kv.list !== 'function') return false
+  try {
+    const marker = await kvJson(kv, ADM_DEV_BACKFILL_KEY)
+    if (alive(marker)) return true
+
+    const keys = await kv.list(LIC_DEVICE_KEY)
+    const devices = await admIndex(kv, ADM_DEV_INDEX_KEY)
+    const byDevice = new Map(devices.filter((d) => d && d.d).map((d) => [d.d, d]))
+
+    for (const key of keys) {
+      const device = String(key).slice(LIC_DEVICE_KEY.length)
+      if (!device || byDevice.has(device)) continue
+      const rec = await kvJson(kv, key)
+      if (!alive(rec)) continue
+      byDevice.set(device, {
+        d: device,
+        at: Number(rec.at) || 0,
+        first: Number(rec.at) || 0,
+        tail: String(rec.tail || '').slice(0, 8),
+        s: Number(rec.serial) || 0,
+        build: String(rec.build || '').slice(0, 96),
+        ver: String(rec.ver || '').slice(0, 32),
+      })
+    }
+
+    const merged = [...byDevice.values()].sort((a, b) => (Number(b.at) || 0) - (Number(a.at) || 0))
+    await admIndexSave(kv, ADM_DEV_INDEX_KEY, merged)
+    await kvSave(kv, ADM_DEV_BACKFILL_KEY, { at: Date.now(), n: merged.length })
+    console.log(`admin: device index backfilled, ${merged.length} device(s)`)
+    return true
+  } catch (err) {
+    console.warn('admin: device backfill failed:', String((err && err.message) || err).slice(0, 120))
+    return false
+  }
 }
 
 /** POST /api/admin/ban { device, hours, reason } —— hours=0 表示永久。 */

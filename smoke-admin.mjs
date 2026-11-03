@@ -8,6 +8,7 @@ globalThis.CSH_STATE = {
   async get(key) { return store.has(key) ? store.get(key) : null },
   async put(key, value) { store.set(key, String(value)) },
   async delete(key) { store.delete(key) },
+  async list(prefix) { return [...store.keys()].filter((k) => k.startsWith(prefix)) },
 }
 
 const env = {
@@ -74,8 +75,20 @@ const device = 'a1b2c3d4e5f60708'
 const act = await jsonOf(await call('/api/license/activate', { method: 'POST', body: { code, device, version: '1.2.0', build: 'test' } }))
 log('激活码可兑换令牌', act.status === 200 && !!act.data.token)
 
+// 预置一台后台上线前激活的老设备（只有 lic:d: 记录，无索引），验证回填
+const legacyDevice = '0legacy00000000a'
+await store.set('lic:d:' + legacyDevice, JSON.stringify({
+  at: Date.now() - 30 * 86400e3, tail: 'OLD9', serial: 77, build: 'dv1.1.0', ver: '1.1.0',
+  _exp: Date.now() + 300 * 86400e3,
+}))
+
 const devices = await jsonOf(await call('/api/admin/devices', { headers: { cookie } }))
 log('设备出现在后台列表', devices.status === 200 && devices.data.devices?.some((d) => d.d === device))
+log('存量老设备被回填', devices.data.devices?.some((d) => d.d === legacyDevice && d.tail === 'OLD9'))
+
+const devicesAgain = await jsonOf(await call('/api/admin/devices', { headers: { cookie } }))
+log('回填只跑一次且不产生重复', devicesAgain.data.backfilled === true &&
+  devicesAgain.data.devices.filter((d) => d.d === legacyDevice).length === 1)
 
 const codesAfter = await jsonOf(await call('/api/admin/codes', { headers: { cookie } }))
 const rec = codesAfter.data.codes?.find((c) => c.s === serial)
