@@ -786,7 +786,8 @@ function corsHeaders(request, env) {
   const origin = getOrigin(request, env)
   const headers = {
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Allow-Headers':
+      'Content-Type, X-CSH-Device, X-CSH-Did, X-CSH-Build, X-CSH-Sig, X-CSH-Lic, X-Purge-Token',
     'Access-Control-Max-Age': '86400',
     'Vary': 'Origin',
   }
@@ -3128,6 +3129,233 @@ const LIC_DENY_BODY = {
   code: 'csh_license_required',
 }
 
+// ── 管理后台（登录 / 激活码签发）─────────────────────────────────────
+//
+// 后台页面是静态 HTML（functions/admin.js），数据全部走 /api/admin/*。
+// 会话用 HttpOnly Cookie + HMAC 签名，密钥取 CSH_ADMIN_SESSION_SECRET，
+// 未配置时回落 CSH_LICENSE_SECRET；生产环境建议两者分开。
+//
+// 激活码本身仍是纯离线校验（见 licVerifyCode），后台只负责签发与对账：
+// 签发记录、激活记录都存在状态存储里，用于列表展示与封禁，删掉记录不影响
+// 已发出的码可用性 —— 要真正作废只能吊销（仅对未激活生效）或轮换密钥。
+
+const ADM_COOKIE = 'csh_adm'
+
+const ADM_SESSION_TTL_HOURS = 12
+
+const ADM_LOGIN_FAIL_LIMIT = 10
+
+const ADM_LOGIN_FAIL_WINDOW_MS = 30 * 60 * 1000
+
+const ADM_MAX_BATCH = 50
+
+const ADM_INDEX_CAP = 200
+
+const ADM_SEQ_KEY = 'lic:seq'
+
+const ADM_CODE_INDEX_KEY = 'lic:c:idx'
+
+const ADM_DEV_INDEX_KEY = 'lic:dev:idx'
+
+const ADM_BAN_KEY = 'lic:ban:'
+
+const ADM_FAIL_KEY = 'adm:fail:'
+
+function admUser(env) {
+  return String((env && env.CSH_ADMIN_USER) || 'admin').trim().slice(0, 64) || 'admin'
+}
+
+function admSecret(env) {
+  return String((env && (env.CSH_ADMIN_SESSION_SECRET || env.CSH_LICENSE_SECRET)) || '')
+}
+
+function admReady(env) {
+  return !!admSecret(env) && !!(env.CSH_ADMIN_PASS || env.CSH_ADMIN_PASS_SHA256)
+}
+
+/** 后台响应：不带任何 CORS 头，禁止缓存，避免会话数据被中间层留存。 */
+function admJson(data, status, headers) {
+  return new Response(JSON.stringify(data), {
+    status: status || 200,
+    headers: {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
+      ...(headers || {}),
+    },
+  })
+}
+
+function admCookieGet(request, name) {
+  const raw = request.headers.get('cookie') || ''
+  for (const part of raw.split(';')) {
+    const at = part.indexOf('=')
+    if (at < 0) continue
+    if (part.slice(0, at).trim() !== name) continue
+    try {
+      return decodeURIComponent(part.slice(at + 1).trim())
+    } catch {
+      return ''
+    }
+  }
+  return ''
+}
+
+function admCookieSet(token, maxAge) {
+  const parts = [
+    `${ADM_COOKIE}=${encodeURIComponent(token)}`,
+    'Path=/',
+    `Max-Age=${maxAge}`,
+    'HttpOnly',
+    'Secure',
+    'SameSite=Strict',
+  ]
+  return parts.join('; ')
+}
+
+/** 请求来源校验：Cookie 已是 SameSite=Strict，这里再挡一层被嵌入/跨站提交的场景。 */
+function admSameOrigin(request) {
+  const site = String(request.headers.get('sec-fetch-site') || '').toLowerCase()
+  if (site && site !== 'same-origin' && site !== 'none') return false
+
+  const raw = request.headers.get('origin') || request.headers.get('referer') || ''
+  if (!raw) return true
+  try {
+    const host = new URL(request.url).host
+    return new URL(raw).host === host
+  } catch {
+    return false
+  }
+}
+
+function reqIp(request) {
+  const raw = request.headers.get('x-forwarded-for') || request.headers.get('eagleeye-real-ip') || ''
+  return String(raw).split(',')[0].trim() || 'unknown'
+}
+
+/** 定长比较，避免按字符提前返回泄漏密码前缀。 */
+function ctEqual(a, b) {
+  const x = String(a)
+  const y = String(b)
+  let diff = x.length ^ y.length
+  const n = Math.max(x.length, y.length)
+  for (let i = 0; i < n; i++) diff |= (x.charCodeAt(i) || 0) ^ (y.charCodeAt(i) || 0)
+  return diff === 0
+}
+
+async function admPasswordOk(env, pass) {
+  const hashed = String(env.CSH_ADMIN_PASS_SHA256 || '').trim().toLowerCase()
+  if (hashed) return ctEqual(await sha256Hex(String(pass)), hashed)
+  const plain = String(env.CSH_ADMIN_PASS || '')
+  return plain.length > 0 && ctEqual(pass, plain)
+}
+
+async function admIssueSession(env) {
+  const exp = Math.floor(Date.now() / 1000) + ADM_SESSION_TTL_HOURS * 3600
+  const mac = new Uint8Array(
+    await hmacSha256(textEncoder.encode(admSecret(env)), `admin|v1|${admUser(env)}|${exp}`)
+  )
+  return { token: `v1.${exp}.${licHex(mac.slice(0, 16))}`, exp }
+}
+
+async function admSession(request, env) {
+  if (!admReady(env)) return null
+  const parts = admCookieGet(request, ADM_COOKIE).split('.')
+  if (parts.length !== 3 || parts[0] !== 'v1') return null
+
+  const exp = Number(parts[1])
+  if (!Number.isFinite(exp) || exp * 1000 <= Date.now()) return null
+
+  const mac = new Uint8Array(
+    await hmacSha256(textEncoder.encode(admSecret(env)), `admin|v1|${admUser(env)}|${exp}`)
+  )
+  if (!ctEqual(parts[2].toLowerCase(), licHex(mac.slice(0, 16)))) return null
+  return { user: admUser(env), exp }
+}
+
+async function admIndex(kv, key) {
+  const list = await kvJson(kv, key)
+  return Array.isArray(list) ? list : []
+}
+
+async function admIndexSave(kv, key, list) {
+  await kvSave(kv, key, list.slice(0, ADM_INDEX_CAP))
+}
+
+/** 激活码本体：16 位 Crockford base32，展示时按 4 位分组并加 CSH- 前缀。 */
+async function licMakeCode(env, serial) {
+  const dayNumber = Math.floor((Date.now() - LIC_CODE_EPOCH_MS) / 86400000) & 0xffff
+  const payload = Uint8Array.from([
+    (dayNumber >> 8) & 0xff,
+    dayNumber & 0xff,
+    (serial >> 16) & 0xff,
+    (serial >> 8) & 0xff,
+    serial & 0xff,
+  ])
+  const mac = new Uint8Array(
+    await hmacSha256(textEncoder.encode(String(env.CSH_LICENSE_SECRET)), `code|${licHex(payload)}`)
+  )
+  const raw = new Uint8Array(10)
+  raw.set(payload, 0)
+  raw.set(mac.slice(0, 5), 5)
+  const body = licBase32Encode(raw)
+  return { code: 'CSH-' + body.match(/.{4}/g).join('-'), serial }
+}
+
+/** 设备封禁记录。until = 0 表示永久。 */
+async function licBanInfo(kv, device) {
+  if (!kv || !device) return null
+  const rec = await kvJson(kv, ADM_BAN_KEY + device)
+  if (!rec) return null
+  const until = Number(rec.until) || 0
+  if (until > 0 && until <= Date.now()) return null
+  return rec
+}
+
+function licBanMessage(ban) {
+  const until = Number(ban && ban.until) || 0
+  const reason = String((ban && ban.reason) || '').trim()
+  const tail = until > 0 ? `解封时间 ${new Date(until).toLocaleString('zh-CN')}` : '永久停用'
+  return `该设备已被停用${reason ? `（${reason}）` : ''}，${tail}。如有疑问请联系开发者。`
+}
+
+/** 激活成功后回写对账索引：哪个码被哪台设备、什么时候用掉。 */
+async function licRecordActivation(kv, info) {
+  if (!kv) return
+  const now = Date.now()
+  try {
+    const codes = await admIndex(kv, ADM_CODE_INDEX_KEY)
+    const serial = Number(info.serial) || 0
+    const hit = codes.find((c) => c && Number(c.s) === serial)
+    if (hit) {
+      hit.u = info.device
+      hit.ua = now
+      hit.n = Number(hit.n || 0) + 1
+      await admIndexSave(kv, ADM_CODE_INDEX_KEY, codes)
+    } else if (serial > 0) {
+      // 由外部签发工具生成、后台没有记录的码：补一条便于对账
+      codes.unshift({ s: serial, c: '', at: 0, note: '外部签发', ext: 1, u: info.device, ua: now, n: 1 })
+      await admIndexSave(kv, ADM_CODE_INDEX_KEY, codes)
+    }
+  } catch {}
+
+  try {
+    const devices = await admIndex(kv, ADM_DEV_INDEX_KEY)
+    const prev = devices.find((d) => d && d.d === info.device)
+    const entry = {
+      d: info.device,
+      at: now,
+      first: (prev && Number(prev.first)) || now,
+      tail: String(info.tail || '').slice(0, 8),
+      s: Number(info.serial) || 0,
+      build: String(info.build || '').slice(0, 96),
+      ver: String(info.version || '').slice(0, 32),
+    }
+    const rest = devices.filter((d) => d && d.d !== info.device)
+    await admIndexSave(kv, ADM_DEV_INDEX_KEY, [entry].concat(rest))
+  } catch {}
+}
+
 function licEnforce(env) {
   if (String((env && env.CSH_LIC_ENFORCE) ?? '').toLowerCase() === 'true') return true
   // 定时开闸：到点自动生效，避免「到日子还得有人记得去控制台改一下再重新部署」。
@@ -3338,9 +3566,27 @@ async function licenseGuard(request, env) {
     return null
   }
 
-  const device = String(request.headers.get('x-csh-device') || '').slice(0, 64)
+  const device = String(
+    request.headers.get('x-csh-device') || request.headers.get('x-csh-did') || ''
+  ).slice(0, 64)
   const build = String(request.headers.get('x-csh-build') || '').trim()
   const signature = String(request.headers.get('x-csh-sig') || '').trim()
+
+  // 封禁先于授权判定：被停用的设备即使令牌仍在有效期内也挡下来
+  if (device) {
+    const kv = await gateKv()
+    const ban = await licBanInfo(kv, device)
+    if (ban) {
+      return {
+        deny: json(
+          { error: licBanMessage(ban), code: 'csh_device_banned', until: Number(ban.until) || 0 },
+          403,
+          request,
+          env
+        ),
+      }
+    }
+  }
 
   if (env.CSH_LICENSE_SECRET) {
     const payload = await licVerifyToken(request.headers.get('x-csh-lic'), device, env)
@@ -3389,10 +3635,19 @@ async function handleLicenseActivate(request, env) {
   }
   if (!device) return json({ error: '缺少设备码。' }, 400, request, env)
 
+  const kv = await gateKv()
+
+  // 被封禁的设备连换码的机会都没有，避免「换个码继续用」
+  if (kv) {
+    const ban = await licBanInfo(kv, device)
+    if (ban) {
+      return json({ error: licBanMessage(ban), code: 'csh_device_banned', until: Number(ban.until) || 0 }, 403, request, env)
+    }
+  }
+
   // 防爆破：同一来源每日尝试次数上限
   const srcRaw = request.headers.get('x-forwarded-for') || request.headers.get('eagleeye-real-ip') || 'unknown'
   const src = (await sha256Hex(String(srcRaw).split(',')[0].trim())).slice(0, 24)
-  const kv = await gateKv()
   const day = gateDay()
   const tryKey = LIC_TRY_KEY + day + ':' + src
   if (kv) {
@@ -3411,17 +3666,35 @@ async function handleLicenseActivate(request, env) {
     return json({ error: check.reason === 'signature' ? '激活码无效。' : '激活码格式不对。' }, 400, request, env)
   }
 
-  const issued = await licIssueToken(device, code.slice(-4), undefined, env)
-
+  // 吊销只对「尚未激活」的码有效：已发出去的令牌是离线凭证，收不回来，
+  // 要连带失效只能封禁设备或轮换 CSH_LICENSE_SECRET。
   if (kv) {
     try {
-      await kvSave(kv, LIC_DEVICE_KEY + device, {
-        at: Date.now(),
-        tail: code.slice(-4),
+      const codes = await admIndex(kv, ADM_CODE_INDEX_KEY)
+      const hit = codes.find((c) => c && Number(c.s) === Number(check.serial))
+      if (hit && hit.r) return json({ error: '激活码已被吊销，请联系开发者重新获取。' }, 403, request, env)
+    } catch {}
+  }
+
+  const issued = await licIssueToken(device, code.slice(-4), undefined, env)
+
+  const deviceRec = {
+    at: Date.now(),
+    tail: code.slice(-4),
+    serial: check.serial,
+    build: String(body?.build || '').slice(0, 96),
+    ver: String(body?.version || '').slice(0, 32),
+    _exp: Date.now() + 400 * 24 * 3600 * 1000,
+  }
+  if (kv) {
+    try { await kvSave(kv, LIC_DEVICE_KEY + device, deviceRec) } catch {}
+    try {
+      await licRecordActivation(kv, {
+        device,
         serial: check.serial,
-        build: String(body?.build || '').slice(0, 96),
-        ver: String(body?.version || '').slice(0, 32),
-        _exp: Date.now() + 400 * 24 * 3600 * 1000,
+        tail: code.slice(-4),
+        build: deviceRec.build,
+        version: deviceRec.ver,
       })
     } catch {}
   }
@@ -3432,6 +3705,259 @@ async function handleLicenseActivate(request, env) {
     token: issued.token,
     expiresAt: issued.payload.e,
   }, 200, request, env)
+}
+
+// ── 后台接口 ─────────────────────────────────────────────────────────
+
+function admLicenseSnapshot(env) {
+  return {
+    enforce: licEnforce(env),
+    enforceAt: String(env.CSH_LIC_ENFORCE_AT || '') || null,
+    legacyUntil: String(env.CSH_LIC_LEGACY_UNTIL || '') || null,
+    days: Number(env.CSH_LICENSE_DAYS || 365),
+    officialDays: Number(env.CSH_OFFICIAL_TOKEN_DAYS || 30),
+    buildSecret: !!env.CSH_BUILD_SECRET,
+    licenseSecret: !!env.CSH_LICENSE_SECRET,
+  }
+}
+
+/** POST /api/admin/login */
+async function handleAdminLogin(request, env) {
+  if (!admSameOrigin(request)) return admJson({ error: '来源校验失败，请直接打开后台页面登录。' }, 403)
+  if (!admReady(env)) {
+    return admJson(
+      {
+        error: '后台未配置',
+        detail: '需在环境变量里设置 CSH_ADMIN_PASS（或 CSH_ADMIN_PASS_SHA256）与 CSH_LICENSE_SECRET。',
+      },
+      503
+    )
+  }
+
+  let body
+  try {
+    body = await request.json()
+  } catch {
+    return admJson({ error: '请求格式错误' }, 400)
+  }
+
+  const user = String(body?.user || '').trim().slice(0, 64)
+  const pass = String(body?.pass || '')
+  const kv = await gateKv()
+  const failKey = ADM_FAIL_KEY + (await sha256Hex(reqIp(request))).slice(0, 24)
+
+  if (kv) {
+    const rec = await kvJson(kv, failKey)
+    if (rec && Number(rec.n) >= ADM_LOGIN_FAIL_LIMIT && Number(rec._exp) > Date.now()) {
+      const mins = Math.max(1, Math.ceil((Number(rec._exp) - Date.now()) / 60000))
+      return admJson({ error: `密码错误次数过多，请 ${mins} 分钟后再试。` }, 429)
+    }
+  }
+
+  const okUser = ctEqual(user, admUser(env))
+  const okPass = await admPasswordOk(env, pass)
+  if (!okUser || !okPass) {
+    if (kv) {
+      const rec = (await kvJson(kv, failKey)) || { n: 0 }
+      const n = (Number(rec.n) || 0) + 1
+      try {
+        await kvSave(kv, failKey, { n, _exp: Date.now() + ADM_LOGIN_FAIL_WINDOW_MS })
+      } catch {}
+    }
+    console.warn(`admin: login failed from ${reqIp(request)}`)
+    return admJson({ error: '账号或密码不正确。' }, 401)
+  }
+
+  if (kv) {
+    try {
+      await kv.delete(failKey)
+    } catch {}
+  }
+
+  const issued = await admIssueSession(env)
+  console.log(`admin: ${admUser(env)} logged in`)
+  return admJson({ ok: true, user: admUser(env), exp: issued.exp }, 200, {
+    'Set-Cookie': admCookieSet(issued.token, ADM_SESSION_TTL_HOURS * 3600),
+  })
+}
+
+/** POST /api/admin/logout */
+async function handleAdminLogout(request, env) {
+  return admJson({ ok: true }, 200, { 'Set-Cookie': admCookieSet('', 0) })
+}
+
+/** GET /api/admin/session —— 页面加载时用它决定显示登录框还是控制台。 */
+async function handleAdminSession(request, env) {
+  const sess = await admSession(request, env)
+  if (!sess) return admJson({ ok: false, ready: admReady(env) }, 401)
+  return admJson({ ok: true, user: sess.user, exp: sess.exp, license: admLicenseSnapshot(env) })
+}
+
+/** GET /api/admin/codes 列表；POST /api/admin/codes 批量签发。 */
+async function handleAdminCodes(request, env) {
+  const sess = await admSession(request, env)
+  if (!sess) return admJson({ error: '未登录' }, 401)
+
+  const kv = await gateKv()
+  if (!kv) return admJson({ error: '状态存储不可用' }, 503)
+
+  if (request.method === 'GET') {
+    const codes = await admIndex(kv, ADM_CODE_INDEX_KEY)
+    return admJson({ ok: true, codes })
+  }
+
+  if (!admSameOrigin(request)) return admJson({ error: '来源校验失败' }, 403)
+  if (!env.CSH_LICENSE_SECRET) return admJson({ error: '未配置 CSH_LICENSE_SECRET，无法签发' }, 503)
+
+  let body
+  try {
+    body = await request.json()
+  } catch {
+    return admJson({ error: '请求格式错误' }, 400)
+  }
+
+  const want = Math.min(ADM_MAX_BATCH, Math.max(1, Math.floor(Number(body?.count) || 1)))
+  const note = cleanText(body?.note, 60)
+
+  const seqRec = await kvJson(kv, ADM_SEQ_KEY)
+  const codes = await admIndex(kv, ADM_CODE_INDEX_KEY)
+  let seq = Math.max(Number(seqRec && seqRec.n) || 0, 0)
+  for (const c of codes) seq = Math.max(seq, Number(c && c.s) || 0)
+
+  const created = []
+  const now = Date.now()
+  for (let i = 0; i < want; i++) {
+    if (seq >= 0xffffff) break
+    seq += 1
+    const made = await licMakeCode(env, seq)
+    created.push({ s: made.serial, c: made.code, at: now, note, by: sess.user, n: 0 })
+  }
+  if (!created.length) return admJson({ error: '序列号已用尽，需要更换签发规则' }, 507)
+
+  await kvSave(kv, ADM_SEQ_KEY, { n: seq })
+  await admIndexSave(kv, ADM_CODE_INDEX_KEY, created.concat(codes))
+  console.log(`admin: ${sess.user} issued ${created.length} code(s) note=${note || '-'}`)
+
+  return admJson({
+    ok: true,
+    note,
+    codes: created.map((c) => ({ code: c.c, serial: c.s })),
+  })
+}
+
+/** POST /api/admin/code-revoke —— 吊销/恢复。只影响未激活的码。 */
+async function handleAdminCodeRevoke(request, env) {
+  const sess = await admSession(request, env)
+  if (!sess) return admJson({ error: '未登录' }, 401)
+  if (!admSameOrigin(request)) return admJson({ error: '来源校验失败' }, 403)
+
+  let body
+  try {
+    body = await request.json()
+  } catch {
+    return admJson({ error: '请求格式错误' }, 400)
+  }
+
+  const serial = Number(body?.serial) || 0
+  if (!serial) return admJson({ error: '缺少序列号' }, 400)
+
+  const kv = await gateKv()
+  if (!kv) return admJson({ error: '状态存储不可用' }, 503)
+
+  const codes = await admIndex(kv, ADM_CODE_INDEX_KEY)
+  const hit = codes.find((c) => c && Number(c.s) === serial)
+  if (!hit) return admJson({ error: '未找到该激活码记录' }, 404)
+
+  const revoked = body?.revoke === false ? 0 : 1
+  if (revoked && hit.u) {
+    return admJson({ error: '该激活码已被使用，不能吊销；要停止使用请在设备列表里封禁。' }, 409)
+  }
+  hit.r = revoked
+  await admIndexSave(kv, ADM_CODE_INDEX_KEY, codes)
+  console.log(`admin: ${sess.user} ${revoked ? 'revoked' : 'restored'} code #${serial}`)
+  return admJson({ ok: true, serial, revoked: !!revoked })
+}
+
+/** GET /api/admin/devices —— 已激活设备（按最近激活排序，最多 200 台）。 */
+async function handleAdminDevices(request, env) {
+  const sess = await admSession(request, env)
+  if (!sess) return admJson({ error: '未登录' }, 401)
+
+  const kv = await gateKv()
+  if (!kv) return admJson({ error: '状态存储不可用' }, 503)
+
+  const devices = await admIndex(kv, ADM_DEV_INDEX_KEY)
+  return admJson({ ok: true, devices })
+}
+
+/** POST /api/admin/ban { device, hours, reason } —— hours=0 表示永久。 */
+async function handleAdminBan(request, env) {
+  const sess = await admSession(request, env)
+  if (!sess) return admJson({ error: '未登录' }, 401)
+  if (!admSameOrigin(request)) return admJson({ error: '来源校验失败' }, 403)
+
+  let body
+  try {
+    body = await request.json()
+  } catch {
+    return admJson({ error: '请求格式错误' }, 400)
+  }
+
+  const device = String(body?.device || '').trim().slice(0, 64)
+  if (!device) return admJson({ error: '缺少设备码' }, 400)
+
+  const hours = Math.max(0, Math.min(24 * 3650, Number(body?.hours) || 0))
+  const until = hours > 0 ? Date.now() + hours * 3600 * 1000 : 0
+  const reason = cleanText(body?.reason, 80)
+
+  const kv = await gateKv()
+  if (!kv) return admJson({ error: '状态存储不可用' }, 503)
+
+  await kvSave(kv, ADM_BAN_KEY + device, { at: Date.now(), until, reason, by: sess.user })
+
+  const devices = await admIndex(kv, ADM_DEV_INDEX_KEY)
+  const hit = devices.find((d) => d && d.d === device)
+  if (hit) {
+    hit.b = until
+    await admIndexSave(kv, ADM_DEV_INDEX_KEY, devices)
+  }
+
+  console.log(`admin: ${sess.user} banned ${device} until=${until || 'forever'} reason=${reason || '-'}`)
+  return admJson({ ok: true, device, until })
+}
+
+/** POST /api/admin/unban { device } */
+async function handleAdminUnban(request, env) {
+  const sess = await admSession(request, env)
+  if (!sess) return admJson({ error: '未登录' }, 401)
+  if (!admSameOrigin(request)) return admJson({ error: '来源校验失败' }, 403)
+
+  let body
+  try {
+    body = await request.json()
+  } catch {
+    return admJson({ error: '请求格式错误' }, 400)
+  }
+
+  const device = String(body?.device || '').trim().slice(0, 64)
+  if (!device) return admJson({ error: '缺少设备码' }, 400)
+
+  const kv = await gateKv()
+  if (!kv) return admJson({ error: '状态存储不可用' }, 503)
+
+  try {
+    await kv.delete(ADM_BAN_KEY + device)
+  } catch {}
+
+  const devices = await admIndex(kv, ADM_DEV_INDEX_KEY)
+  const hit = devices.find((d) => d && d.d === device)
+  if (hit && 'b' in hit) {
+    delete hit.b
+    await admIndexSave(kv, ADM_DEV_INDEX_KEY, devices)
+  }
+
+  console.log(`admin: ${sess.user} unbanned ${device}`)
+  return admJson({ ok: true, device })
 }
 
 async function workerFetch(request, env, ctx) {
@@ -3460,6 +3986,23 @@ async function workerFetch(request, env, ctx) {
 
 async function routeRequest(request, env, ctx) {
     const url = new URL(request.url)
+
+    // 管理后台：登录态走 Cookie，与其它接口的 CORS/许可闸门互不影响
+    if (url.pathname.startsWith('/api/admin/')) {
+      if (url.pathname === '/api/admin/login' && request.method === 'POST') return handleAdminLogin(request, env)
+      if (url.pathname === '/api/admin/logout' && request.method === 'POST') return handleAdminLogout(request, env)
+      if (url.pathname === '/api/admin/session' && request.method === 'GET') return handleAdminSession(request, env)
+      if (url.pathname === '/api/admin/codes' && (request.method === 'GET' || request.method === 'POST')) {
+        return handleAdminCodes(request, env)
+      }
+      if (url.pathname === '/api/admin/code-revoke' && request.method === 'POST') {
+        return handleAdminCodeRevoke(request, env)
+      }
+      if (url.pathname === '/api/admin/devices' && request.method === 'GET') return handleAdminDevices(request, env)
+      if (url.pathname === '/api/admin/ban' && request.method === 'POST') return handleAdminBan(request, env)
+      if (url.pathname === '/api/admin/unban' && request.method === 'POST') return handleAdminUnban(request, env)
+      return admJson({ error: 'Not Found' }, 404)
+    }
 
     if (url.pathname === '/api/status' && request.method === 'GET') return handleStatus(request, env)
     if (url.pathname === '/api/submit' && request.method === 'POST') {
@@ -3550,6 +4093,8 @@ async function handleStatus(request, env) {
   out.services.signConfig = !!env.SIGN_API_KEY
   out.services.githubConfig = githubConfig
   out.services.licenseConfig = !!(env.CSH_BUILD_SECRET && env.CSH_LICENSE_SECRET)
+  out.services.adminConfig = admReady(env)
+  out.admin = { user: admUser(env), ready: admReady(env) }
   out.license = {
     enforce: licEnforce(env),
     enforceAt: String(env.CSH_LIC_ENFORCE_AT || '') || null,
@@ -3657,6 +4202,8 @@ const ENV_DEFAULTS = {
   CSH_LIC_LEGACY_UNTIL: '',
   CSH_LIC_BROWSER_ORIGINS: 'classsoftwarehub.cn,www.classsoftwarehub.cn',
   CSH_LIC_TRY_PER_DAY: '30',
+  // 管理后台：密码必须由控制台提供，代码里不留默认值
+  CSH_ADMIN_USER: 'admin',
 }
 
 export async function onRequest(context) {

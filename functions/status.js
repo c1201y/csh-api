@@ -138,6 +138,7 @@ async function refresh() {
     svc.appendChild(row('OSS 对象存储', badge(d.services.oss), d.services.ossConfig ? (d.ossProbeMs ? d.ossProbeMs + 'ms · ' + (d.ossObjectsProbed || 0) + ' 个对象' : '') : '未配置密钥'))
     svc.appendChild(row('GitHub API', badge(d.services.githubApi), d.services.githubConfig ? '' : '未配置 Token（匿名探测）'))
     svc.appendChild(row('加速签名配置', badge(d.services.signConfig), d.services.signConfig ? '' : '未配置'))
+    svc.appendChild(row('管理后台', badge(d.services.adminConfig), d.services.adminConfig ? '/admin' : '未配置 CSH_ADMIN_PASS'))
     var dl = d.dl || {}
     var relayCell = '未配置', relayCls = 'warn', relayNote = '未设置 RELAY_HOST'
     if (dl.relayConfigured) {
