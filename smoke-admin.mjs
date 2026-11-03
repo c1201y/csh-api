@@ -22,6 +22,7 @@ const env = {
 }
 
 let cookie = ''
+const pendingTasks = []
 
 function call(path, { method = 'GET', body, headers = {} } = {}) {
   const req = new Request('https://api.test' + path, {
@@ -29,7 +30,12 @@ function call(path, { method = 'GET', body, headers = {} } = {}) {
     headers: Object.assign({ origin: 'https://api.test', 'sec-fetch-site': 'same-origin' }, headers),
     body: body === undefined ? undefined : JSON.stringify(body),
   })
-  return onRequest({ request: req, env, waitUntil() {} })
+  return onRequest({ request: req, env, waitUntil(p) { pendingTasks.push(p) } })
+}
+
+/** 等待 waitUntil 收集的异步任务（设备触点等）落库完成。 */
+async function flush() {
+  await Promise.allSettled(pendingTasks.splice(0))
 }
 
 async function jsonOf(res) {
@@ -90,6 +96,35 @@ const devicesAgain = await jsonOf(await call('/api/admin/devices', { headers: { 
 log('回填只跑一次且不产生重复', devicesAgain.data.backfilled === true &&
   devicesAgain.data.devices.filter((d) => d.d === legacyDevice).length === 1)
 
+// 设备触点：未激活的客户端只要带设备码请求就会被登记
+const fresh = 'aa11bb22cc33dd44'
+await call('/api/mirror-sign?url=https://github.com/x/y/releases/download/v1/tag', {
+  headers: { 'x-csh-did': fresh, 'x-csh-build': 'dv1.2.0-insider1.6', 'x-csh-ver': '1.2.0' },
+})
+await flush()
+const touched = JSON.parse(await store.get('lic:d:' + fresh))
+log('未激活设备请求即被登记', !!touched && touched.tail === '' && touched.build === 'dv1.2.0-insider1.6' && touched.ver === '1.2.0')
+
+// 节流：6 小时内重复请求不重写，也不覆盖已有构建号
+await call('/api/mirror-sign?url=https://github.com/x/y/releases/download/v1/tag', {
+  headers: { 'x-csh-did': fresh, 'x-csh-build': 'dv9.9.9' },
+})
+await flush()
+const untouched = JSON.parse(await store.get('lic:d:' + fresh))
+log('触点在节流窗口内不重复写', untouched.build === 'dv1.2.0-insider1.6')
+
+// 窗口外刷新时间戳，但保留既有 tail/serial/构建号
+touched.at = Date.now() - 7 * 3600e3
+await store.set('lic:d:' + fresh, JSON.stringify(touched))
+await call('/api/mirror-sign?url=https://github.com/x/y/releases/download/v1/tag', { headers: { 'x-csh-did': fresh } })
+await flush()
+const refreshed = JSON.parse(await store.get('lic:d:' + fresh))
+log('节流窗口外仅刷新时间戳', Math.abs(refreshed.at - Date.now()) < 60e3 && refreshed.build === 'dv1.2.0-insider1.6')
+
+// 触点登记的设备出现在后台列表（tail 为空表示从未激活）
+const devicesTouched = await jsonOf(await call('/api/admin/devices', { headers: { cookie } }))
+log('触点设备进入后台列表', devicesTouched.data.devices?.some((d) => d.d === fresh))
+
 const codesAfter = await jsonOf(await call('/api/admin/codes', { headers: { cookie } }))
 const rec = codesAfter.data.codes?.find((c) => c.s === serial)
 log('签发记录标记为已使用', !!rec && rec.u === device && rec.n === 1)
@@ -111,8 +146,8 @@ log('解封设备', unban.status === 200)
 const actAfter = await jsonOf(await call('/api/license/activate', { method: 'POST', body: { code: issued.data.codes[1].code, device } }))
 log('解封后可再次激活', actAfter.status === 200 && !!actAfter.data.token)
 
-const fresh = await jsonOf(await call('/api/admin/codes', { method: 'POST', headers: { cookie }, body: { count: 1, note: '吊销测试' } }))
-const freshCode = fresh.data.codes[0]
+const revoking = await jsonOf(await call('/api/admin/codes', { method: 'POST', headers: { cookie }, body: { count: 1, note: '吊销测试' } }))
+const freshCode = revoking.data.codes[0]
 const revokedCode = await jsonOf(await call('/api/admin/code-revoke', { method: 'POST', headers: { cookie }, body: { serial: freshCode.serial } }))
 const actRevoked = await jsonOf(await call('/api/license/activate', { method: 'POST', body: { code: freshCode.code, device: 'ffffffffffffffff' } }))
 log('吊销后的码无法激活', revokedCode.status === 200 && actRevoked.status === 403, actRevoked.data.error)

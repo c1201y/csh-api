@@ -3374,6 +3374,56 @@ async function licRecordActivation(kv, info) {
   } catch {}
 }
 
+/**
+ * 设备触点：凡带设备码的客户端请求都记入 lic:d:<device> 与后台设备索引，
+ * 不论是否激活过——封禁、对账都以这里见过的设备为准。
+ * 同一设备至多每 6 小时刷新一次时间戳，避免每个请求都写存储。
+ */
+const LIC_TOUCH_TTL_MS = 6 * 3600 * 1000
+
+async function licTouchDevice(env, request) {
+  const device = String(
+    request.headers.get('x-csh-did') || request.headers.get('x-csh-device') || ''
+  ).slice(0, 64)
+  if (!device) return
+
+  const kv = await gateKv()
+  if (!kv) return
+
+  const now = Date.now()
+  const build = String(request.headers.get('x-csh-build') || '').slice(0, 96)
+  const ver = String(request.headers.get('x-csh-ver') || '').slice(0, 32)
+
+  const prev = await kvJson(kv, LIC_DEVICE_KEY + device)
+  if (prev && now - (Number(prev.at) || 0) < LIC_TOUCH_TTL_MS) return
+
+  const rec = prev || { tail: '', serial: 0 }
+  if (!Number(rec.first) || Number(rec.first) > now) rec.first = now
+  rec.at = now
+  rec._exp = now + 400 * 24 * 3600 * 1000
+  if (build && !rec.build) rec.build = build
+  if (ver && !rec.ver) rec.ver = ver
+  try {
+    await kvSave(kv, LIC_DEVICE_KEY + device, rec)
+  } catch {}
+
+  // 索引只用于后台展示：新设备插入，老设备仅刷新时间戳（同样受节流约束）
+  try {
+    const devices = await admIndex(kv, ADM_DEV_INDEX_KEY)
+    const hit = devices.find((d) => d && d.d === device)
+    if (hit) {
+      if (now - (Number(hit.at) || 0) < LIC_TOUCH_TTL_MS) return
+      hit.at = now
+      if (build && !hit.build) hit.build = build
+      if (ver && !hit.ver) hit.ver = ver
+      await admIndexSave(kv, ADM_DEV_INDEX_KEY, devices)
+    } else {
+      devices.unshift({ d: device, at: now, first: rec.first, tail: '', s: 0, build, ver })
+      await admIndexSave(kv, ADM_DEV_INDEX_KEY, devices)
+    }
+  } catch {}
+}
+
 function licEnforce(env) {
   if (String((env && env.CSH_LIC_ENFORCE) ?? '').toLowerCase() === 'true') return true
   // 定时开闸：到点自动生效，避免「到日子还得有人记得去控制台改一下再重新部署」。
@@ -4031,6 +4081,11 @@ async function workerFetch(request, env, ctx) {
     const url = new URL(request.url)
 
     if (url.pathname === LIC_ACTIVATE_PATH) return handleLicenseActivate(request, env)
+
+    // 凡带设备码的客户端请求都登记一笔（激活接口自己会记，这里跳过）；异步写，不阻塞响应
+    if (url.pathname.startsWith('/api/') && !url.pathname.startsWith('/api/admin/')) {
+      ctx.waitUntil(licTouchDevice(env, request).catch(() => {}))
+    }
 
     const gate = await licenseGuard(request, env)
     if (gate && gate.deny) return gate.deny
