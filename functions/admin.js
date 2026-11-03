@@ -90,6 +90,10 @@ tr:last-child td{border-bottom:none}
 .foot{color:var(--muted);font-size:12px;text-align:center;margin:20px 0 0}
 .nowrap{white-space:nowrap}
 .dim{color:var(--muted);font-size:11.5px}
+.shout-form{margin-top:14px;padding-top:14px;border-top:1px dashed var(--line)}
+.shout-form textarea{font:inherit;color:var(--fg);background:var(--bg);border:1px solid var(--line);border-radius:9px;padding:9px 11px;width:100%;outline:none;resize:vertical;min-height:58px;margin-bottom:12px}
+.shout-form textarea:focus{border-color:var(--brand);box-shadow:0 0 0 3px var(--brand-soft)}
+.online-check{width:16px;height:16px;accent-color:var(--brand);vertical-align:middle}
 
 /* 弹窗 */
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.42);display:flex;align-items:center;justify-content:center;padding:20px;z-index:20}
@@ -177,6 +181,39 @@ tr:last-child td{border-bottom:none}
       <p id="devEmpty" class="empty hidden">还没有设备激活。</p>
     </section>
 
+    <section class="card">
+      <div class="card-head">
+        <h2>在线喊话</h2>
+        <div class="tools">
+          <span id="onlineCount" class="dim"></span>
+          <button id="reloadOnline" class="ghost sm">刷新</button>
+        </div>
+      </div>
+      <p class="hint">只列出正在运行「教室喊话」轮询的客户端（3 分钟内有心跳）。喊话会以全屏窗口出现在对方屏幕上，并按设定时长停留。</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th style="width:36px"><input id="onlineAll" class="online-check" type="checkbox"/></th><th>设备码</th><th>名称</th><th>配对码</th><th>最近心跳</th></tr></thead>
+          <tbody id="onlineBody"></tbody>
+        </table>
+      </div>
+      <p id="onlineEmpty" class="empty hidden">当前没有在线设备。</p>
+      <div class="shout-form">
+        <textarea id="shoutText" maxlength="100" rows="2" placeholder="喊话内容，最多 100 字"></textarea>
+        <div class="form">
+          <label class="field">显示时长
+            <select id="shoutDuration">
+              <option value="10">10 秒</option>
+              <option value="30" selected>30 秒</option>
+              <option value="60">60 秒</option>
+              <option value="120">120 秒</option>
+            </select>
+          </label>
+          <label class="field grow">落款<input id="shoutFrom" maxlength="20" placeholder="默认「管理员」"/></label>
+          <button id="shoutBtn" class="primary">发送喊话</button>
+        </div>
+      </div>
+    </section>
+
     <p class="foot">激活码是离线签名凭证：吊销只对未激活的码生效；已激活的设备要失效，需要在这里封禁。</p>
   </main>
 </div>
@@ -205,7 +242,7 @@ tr:last-child td{border-bottom:none}
 <div id="toast" class="toast hidden"></div>
 
 <script>
-var state = { codes: [], devices: [], pendingBan: '', license: null };
+var state = { codes: [], devices: [], pendingBan: '', license: null, online: [], onlinePicked: {} };
 
 function $(id) { return document.getElementById(id); }
 function el(tag, cls, text) {
@@ -288,6 +325,12 @@ function enterApp(info) {
   renderStrip();
   loadCodes();
   loadDevices();
+  loadOnline();
+  if (!state.onlineTimer) {
+    state.onlineTimer = setInterval(function () {
+      if (!document.hidden && !$('app').classList.contains('hidden')) loadOnline();
+    }, 30000);
+  }
 }
 
 function renderStrip() {
@@ -524,6 +567,109 @@ function openBan(device) {
   show($('banModal'), true);
 }
 
+function agoText(ms) {
+  var diff = Math.max(0, Date.now() - Number(ms || 0));
+  if (diff < 60000) return Math.round(diff / 1000) + ' 秒前';
+  if (diff < 3600000) return Math.round(diff / 60000) + ' 分钟前';
+  return Math.round(diff / 3600000) + ' 小时前';
+}
+
+async function loadOnline() {
+  var btn = $('reloadOnline');
+  btn.disabled = true;
+  try {
+    var r = await api('/online');
+    if (!r.ok) { toast(r.error || '读取在线设备失败'); return; }
+    state.online = Array.isArray(r.online) ? r.online : [];
+    var keep = {};
+    state.online.forEach(function (d) { if (state.onlinePicked[d.d]) keep[d.d] = true; });
+    state.onlinePicked = keep;
+    renderOnline();
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function pickedCount() {
+  return state.online.filter(function (d) { return state.onlinePicked[d.d]; }).length;
+}
+
+function renderOnline() {
+  var body = $('onlineBody');
+  body.innerHTML = '';
+  state.online.forEach(function (d) {
+    var tr = el('tr');
+
+    var tdChk = el('td');
+    var chk = document.createElement('input');
+    chk.type = 'checkbox';
+    chk.className = 'online-check';
+    chk.checked = !!state.onlinePicked[d.d];
+    chk.addEventListener('change', function () {
+      if (chk.checked) state.onlinePicked[d.d] = true;
+      else delete state.onlinePicked[d.d];
+      $('onlineAll').checked = state.online.length > 0 && pickedCount() === state.online.length;
+      updateShoutLabel();
+    });
+    tdChk.appendChild(chk);
+    tr.appendChild(tdChk);
+
+    var tdDev = el('td');
+    var devBtn = el('button', 'dev-cell', d.d || '');
+    devBtn.title = '点击复制';
+    devBtn.addEventListener('click', function () { copyInto(d.d, '已复制设备码'); });
+    tdDev.appendChild(devBtn);
+    tr.appendChild(tdDev);
+
+    tr.appendChild(el('td', '', d.name || '—'));
+    tr.appendChild(el('td', 'mono', d.pair || '—'));
+    tr.appendChild(el('td', 'dim nowrap', agoText(d.ts)));
+    body.appendChild(tr);
+  });
+
+  var n = state.online.length;
+  $('onlineCount').textContent = n ? n + ' 台在线' : '无在线设备';
+  $('onlineAll').checked = n > 0 && pickedCount() === n;
+  show($('onlineEmpty'), n === 0);
+  updateShoutLabel();
+}
+
+function updateShoutLabel() {
+  var picked = pickedCount();
+  var total = state.online.length;
+  $('shoutBtn').textContent = picked > 0 ? '发送喊话（选中 ' + picked + ' 台）'
+    : '发送喊话（全部 ' + total + ' 台）';
+  $('shoutBtn').disabled = total === 0;
+}
+
+async function sendShout() {
+  var text = $('shoutText').value.trim();
+  if (!text) { toast('先写点内容'); $('shoutText').focus(); return; }
+  var picked = pickedCount();
+  var targets = picked > 0 ? state.online.filter(function (d) { return state.onlinePicked[d.d]; }).map(function (d) { return d.d; }) : undefined;
+
+  var btn = $('shoutBtn');
+  btn.disabled = true;
+  try {
+    var r = await api('/shout', {
+      method: 'POST',
+      body: {
+        text: text,
+        duration: Number($('shoutDuration').value) || 30,
+        from: $('shoutFrom').value.trim(),
+        targets: targets,
+      },
+    });
+    if (!r.ok) { toast(r.error || '发送失败'); return; }
+    var failed = (r.failed || []).length;
+    toast('已送达 ' + (r.delivered || 0) + ' 台' + (failed ? '，' + failed + ' 组失败' : ''));
+    loadOnline();
+  } finally {
+    btn.disabled = false;
+    updateShoutLabel();
+  }
+}
+
 async function confirmBan() {
   var device = state.pendingBan;
   if (!device) return;
@@ -543,6 +689,17 @@ $('reloadCodes').addEventListener('click', loadCodes);
 $('reloadDevices').addEventListener('click', loadDevices);
 $('codeFilter').addEventListener('input', renderCodes);
 $('devFilter').addEventListener('input', renderDevices);
+$('reloadOnline').addEventListener('click', loadOnline);
+$('shoutBtn').addEventListener('click', sendShout);
+$('onlineAll').addEventListener('change', function () {
+  var on = $('onlineAll').checked;
+  state.onlinePicked = {};
+  if (on) state.online.forEach(function (d) { state.onlinePicked[d.d] = true; });
+  renderOnline();
+});
+$('shoutText').addEventListener('keydown', function (e) {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) sendShout();
+});
 $('banCancel').addEventListener('click', function () { show($('banModal'), false); });
 $('banOk').addEventListener('click', confirmBan);
 $('banModal').addEventListener('click', function (e) { if (e.target === $('banModal')) show($('banModal'), false); });

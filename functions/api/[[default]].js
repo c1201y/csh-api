@@ -2816,7 +2816,8 @@ async function gateAnn(kv, body) {
   if (op === 'ann-send') {
     const rateKey = 'gate:ann:r:' + pairCode
     const prev = (await kvJson(kv, rateKey)) || null
-    if (alive(prev) && Number.isFinite(prev.t) && Date.now() - prev.t < ANN_RATE_MS) {
+    // rate: false 供管理后台使用：喊话由已登录的维护者触发，不受 10 秒/配对码限制
+    if (body.rate !== false && alive(prev) && Number.isFinite(prev.t) && Date.now() - prev.t < ANN_RATE_MS) {
       return { ok: false, error: 'rate_limited' }
     }
     const regKey = 'gate:ann:d:' + pairCode
@@ -4073,6 +4074,126 @@ async function handleAdminUnban(request, env) {
   return admJson({ ok: true, device })
 }
 
+/** 通用键前缀枚举：兼容本仓 Blob 适配层（收字符串）与 Cloudflare KV 绑定（收 { prefix }）。 */
+async function kvListKeys(kv, prefix) {
+  if (!kv || typeof kv.list !== 'function') return []
+  try {
+    const res = await kv.list(prefix)
+    if (Array.isArray(res)) return res.map((k) => String(k))
+    if (res && Array.isArray(res.keys)) return res.keys.map((k) => String((k && k.name) || ''))
+  } catch {}
+  try {
+    const res = await kv.list({ prefix })
+    if (Array.isArray(res)) return res.map((k) => String(k))
+    if (res && Array.isArray(res.keys)) return res.keys.map((k) => String((k && k.name) || ''))
+  } catch {}
+  return []
+}
+
+/** 在线窗口：客户端轮询间隔最慢 120 秒，留一个周期余量。 */
+const ADM_ONLINE_WINDOW_MS = 180 * 1000
+
+/** 在线设备 = 教室喊话轮询（ann-poll）心跳仍在窗口内的设备，按配对码分组。 */
+async function admOnlineDevices(kv) {
+  const keys = await kvListKeys(kv, 'gate:ann:d:')
+  const now = Date.now()
+  const out = []
+  for (const key of keys) {
+    const pair = key.slice('gate:ann:d:'.length)
+    if (!/^\d{6}$/.test(pair)) continue
+    const reg = await kvJson(kv, key)
+    if (!reg || typeof reg !== 'object') continue
+    for (const [dev, v] of Object.entries(reg)) {
+      const ts = Number(v && typeof v === 'object' ? v.t : v)
+      if (!Number.isFinite(ts) || now - ts > ADM_ONLINE_WINDOW_MS) continue
+      out.push({
+        d: dev,
+        pair,
+        name: String((v && typeof v === 'object' && v.n) || '').slice(0, 32),
+        ts,
+      })
+    }
+  }
+  out.sort((a, b) => b.ts - a.ts)
+  return out
+}
+
+/** GET /api/admin/online —— 当前可喊话的在线设备。 */
+async function handleAdminOnline(request, env) {
+  const sess = await admSession(request, env)
+  if (!sess) return admJson({ error: '未登录' }, 401)
+
+  const kv = await gateKv()
+  if (!kv) return admJson({ error: '状态存储不可用' }, 503)
+
+  const online = await admOnlineDevices(kv)
+  return admJson({ ok: true, online, window: Math.round(ADM_ONLINE_WINDOW_MS / 1000) })
+}
+
+/** POST /api/admin/shout { text, duration, from, targets } —— 向在线设备喊话。 */
+async function handleAdminShout(request, env) {
+  const sess = await admSession(request, env)
+  if (!sess) return admJson({ error: '未登录' }, 401)
+  if (!admSameOrigin(request)) return admJson({ error: '来源校验失败' }, 403)
+
+  let body
+  try {
+    body = await request.json()
+  } catch {
+    return admJson({ error: '请求格式错误' }, 400)
+  }
+
+  const text = String(body?.text || '').trim()
+  if (!text) return admJson({ error: '喊话内容不能为空' }, 400)
+  if (text.length > ANN_TEXT_MAX) return admJson({ error: `喊话内容最多 ${ANN_TEXT_MAX} 字` }, 400)
+
+  const duration = Math.min(
+    ANN_DURATION_MAX,
+    Math.max(ANN_DURATION_MIN, Number(body?.duration) || ANN_DURATION_DEFAULT)
+  )
+  const from = String(body?.from || '').trim().slice(0, ANN_FROM_MAX) || '管理员'
+
+  const kv = await gateKv()
+  if (!kv) return admJson({ error: '状态存储不可用' }, 503)
+
+  const online = await admOnlineDevices(kv)
+  if (online.length === 0) return admJson({ error: '当前没有在线设备', online: 0 }, 409)
+
+  const wanted = Array.isArray(body?.targets)
+    ? new Set(body.targets.map((t) => String(t).trim()).filter(Boolean))
+    : null
+  const picked = wanted ? online.filter((d) => wanted.has(d.d)) : online
+  if (picked.length === 0) return admJson({ error: '选中的设备已离线', online: online.length }, 409)
+
+  // 同一配对码下的一条消息可带多个目标；按配对码分组合并投递
+  const groups = new Map()
+  for (const dev of picked) {
+    if (!groups.has(dev.pair)) groups.set(dev.pair, [])
+    groups.get(dev.pair).push(dev.d)
+  }
+
+  const id = `adm-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+  let delivered = 0
+  const failed = []
+  for (const [pair, targets] of groups) {
+    const out = await announceOp(env, {
+      op: 'ann-send',
+      pairCode: pair,
+      text,
+      from,
+      duration,
+      id,
+      targets,
+      rate: false,
+    })
+    if (out && out.ok) delivered += Number(out.devices) || targets.length
+    else failed.push({ pair, error: (out && out.error) || 'internal' })
+  }
+
+  console.log(`admin: ${sess.user} shout ${id} delivered=${delivered} pairs=${groups.size} text=${text.slice(0, 40)}`)
+  return admJson({ ok: true, id, delivered, pairs: groups.size, failed })
+}
+
 async function workerFetch(request, env, ctx) {
     if (request.method === 'OPTIONS') {
       return new Response(null, { headers: corsHeaders(request, env) })
@@ -4119,6 +4240,8 @@ async function routeRequest(request, env, ctx) {
       if (url.pathname === '/api/admin/devices' && request.method === 'GET') return handleAdminDevices(request, env)
       if (url.pathname === '/api/admin/ban' && request.method === 'POST') return handleAdminBan(request, env)
       if (url.pathname === '/api/admin/unban' && request.method === 'POST') return handleAdminUnban(request, env)
+      if (url.pathname === '/api/admin/online' && request.method === 'GET') return handleAdminOnline(request, env)
+      if (url.pathname === '/api/admin/shout' && request.method === 'POST') return handleAdminShout(request, env)
       return admJson({ error: 'Not Found' }, 404)
     }
 

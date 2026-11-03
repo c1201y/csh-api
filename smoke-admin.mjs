@@ -152,6 +152,53 @@ const revokedCode = await jsonOf(await call('/api/admin/code-revoke', { method: 
 const actRevoked = await jsonOf(await call('/api/license/activate', { method: 'POST', body: { code: freshCode.code, device: 'ffffffffffffffff' } }))
 log('吊销后的码无法激活', revokedCode.status === 200 && actRevoked.status === 403, actRevoked.data.error)
 
+// ── 在线喊话：客户端心跳 → 后台在线列表 → 投递 ─────────────────────────
+const pairCode = '618204'
+const onlineDev = 'cccc111122223333'
+const otherDev = 'dddd444455556666'
+
+const beat = await jsonOf(await call(
+  `/api/announce/poll?deviceId=${onlineDev}&pairCode=${pairCode}&name=${encodeURIComponent('第三机房-01')}`,
+))
+log('客户端轮询注册成功', beat.status === 204 || beat.status === 200, 'status=' + beat.status)
+
+const onlineList = await jsonOf(await call('/api/admin/online', { headers: { cookie } }))
+const onlineHit = (onlineList.data.online || []).find((d) => d.d === onlineDev)
+log('在线设备出现在后台', onlineList.status === 200 && !!onlineHit && onlineHit.pair === pairCode, onlineHit?.name)
+
+// 同组第二台设备在线（用于验证 targets 只投给选中设备）
+await call(`/api/announce/poll?deviceId=${otherDev}&pairCode=${pairCode}&name=other`)
+
+const shout = await jsonOf(await call('/api/admin/shout', {
+  method: 'POST',
+  headers: { cookie },
+  body: { text: '下课铃响前把作业交到讲台', duration: 30, targets: [onlineDev] },
+}))
+log('定向喊话送达 1 台', shout.status === 200 && shout.data.delivered === 1, JSON.stringify(shout.data.failed || []))
+
+const got = await jsonOf(await call(`/api/announce/poll?deviceId=${onlineDev}&pairCode=${pairCode}`))
+log('目标设备收到喊话', got.status === 200 && got.data.text === '下课铃响前把作业交到讲台', got.data.from)
+
+const gotOther = await call(`/api/announce/poll?deviceId=${otherDev}&pairCode=${pairCode}`)
+log('未选中设备不接收', gotOther.status === 204)
+
+const shoutAll = await jsonOf(await call('/api/admin/shout', {
+  method: 'POST',
+  headers: { cookie },
+  body: { text: '全体注意', duration: 10 },
+}))
+log('不限频连续喊话（全部在线）', shoutAll.status === 200 && shoutAll.data.delivered === 2, 'delivered=' + shoutAll.data.delivered)
+
+const shoutEmpty = await jsonOf(await call('/api/admin/shout', {
+  method: 'POST',
+  headers: { cookie },
+  body: { text: '   ' },
+}))
+log('空内容被拒绝', shoutEmpty.status === 400)
+
+const onlineNoAuth = await jsonOf(await call('/api/admin/online'))
+log('未登录看不到在线设备', onlineNoAuth.status === 401)
+
 const noCookie = await jsonOf(await call('/api/admin/codes'))
 log('无 Cookie 拿不到签发记录', noCookie.status === 401)
 
