@@ -138,6 +138,7 @@ const ANN_TTL = 180
 const ANN_BIND_TTL = 12 * 3600
 
 const ANN_RATE_MS = 10 * 1000
+const ANN_SEND_PER_MIN = 20
 
 const ANN_DURATION_MIN = 10
 const ANN_DURATION_MAX = 120
@@ -284,6 +285,59 @@ async function ossPresignPut(env, key, contentType, expiresIn) {
       .map(uriEncode)
       .join('/')}`,
     host,
+  }
+}
+
+/**
+ * 生成 OSS **POST Policy** 上传表单（V4）。
+ *
+ * 预签名 PUT 的 Content-Length 无法进入签名，客户端可声明 1 字节再传 2.5GB。
+ * POST Policy 的 `content-length-range` 由 OSS 在上传时强制校验，是唯一能在
+ * 落盘前绑定大小的方式。字段以表单形式返回，旧客户端仍可用 url 走 PUT。
+ */
+async function ossPresignPost(env, key, contentType, maxBytes, expiresIn) {
+  const bucket = String(env.OSS_BUCKET).trim()
+  const region = String(env.OSS_REGION || 'cn-shanghai').trim()
+  const endpoint = String(env.OSS_ENDPOINT || `oss-${region}.aliyuncs.com`).trim()
+  const host = `${bucket}.${endpoint}`
+
+  const now = new Date()
+  const dateStr = `${now.getUTCFullYear()}${pad2(now.getUTCMonth() + 1)}${pad2(now.getUTCDate())}`
+  const amzDate = `${dateStr}T${pad2(now.getUTCHours())}${pad2(now.getUTCMinutes())}${pad2(now.getUTCSeconds())}Z`
+  const credential = `${env.OSS_ACCESS_KEY_ID}/${dateStr}/${region}/oss/aliyun_v4_request`
+
+  const policy = {
+    expiration: new Date(Date.now() + expiresIn * 1000).toISOString(),
+    conditions: [
+      ['eq', '$key', key],
+      ['eq', '$Content-Type', contentType],
+      ['content-length-range', 1, Math.max(1, Math.floor(maxBytes))],
+      { 'x-oss-signature-version': OSS_ALGO },
+      { 'x-oss-credential': credential },
+      { 'x-oss-date': amzDate },
+    ],
+  }
+  const policyB64 = toBase64(JSON.stringify(policy))
+
+  const secretBytes = textEncoder.encode(`aliyun_v4${env.OSS_ACCESS_KEY_SECRET}`)
+  const kDate = await hmacSha256(secretBytes, dateStr)
+  const kRegion = await hmacSha256(kDate, region)
+  const kService = await hmacSha256(kRegion, 'oss')
+  const kSigning = await hmacSha256(kService, 'aliyun_v4_request')
+  const signature = toHex(await hmacSha256(kSigning, policyB64))
+
+  return {
+    host: `https://${host}`,
+    fields: {
+      key,
+      policy: policyB64,
+      'x-oss-signature-version': OSS_ALGO,
+      'x-oss-credential': credential,
+      'x-oss-date': amzDate,
+      'x-oss-signature': signature,
+      'Content-Type': contentType,
+      success_action_status: '200',
+    },
   }
 }
 
@@ -689,10 +743,19 @@ async function handleOssSign(request, env, ctx) {
 
   try {
     const signed = await ossPresignPut(env, key, contentType, OSS_SIGN_TTL)
+    // POST Policy 把实际大小硬绑在声明值以内；PUT 仅作旧客户端兼容。
+    let post = null
+    try {
+      post = await ossPresignPost(env, key, contentType, Math.min(size, sizeLimit), OSS_SIGN_TTL)
+    } catch (err) {
+      console.error('oss post policy error:', err && err.message)
+    }
     return json(
       {
         success: true,
+        uploadMode: post ? 'post' : 'put',
         url: signed.url,
+        post,
         publicUrl: signed.publicUrl,
         key,
         contentType,
@@ -744,8 +807,38 @@ async function handleMirrorSign(request, env) {
     return json({ error: '仅支持 GitHub 文件直链' }, 400, request, env)
   }
 
+  const srcIp = clientIpOf(request)
+  if (env.DL_GATE) {
+    try {
+      const src = (await sha256Hex(srcIp)).slice(0, 24)
+      const id = env.DL_GATE.idFromName('__mirror__')
+      const res = await env.DL_GATE.get(id).fetch('https://dl-gate/mirror-check', {
+        method: 'POST',
+        body: JSON.stringify({ op: 'mirror-check', ip: src }),
+      })
+      const gate = await res.json()
+      if (gate && gate.allowed === false) {
+        console.warn(`mirror-sign rate limited ip=${src} scope=${gate.scope}`)
+        return json(
+          {
+            error: gate.scope === 'ip'
+              ? '加速链接申请过于频繁，请稍后再试。'
+              : '今天的加速链接配额已用完，请明天再试。',
+            scope: gate.scope,
+            used: gate.used,
+            limit: gate.limit,
+          },
+          429,
+          request,
+          env
+        )
+      }
+    } catch (err) {
+      console.error('mirror sign gate error:', err && err.message)
+    }
+  }
+
   try {
-    const srcIp = reqIp(request)
     const res = await fetch(
       `https://${MIRROR_SIGN_HOST}/sign?url=${encodeURIComponent(target)}${srcIp ? `&ip=${encodeURIComponent(srcIp)}` : ''}`,
       {
@@ -966,17 +1059,49 @@ async function handleSubmit(request, env) {
   const referenced = collectOssKeys(data).filter((k) => /^upload\//.test(k))
   if (referenced.length) {
     const gone = []
+    const oversize = []
     for (const k of referenced) {
       try {
         const probe = await relayOpen(env, k, 'HEAD')
-        if (probe.reader) {
-          try { probe.reader.releaseLock() } catch {}
-          try { probe.socket.close() } catch {}
-          if (probe.status === 404) gone.push(k)
+        if (!probe.reader) continue
+        try { probe.reader.releaseLock() } catch {}
+        try { probe.socket.close() } catch {}
+        if (probe.status === 404) {
+          gone.push(k)
+          continue
+        }
+        if (probe.status >= 200 && probe.status < 300) {
+          // PUT 预签名无法在落盘前绑定 Content-Length：提交时用 HEAD 的实际大小
+          // 与登记值/上限比对，超限对象立即删除，避免「签 1 字节传 2.5GB」。
+          const actual = Number(probe.headers && probe.headers['content-length'])
+          const rec = await registryGet(env, k)
+          const declared = rec && Number.isFinite(Number(rec.size)) ? Number(rec.size) : 0
+          const limit = rec && String(rec.origin) === ICON_PREFIX ? ICON_SIGN_MAX_BYTES : OSS_MAX_BYTES
+          if (Number.isFinite(actual) && actual > 0 && (actual > limit || (declared > 0 && actual > declared))) {
+            oversize.push({ key: k, actual, declared, limit })
+          }
         }
       } catch (err) {
         console.error('submit probe error:', err && err.message)
       }
+    }
+    if (oversize.length) {
+      for (const item of oversize) {
+        try {
+          await purgeOne(env, item.key)
+        } catch (err) {
+          console.error('oversize purge error:', err && err.message)
+        }
+      }
+      return json(
+        {
+          error: '上传文件的实际大小与登记不符或超出上限，已拒绝并清理，请重新上传。',
+          invalid: oversize,
+        },
+        413,
+        request,
+        env
+      )
     }
     if (gone.length) {
       const mins = await gcOrphanMinutes(env)
@@ -1672,8 +1797,23 @@ async function handleDlTicket(request, env, ctx) {
   const key = String(data?.key || '').trim()
   if (!dlKeyOk(key)) return json({ error: '下载地址无效' }, 400, request, env)
 
-  const fp = String(data?.fp || '').trim()
-  if (fp.length < 8 || fp.length > 256) return json({ error: '设备标识无效' }, 400, request, env)
+  // 配额键必须由服务端派生：客户端 fp 可任意轮换，等于没有每日限额。
+  // 有设备码用设备码；没有设备码退化为「可信 IP + UA」摘要。
+  const device = deviceIdOf(request)
+  const ua = String(request.headers.get('user-agent') || '').slice(0, 128)
+  const fp = device || `ip:${clientIpOf(request)}|ua:${ua}`
+  const fpHash = (await sha256Hex(fp)).slice(0, 16)
+
+  if (device) {
+    try {
+      const ban = await licBanInfo(await gateKv(), device)
+      if (ban) {
+        return json({ error: licBanMessage(ban), code: 'csh_device_banned' }, 429, request, env)
+      }
+    } catch (err) {
+      console.error('dl ban check error:', err && err.message)
+    }
+  }
 
 
 
@@ -1687,8 +1827,6 @@ async function handleDlTicket(request, env, ctx) {
       return json({ error: '下载地址无效' }, 404, request, env)
     }
   }
-
-  const fpHash = (await sha256Hex(fp)).slice(0, 16)
 
   if (env.DL_GATE) {
     try {
@@ -1736,7 +1874,8 @@ async function handleDlTicket(request, env, ctx) {
   const backendReady = relayReady || ossReady
 
   const directTtl = directTtlFor(size)
-  const directPath = await buildDirectUrl(env, key, dlFileName(key), directTtl)
+  // 直链只对已登记对象签发：否则 soft/、releases/ 下任意 key 都能被探测签名。
+  const directPath = rec ? await buildDirectUrl(env, key, dlFileName(key), directTtl) : null
 
   // 双方法优先级（auto）：ECS 中继（内网取流，不计 OSS 公网）→ 后端直连 OSS → 浏览器直连
   let mode
@@ -1811,10 +1950,10 @@ async function handleDl(request, env) {
   if (!Number.isFinite(exp) || exp * 1000 < Date.now()) {
     return json({ error: '下载链接已过期，请回站点重新点击下载' }, 410, request, env)
   }
-  if (sig !== (await dlTicketSig(env, exp, fpHash, key, mode))) {
+  if (!ctEqual(sig, await dlTicketSig(env, exp, fpHash, key, mode))) {
     return json({ error: '下载地址无效' }, 403, request, env)
   }
-  if (!fp || (await sha256Hex(fp)).slice(0, 16) !== fpHash) {
+  if (!fp || !ctEqual((await sha256Hex(fp)).slice(0, 16), fpHash)) {
     return json({ error: '设备校验失败，请回站点重新点击下载' }, 403, request, env)
   }
 
@@ -2621,6 +2760,36 @@ function gateMonth() {
   return new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 7)
 }
 
+const MIRROR_SIGN_PER_IP_PER_DAY = 300
+const MIRROR_SIGN_GLOBAL_PER_DAY = 20000
+
+/**
+ * 加速链接签发配额。与上传配额分开计数，避免一条下载链被批量铸造后
+ * 还能顺带把上传额度刷空；IP 由调用方传入可信边缘地址的哈希。
+ */
+async function gateMirrorCheck(kv, body) {
+  const day = gateDay()
+  const key = 'gate:ms:' + day
+  let rec = (await kvJson(kv, key)) || null
+  if (!alive(rec) || rec.day !== day) rec = { day, n: 0, ips: {} }
+  const ips = rec.ips && typeof rec.ips === 'object' ? rec.ips : {}
+  const src = String(body.ip || 'unknown').slice(0, 32)
+  const perIp = Math.max(1, Number(body.perIp) || MIRROR_SIGN_PER_IP_PER_DAY)
+  const perDay = Math.max(1, Number(body.perDay) || MIRROR_SIGN_GLOBAL_PER_DAY)
+  const ipN = Number(ips[src]) || 0
+  const n = Number(rec.n) || 0
+  if (n >= perDay) return { allowed: false, scope: 'global', limit: perDay, used: n, remaining: 0 }
+  if (ipN >= perIp) return { allowed: false, scope: 'ip', limit: perIp, used: ipN, remaining: 0 }
+  rec.n = n + 1
+  ips[src] = ipN + 1
+  rec.ips = ips
+  await kvSave(kv, key, rec)
+  if (Math.random() < 0.02) {
+    try { await kv.delete('gate:ms:' + new Date(Date.now() - 2 * 86400000).toISOString().slice(0, 10)) } catch {}
+  }
+  return { allowed: true, used: rec.n, limit: perDay, remaining: Math.max(0, perDay - rec.n) }
+}
+
 async function gateSignCheck(kv, body) {
   const day = gateDay()
   const key = 'gate:sg:' + day
@@ -2836,6 +3005,18 @@ async function gateAnn(kv, body) {
   const op = String(body.op || '')
   const pairCode = String(body.pairCode || '')
   if (op === 'ann-send') {
+    // 按来源（IP + 设备码摘要）限速：仅按 pairCode 限流时，攻击者可轮换 6 位码刷屏。
+    const src = String(body.src || '').slice(0, 40)
+    if (src && body.rate !== false) {
+      const srcKey = 'gate:ann:s:' + src
+      const sr = (await kvJson(kv, srcKey)) || null
+      const now = Date.now()
+      const win = 60 * 1000
+      const fresh = sr && Number.isFinite(sr.w) && now - sr.w < win
+      const n = fresh ? Number(sr.n) || 0 : 0
+      if (n >= ANN_SEND_PER_MIN) return { ok: false, error: 'rate_limited' }
+      await kvSave(kv, srcKey, { w: fresh ? sr.w : now, n: n + 1, _exp: now + 3600 * 1000 })
+    }
     const rateKey = 'gate:ann:r:' + pairCode
     const prev = (await kvJson(kv, rateKey)) || null
     // rate: false 供管理后台使用：喊话由已登录的维护者触发，不受 10 秒/配对码限制
@@ -2901,8 +3082,17 @@ async function gateAnn(kv, body) {
     return { ok: true, msg }
   }
   if (op === 'ann-list') {
+    // 管理端或已与该配对码绑定（至少轮询过一次）的设备才能看设备列表，
+    // 避免拿到 6 位码后匿名枚举教室里在线的是谁。
+    // 注意：poll 本身不需要鉴权，攻击者可以先 poll 注册自己的设备码再 list，
+    // 所以路由层（handleAnnounceList）必须用管理令牌兜底，这里的绑定校验只是补充。
+    const deviceId = String(body.deviceId || '').trim()
     const regKey = 'gate:ann:d:' + pairCode
     const reg = (await kvJson(kv, regKey)) || {}
+    if (body.admin !== true) {
+      if (!/^[0-9a-f]{16,64}$/i.test(deviceId)) return { ok: false, error: 'bad_request' }
+      if (!reg[deviceId]) return { ok: false, error: 'forbidden' }
+    }
     const cutoff = Date.now() - ANN_BIND_TTL * 1000
     const devices = []
     for (const [dev, v] of Object.entries(reg)) {
@@ -2924,6 +3114,7 @@ async function gateDispatch(kv, name, body) {
   const op = String(body.op || 'check')
   if (name === ANN_ID) return gateAnn(kv, body)
   if (op === 'sign-check') return gateSignCheck(kv, body)
+  if (op === 'mirror-check') return gateMirrorCheck(kv, body)
   if (name === REGISTRY_ID) return gateRegistry(kv, body)
   return gateQuota(kv, name, body)
 }
@@ -3093,7 +3284,8 @@ async function handleAnnounceSend(request, env) {
   const targets = Array.isArray(data?.targets)
     ? data.targets.map((t) => String(t).trim()).filter((t) => /^[0-9a-f]{16,64}$/i.test(t))
     : undefined
-  const out = await announceOp(env, { op: 'ann-send', pairCode, text, from, duration, id, targets })
+  const src = (await sha256Hex(`${clientIpOf(request)}|${deviceIdOf(request)}`)).slice(0, 24)
+  const out = await announceOp(env, { op: 'ann-send', pairCode, text, from, duration, id, targets, src })
   if (!out) return json({ error: 'internal' }, 500, request, env)
   if (out.ok) return json({ ok: true, id, devices: out.devices || 0 }, 200, request, env)
   if (out.error === 'rate_limited') return json({ error: 'rate_limited' }, 429, request, env)
@@ -3151,12 +3343,18 @@ async function handleAnnouncePoll(request, env) {
 }
 
 async function handleAnnounceList(request, env) {
+  // 设备列表（id/name/ts）属于管理端数据：只凭 6 位配对码就能匿名枚举在线设备，
+  // 因此与 /api/files 等管理路由一致，要求 X-Purge-Token。
+  if (!adminOk(request, env)) return json({ error: '未授权' }, 401, request, env)
   const url = new URL(request.url)
   const pairCode = (url.searchParams.get('pairCode') || '').trim()
   if (!/^\d{6}$/.test(pairCode)) return json({ error: 'bad_request' }, 400, request, env)
 
-  const out = await announceOp(env, { op: 'ann-list', pairCode })
+  const out = await announceOp(env, { op: 'ann-list', pairCode, admin: true })
   if (!out) return json({ error: 'internal' }, 500, request, env)
+  if (!out.ok) {
+    return json({ error: out.error || 'forbidden' }, out.error === 'bad_request' ? 400 : 403, request, env)
+  }
   return json({ ok: true, devices: out.devices || [] }, 200, request, env)
 }
 
@@ -3294,22 +3492,49 @@ function admSameOrigin(request) {
 }
 
 /**
- * 来源 IP：优先用边缘注入的可信头；退化到 XFF 时取**最后一段**——
- * 首段由客户端自行填写，用它做限流会被伪造头直接绕过。
+ * 真实客户端 IP：只信任边缘会覆盖写入的头（EdgeOne: EO-Connecting-IP，
+ * Cloudflare: CF-Connecting-IP）；退化到 XFF 时取**最后一段**——首段由客户端
+ * 自行填写，用它做限流会被伪造头直接绕过。eagleeye-real-ip 是阿里云头，
+ * EdgeOne 不会覆盖，客户端可以随便填，因此不参与判定。
  */
-function reqIp(request) {
-  for (const name of ['eagleeye-real-ip', 'cf-connecting-ip', 'true-client-ip', 'x-real-ip']) {
-    const value = String(request.headers.get(name) || '').trim()
-    if (value) return value
+function clientIpOf(request) {
+  const h = request.headers
+  for (const name of ['eo-connecting-ip', 'cf-connecting-ip', 'true-client-ip', 'x-real-ip']) {
+    const value = String(h.get(name) || '').split(',')[0].trim()
+    if (value) return value.slice(0, 64) || 'unknown'
   }
-  const chain = String(request.headers.get('x-forwarded-for') || '')
+  const chain = String(h.get('x-forwarded-for') || '')
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean)
-  return chain.length ? chain[chain.length - 1] : 'unknown'
+  const last = chain.length ? chain[chain.length - 1] : ''
+  return last.slice(0, 64) || 'unknown'
+}
+
+function reqIp(request) {
+  return clientIpOf(request)
+}
+
+/** 客户端设备码：与 deviceIdOk 同一形态，避免把任意头写进存储键。 */
+function deviceIdOf(request) {
+  const raw = String(request.headers.get('x-csh-did') || request.headers.get('x-csh-device') || '').trim()
+  return deviceIdOk(raw) ? raw : ''
 }
 
 /** 定长比较，避免按字符提前返回泄漏密码前缀。 */
+/**
+ * 服务间调用令牌：观测台等受信后端用它调用 /api/admin/*，无需浏览器会话。
+ * 只接受 Authorization: Bearer 或 X-CSH-Admin-Token，且令牌必须足够长。
+ */
+function admServiceOk(request, env) {
+  const expect = String(env.CSH_ADMIN_API_TOKEN || '').trim()
+  if (expect.length < 16) return false
+  const auth = String(request.headers.get('authorization') || '').trim()
+  const bearer = /^bearer\s+/i.test(auth) ? auth.replace(/^bearer\s+/i, '').trim() : ''
+  const direct = String(request.headers.get('x-csh-admin-token') || '').trim()
+  return ctEqual(bearer || direct, expect)
+}
+
 function ctEqual(a, b) {
   const x = String(a)
   const y = String(b)
@@ -3502,6 +3727,128 @@ async function licTouchDevice(env, request) {
       await admIndexSave(kv, ADM_DEV_INDEX_KEY, devices)
     }
   } catch {}
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// 设备信誉
+//
+// 设备码由客户端上报（SystemIdentification.GetSystemIdForPublisher 等），
+// 服务端据此做两件事：
+//   1. 封禁优先：命中直接 429，换网/换 IP 也甩不掉；
+//   2. 敏感接口按设备限速：超每分钟/每日上限即 429，并记一条违规事件。
+// 通过时把最近活动写入 lic:ev:<device>（每 10 分钟最多一条），便于事后回溯。
+// ══════════════════════════════════════════════════════════════════════
+
+const REP_EVENT_PREFIX = 'lic:ev:'
+const REP_EVENT_CAP = 80
+const REP_EVENT_THROTTLE_MS = 10 * 60 * 1000
+
+// 路径 → 每分钟 / 每日上限。未列出的 /api/* 只做封禁检查，不额外计数。
+const REP_TIERS = [
+  ['/api/dl-ticket', 60, 1200],
+  ['/api/oss-sign', 40, 800],
+  ['/api/mirror-sign', 40, 800],
+  ['/api/submit', 6, 30],
+  ['/api/echocave', 20, 200],
+  ['/api/feedback', 10, 100],
+  ['/api/license/activate', 10, 60],
+]
+
+function repTierOf(pathname) {
+  for (const [p, perMin, perDay] of REP_TIERS) {
+    if (pathname === p || pathname.startsWith(p + '/')) return { perMin, perDay }
+  }
+  return null
+}
+
+/** 设备事件环形日志。默认 10 分钟节流，避免每个请求都写存储。 */
+async function repLogEvent(kv, device, ev) {
+  if (!kv || !device) return
+  const key = REP_EVENT_PREFIX + device
+  try {
+    const prev = (await kvJson(kv, key)) || null
+    // 同类事件 10 分钟只记一条；换类型（request → rate_limited）立即补记，便于回溯。
+    if (prev && Number.isFinite(prev.at) && Date.now() - prev.at < REP_EVENT_THROTTLE_MS && prev.k === ev.kind) return
+    const events = Array.isArray(prev && prev.events) ? prev.events : []
+    events.unshift({ ts: Date.now(), ...ev })
+    await kvSave(kv, key, { at: Date.now(), k: ev.kind, events: events.slice(0, REP_EVENT_CAP) })
+  } catch {}
+}
+
+/** 每设备每分钟/每日计数。返回 { ok:false } 由调用方转 429。 */
+async function repCheck(kv, device, tier, pathname) {
+  const day = gateDay()
+  const key = 'lic:rep:' + device + ':' + day
+  const now = Date.now()
+  const minute = Math.floor(now / 60000)
+  let rec = (await kvJson(kv, key)) || null
+  if (!rec || rec.day !== day) rec = { day, m: minute, mn: 0, n: 0, _exp: now + 2 * 86400000 }
+  if (rec.m !== minute) {
+    rec.m = minute
+    rec.mn = 0
+  }
+  rec._exp = now + 2 * 86400000
+  if (rec.n >= tier.perDay) return { ok: false, scope: 'day', limit: tier.perDay, used: rec.n }
+  if (rec.mn >= tier.perMin) return { ok: false, scope: 'minute', limit: tier.perMin, used: rec.mn }
+  rec.n += 1
+  rec.mn += 1
+  await kvSave(kv, key, rec)
+  await repLogEvent(kv, device, { kind: 'request', path: pathname })
+  return { ok: true, used: rec.n, limit: tier.perDay }
+}
+
+/**
+ * 设备信誉闸门：返回 null = 放行；返回 Response = 直接回绝（封禁与超限都是 429）。
+ * 无设备码的请求不在这里处理，仍由各接口自己的 IP/配额逻辑兜底。
+ */
+async function deviceGuard(request, env) {
+  const url = new URL(request.url)
+  if (!url.pathname.startsWith('/api/') || url.pathname.startsWith('/api/admin/')) return null
+  const device = deviceIdOf(request)
+  if (!device) return null
+
+  const kv = await gateKv()
+  if (!kv) return null
+
+  const ban = await licBanInfo(kv, device)
+  if (ban) {
+    await repLogEvent(kv, device, { kind: 'banned', path: url.pathname })
+    return json(
+      { error: licBanMessage(ban), code: 'csh_device_banned', until: Number(ban.until) || 0 },
+      429,
+      request,
+      env
+    )
+  }
+
+  const tier = repTierOf(url.pathname)
+  if (!tier) return null
+
+  const r = await repCheck(kv, device, tier, url.pathname)
+  if (r.ok) return null
+
+  await repLogEvent(kv, device, {
+    kind: 'rate_limited',
+    path: url.pathname,
+    scope: r.scope,
+    used: r.used,
+    limit: r.limit,
+  })
+  return json(
+    {
+      error:
+        r.scope === 'minute'
+          ? `请求过于频繁（每分钟最多 ${r.limit} 次），请稍后再试。`
+          : `今天的请求次数已达上限（${r.limit} 次），请明天再试。`,
+      code: 'csh_device_rate_limited',
+      scope: r.scope,
+      limit: r.limit,
+      used: r.used,
+    },
+    429,
+    request,
+    env
+  )
 }
 
 function licEnforce(env) {
@@ -3790,11 +4137,27 @@ async function handleLicenseActivate(request, env) {
   if (kv) {
     const ban = await licBanInfo(kv, device)
     if (ban) {
-      return json({ error: licBanMessage(ban), code: 'csh_device_banned', until: Number(ban.until) || 0 }, 403, request, env)
+      return json({ error: licBanMessage(ban), code: 'csh_device_banned', until: Number(ban.until) || 0 }, 429, request, env)
+    }
+    const rep = await repCheck(kv, device, { perMin: 10, perDay: 60 }, LIC_ACTIVATE_PATH)
+    if (!rep.ok) {
+      await repLogEvent(kv, device, { kind: 'rate_limited', path: LIC_ACTIVATE_PATH, scope: rep.scope })
+      return json(
+        {
+          error: rep.scope === 'minute' ? '激活尝试过于频繁，请稍后再试。' : '今日激活尝试次数过多，请明天再试。',
+          code: 'csh_device_rate_limited',
+          scope: rep.scope,
+          limit: rep.limit,
+          used: rep.used,
+        },
+        429,
+        request,
+        env
+      )
     }
   }
 
-  // 防爆破：同一来源每日尝试次数上限
+  // 防爆破：同一来源每日尝试次数上限（来源 IP 以边缘写入的可信头为准）
   const src = (await sha256Hex(reqIp(request))).slice(0, 24)
   const day = gateDay()
   const tryKey = LIC_TRY_KEY + day + ':' + src
@@ -3836,6 +4199,7 @@ async function handleLicenseActivate(request, env) {
   }
   if (kv) {
     try { await kvSave(kv, LIC_DEVICE_KEY + device, deviceRec) } catch {}
+    try { await repLogEvent(kv, device, { kind: 'activate', serial: check.serial }) } catch {}
     try {
       await licRecordActivation(kv, {
         device,
@@ -3944,7 +4308,7 @@ async function handleAdminSession(request, env) {
 /** GET /api/admin/codes 列表；POST /api/admin/codes 批量签发。 */
 async function handleAdminCodes(request, env) {
   const sess = await admSession(request, env)
-  if (!sess) return admJson({ error: '未登录' }, 401)
+  if (!sess && !admServiceOk(request, env)) return admJson({ error: '未登录' }, 401)
 
   const kv = await gateKv()
   if (!kv) return admJson({ error: '状态存储不可用' }, 503)
@@ -3954,7 +4318,7 @@ async function handleAdminCodes(request, env) {
     return admJson({ ok: true, codes })
   }
 
-  if (!admSameOrigin(request)) return admJson({ error: '来源校验失败' }, 403)
+  if (!admServiceOk(request, env) && !admSameOrigin(request)) return admJson({ error: '来源校验失败' }, 403)
   if (!env.CSH_LICENSE_SECRET) return admJson({ error: '未配置 CSH_LICENSE_SECRET，无法签发' }, 503)
 
   let body
@@ -3978,13 +4342,13 @@ async function handleAdminCodes(request, env) {
     if (seq >= 0xffffff) break
     seq += 1
     const made = await licMakeCode(env, seq)
-    created.push({ s: made.serial, c: made.code, at: now, note, by: sess.user, n: 0 })
+    created.push({ s: made.serial, c: made.code, at: now, note, by: (sess && sess.user) || 'service', n: 0 })
   }
   if (!created.length) return admJson({ error: '序列号已用尽，需要更换签发规则' }, 507)
 
   await kvSave(kv, ADM_SEQ_KEY, { n: seq })
   await admIndexSave(kv, ADM_CODE_INDEX_KEY, created.concat(codes))
-  console.log(`admin: ${sess.user} issued ${created.length} code(s) note=${note || '-'}`)
+  console.log(`admin: ${(sess && sess.user) || 'service'} issued ${created.length} code(s) note=${note || '-'}`)
 
   return admJson({
     ok: true,
@@ -3996,8 +4360,8 @@ async function handleAdminCodes(request, env) {
 /** POST /api/admin/code-revoke —— 吊销/恢复。只影响未激活的码。 */
 async function handleAdminCodeRevoke(request, env) {
   const sess = await admSession(request, env)
-  if (!sess) return admJson({ error: '未登录' }, 401)
-  if (!admSameOrigin(request)) return admJson({ error: '来源校验失败' }, 403)
+  if (!sess && !admServiceOk(request, env)) return admJson({ error: '未登录' }, 401)
+  if (!admServiceOk(request, env) && !admSameOrigin(request)) return admJson({ error: '来源校验失败' }, 403)
 
   let body
   try {
@@ -4022,14 +4386,14 @@ async function handleAdminCodeRevoke(request, env) {
   }
   hit.r = revoked
   await admIndexSave(kv, ADM_CODE_INDEX_KEY, codes)
-  console.log(`admin: ${sess.user} ${revoked ? 'revoked' : 'restored'} code #${serial}`)
+  console.log(`admin: ${(sess && sess.user) || 'service'} ${revoked ? 'revoked' : 'restored'} code #${serial}`)
   return admJson({ ok: true, serial, revoked: !!revoked })
 }
 
 /** GET /api/admin/devices —— 已激活设备（按最近激活排序，最多 200 台）。 */
 async function handleAdminDevices(request, env) {
   const sess = await admSession(request, env)
-  if (!sess) return admJson({ error: '未登录' }, 401)
+  if (!sess && !admServiceOk(request, env)) return admJson({ error: '未登录' }, 401)
 
   const kv = await gateKv()
   if (!kv) return admJson({ error: '状态存储不可用' }, 503)
@@ -4040,6 +4404,32 @@ async function handleAdminDevices(request, env) {
 
   const devices = await admIndex(kv, ADM_DEV_INDEX_KEY)
   return admJson({ ok: true, devices, backfilled })
+}
+
+/** GET /api/admin/device-events?device= —— 单设备信誉详情：事件、封禁、当日报数。 */
+async function handleAdminDeviceEvents(request, env) {
+  const sess = await admSession(request, env)
+  if (!sess && !admServiceOk(request, env)) return admJson({ error: '未登录' }, 401)
+
+  const device = String(new URL(request.url).searchParams.get('device') || '').trim().slice(0, 64)
+  if (!device) return admJson({ error: '缺少设备码' }, 400)
+
+  const kv = await gateKv()
+  if (!kv) return admJson({ error: '状态存储不可用' }, 503)
+
+  const ev = (await kvJson(kv, REP_EVENT_PREFIX + device)) || null
+  const ban = await licBanInfo(kv, device)
+  const touch = await kvJson(kv, LIC_DEVICE_KEY + device)
+  const usage = (await kvJson(kv, 'lic:rep:' + device + ':' + gateDay())) || null
+
+  return admJson({
+    ok: true,
+    device,
+    ban: ban || null,
+    touch: touch || null,
+    usage: usage ? { day: usage.day, dayCount: usage.n, minuteCount: usage.mn } : null,
+    events: Array.isArray(ev && ev.events) ? ev.events : [],
+  })
 }
 
 /**
@@ -4086,8 +4476,8 @@ async function licBackfillDevices(kv) {
 /** POST /api/admin/ban { device, hours, reason } —— hours=0 表示永久。 */
 async function handleAdminBan(request, env) {
   const sess = await admSession(request, env)
-  if (!sess) return admJson({ error: '未登录' }, 401)
-  if (!admSameOrigin(request)) return admJson({ error: '来源校验失败' }, 403)
+  if (!sess && !admServiceOk(request, env)) return admJson({ error: '未登录' }, 401)
+  if (!admServiceOk(request, env) && !admSameOrigin(request)) return admJson({ error: '来源校验失败' }, 403)
 
   let body
   try {
@@ -4107,7 +4497,7 @@ async function handleAdminBan(request, env) {
   const kv = await gateKv()
   if (!kv) return admJson({ error: '状态存储不可用' }, 503)
 
-  await kvSave(kv, ADM_BAN_KEY + device, { at: Date.now(), until, reason, by: sess.user })
+  await kvSave(kv, ADM_BAN_KEY + device, { at: Date.now(), until, reason, by: (sess && sess.user) || 'service' })
 
   const devices = await admIndex(kv, ADM_DEV_INDEX_KEY)
   const hit = devices.find((d) => d && d.d === device)
@@ -4116,15 +4506,15 @@ async function handleAdminBan(request, env) {
     await admIndexSave(kv, ADM_DEV_INDEX_KEY, devices)
   }
 
-  console.log(`admin: ${sess.user} banned ${device} until=${until || 'forever'} reason=${reason || '-'}`)
+  console.log(`admin: ${(sess && sess.user) || 'service'} banned ${device} until=${until || 'forever'} reason=${reason || '-'}`)
   return admJson({ ok: true, device, until })
 }
 
 /** POST /api/admin/unban { device } */
 async function handleAdminUnban(request, env) {
   const sess = await admSession(request, env)
-  if (!sess) return admJson({ error: '未登录' }, 401)
-  if (!admSameOrigin(request)) return admJson({ error: '来源校验失败' }, 403)
+  if (!sess && !admServiceOk(request, env)) return admJson({ error: '未登录' }, 401)
+  if (!admServiceOk(request, env) && !admSameOrigin(request)) return admJson({ error: '来源校验失败' }, 403)
 
   let body
   try {
@@ -4151,7 +4541,7 @@ async function handleAdminUnban(request, env) {
     await admIndexSave(kv, ADM_DEV_INDEX_KEY, devices)
   }
 
-  console.log(`admin: ${sess.user} unbanned ${device}`)
+  console.log(`admin: ${(sess && sess.user) || 'service'} unbanned ${device}`)
   return admJson({ ok: true, device })
 }
 
@@ -4216,7 +4606,7 @@ async function admOnlineDevices(kv) {
 /** GET /api/admin/online —— 当前可喊话的在线设备。 */
 async function handleAdminOnline(request, env) {
   const sess = await admSession(request, env)
-  if (!sess) return admJson({ error: '未登录' }, 401)
+  if (!sess && !admServiceOk(request, env)) return admJson({ error: '未登录' }, 401)
 
   const kv = await gateKv()
   if (!kv) return admJson({ error: '状态存储不可用' }, 503)
@@ -4228,8 +4618,8 @@ async function handleAdminOnline(request, env) {
 /** POST /api/admin/shout { text, duration, from, targets } —— 向在线设备喊话。 */
 async function handleAdminShout(request, env) {
   const sess = await admSession(request, env)
-  if (!sess) return admJson({ error: '未登录' }, 401)
-  if (!admSameOrigin(request)) return admJson({ error: '来源校验失败' }, 403)
+  if (!sess && !admServiceOk(request, env)) return admJson({ error: '未登录' }, 401)
+  if (!admServiceOk(request, env) && !admSameOrigin(request)) return admJson({ error: '来源校验失败' }, 403)
 
   let body
   try {
@@ -4285,7 +4675,7 @@ async function handleAdminShout(request, env) {
     else failed.push({ pair, error: (out && out.error) || 'internal' })
   }
 
-  console.log(`admin: ${sess.user} shout ${id} delivered=${delivered} pairs=${groups.size} text=${text.slice(0, 40)}`)
+  console.log(`admin: ${(sess && sess.user) || 'service'} shout ${id} delivered=${delivered} pairs=${groups.size} text=${text.slice(0, 40)}`)
   return admJson({ ok: true, id, delivered, pairs: groups.size, failed })
 }
 
@@ -4302,6 +4692,10 @@ async function workerFetch(request, env, ctx) {
     if (url.pathname.startsWith('/api/') && !url.pathname.startsWith('/api/admin/')) {
       ctx.waitUntil(licTouchDevice(env, request).catch(() => {}))
     }
+
+    // 设备信誉先于许可判定：封禁/超限统一回 429（许可闸门对被封禁设备回 403）。
+    const rep = await deviceGuard(request, env)
+    if (rep) return rep
 
     const gate = await licenseGuard(request, env)
     if (gate && gate.deny) return gate.deny
@@ -4333,6 +4727,9 @@ async function routeRequest(request, env, ctx) {
         return handleAdminCodeRevoke(request, env)
       }
       if (url.pathname === '/api/admin/devices' && request.method === 'GET') return handleAdminDevices(request, env)
+      if (url.pathname === '/api/admin/device-events' && request.method === 'GET') {
+        return handleAdminDeviceEvents(request, env)
+      }
       if (url.pathname === '/api/admin/ban' && request.method === 'POST') return handleAdminBan(request, env)
       if (url.pathname === '/api/admin/unban' && request.method === 'POST') return handleAdminUnban(request, env)
       if (url.pathname === '/api/admin/online' && request.method === 'GET') return handleAdminOnline(request, env)

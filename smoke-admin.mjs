@@ -20,6 +20,7 @@ const env = {
   CSH_LIC_ENFORCE: 'false',
   CSH_LIC_ENFORCE_AT: '',
   CSH_LIC_LEGACY_UNTIL: '',
+  CSH_ADMIN_API_TOKEN: 'svc-token-1234567890abcdef',
 }
 
 const sha256HexLocal = (text) => createHash('sha256').update(String(text)).digest('hex')
@@ -53,6 +54,31 @@ function log(name, ok, extra) {
 
 const session0 = await jsonOf(await call('/api/admin/session'))
 log('未登录时 session 返回 401', session0.status === 401 && session0.data.ready === true)
+
+// ── 设备信誉 / 服务令牌 ──────────────────────────────────────────────
+const noToken = await jsonOf(await call('/api/admin/devices'))
+log('无会话且无令牌访问设备列表被拒', noToken.status === 401)
+
+const svcToken = 'svc-token-1234567890abcdef'
+const svcOnline = await jsonOf(await call('/api/admin/online', { headers: { authorization: 'Bearer ' + svcToken } }))
+log('服务令牌可访问后台接口', svcOnline.status === 200 && svcOnline.data.ok === true)
+
+const repDevice = 'feedfacecafebeef'
+let repLast = null
+for (let i = 0; i < 21; i++) {
+  repLast = await jsonOf(await call('/api/echocave', {
+    method: 'POST',
+    headers: { 'x-csh-did': repDevice },
+    body: {},
+  }))
+}
+log('设备每分钟超限返回 429', repLast.status === 429 && repLast.data.code === 'csh_device_rate_limited', repLast && repLast.data.error)
+
+const repEvents = await jsonOf(await call('/api/admin/device-events?device=' + repDevice, {
+  headers: { authorization: 'Bearer ' + svcToken },
+}))
+log('设备事件日志可回溯', repEvents.status === 200 && Array.isArray(repEvents.data.events) &&
+  repEvents.data.events.some((e) => e.kind === 'rate_limited'))
 
 const badLogin = await jsonOf(await call('/api/admin/login', { method: 'POST', body: { user: 'admin', pass: 'nope' } }))
 log('错误密码 401', badLogin.status === 401)
@@ -139,10 +165,10 @@ const ban = await jsonOf(await call('/api/admin/ban', { method: 'POST', headers:
 log('封禁设备', ban.status === 200 && ban.data.until > Date.now())
 
 const actBanned = await jsonOf(await call('/api/license/activate', { method: 'POST', body: { code: issued.data.codes[1].code, device } }))
-log('被封禁设备无法激活', actBanned.status === 403 && actBanned.data.code === 'csh_device_banned', actBanned.data.error)
+log('被封禁设备无法激活', actBanned.status === 429 && actBanned.data.code === 'csh_device_banned', actBanned.data.error)
 
 const gated = await jsonOf(await call('/api/echocave', { method: 'POST', headers: { 'x-csh-device': device }, body: {} }))
-log('被封禁设备请求受保护接口被拒', gated.status === 403 && gated.data.code === 'csh_device_banned')
+log('被封禁设备请求受保护接口被拒', gated.status === 429 && gated.data.code === 'csh_device_banned')
 
 const unban = await jsonOf(await call('/api/admin/unban', { method: 'POST', headers: { cookie }, body: { device } }))
 log('解封设备', unban.status === 200)
@@ -229,13 +255,15 @@ log('非法设备码不写存储', store.size === before)
 // 3) 每来源每日新设备配额 500 台，超限后不再新增记录
 const regDay = new Date().toISOString().slice(0, 10)
 const ipHash = (await sha256HexLocal('198.51.100.7')).slice(0, 24)
-await store.set('lic:reg:' + ipHash + ':' + regDay, JSON.stringify({ n: 500 }))
-const capBefore = store.size
+const regKey = 'lic:reg:' + ipHash + ':' + regDay
+await store.set(regKey, JSON.stringify({ n: 500 }))
 await call('/api/mirror-sign?url=https://github.com/x/y/releases/download/v1/tag', {
   headers: { 'x-csh-did': 'eeee111122223333', 'x-forwarded-for': '198.51.100.7' },
 })
 await flush()
-log('新设备配额用尽后不再登记', store.size === capBefore &&
+// 设备信誉计数（lic:rep / lic:ev）属于另一套机制，这里只断言“设备登记”没发生。
+const regAfter = JSON.parse(await store.get(regKey))
+log('新设备配额用尽后不再登记', regAfter.n === 500 &&
   ![...store.keys()].includes('lic:d:eeee111122223333'))
 
 // 4) 单个配对码在线设备上限，防止随机设备码撑大注册表

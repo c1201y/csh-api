@@ -1,4 +1,4 @@
-const path = 'file:///C:/csh-tencent-backend/functions/api/%5B%5Bdefault%5D%5D.js'
+const path = new URL('./functions/api/[[default]].js', import.meta.url).href
 
 const store = new Map()
 globalThis.CSH_STATE = {
@@ -92,7 +92,8 @@ function check(name, cond, extra) {
     body: JSON.stringify({ key: 'upload/2026/10/test.zip', fp: '0123456789abcdef0123456789abcdef' }),
   }), env))
   const j = await r.json()
-  check('dl-ticket rejects bad fp size', r.status === 400 || r.status === 403, { s: r.status, j })
+  // 客户端 fp 只作兼容：配额键由服务端按设备码/可信 IP 派生，短 fp 不再拒绝。
+  check('dl-ticket ignores client fp', r.status !== 400, { s: r.status, j })
 }
 
 // ── 正版校验 ──────────────────────────────────────────────────────────
@@ -118,7 +119,7 @@ function check(name, cond, extra) {
   const denyJson = await deny.clone().json()
   check('license 无凭证 403', deny.status === 403 && denyJson.code === 'csh_license_required', denyJson)
 
-  const official = await submitAs({ 'X-CSH-Build': buildId, 'X-CSH-Sig': sig, 'X-CSH-Device': 'smoke-dev' }, strict)
+  const official = await submitAs({ 'X-CSH-Build': buildId, 'X-CSH-Sig': sig, 'X-CSH-Device': '0123456789abcdef' }, strict)
   check('license 官方签名放行', official.status !== 403)
   check('license 下发令牌', !!official.headers.get('x-csh-lic'))
 
@@ -151,18 +152,18 @@ function check(name, cond, extra) {
   const activate = await mod.onRequest(ctxOf(new Request('http://t/api/license/activate', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ code, device: 'smoke-dev' }),
+    body: JSON.stringify({ code, device: '0123456789abcdef' }),
   }), { ...licEnv, ...strict }))
   const activateJson = await activate.clone().json()
   check('license 激活成功', activate.status === 200 && activateJson.success === true, activateJson)
 
-  const withToken = await submitAs({ 'X-CSH-Build': 'community+local', 'X-CSH-Device': 'smoke-dev', 'X-CSH-Lic': activateJson.token }, strict)
+  const withToken = await submitAs({ 'X-CSH-Build': 'community+local', 'X-CSH-Device': '0123456789abcdef', 'X-CSH-Lic': activateJson.token }, strict)
   check('license 已激活令牌放行', withToken.status !== 403)
 
   const badCode = await mod.onRequest(ctxOf(new Request('http://t/api/license/activate', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ code: 'AAAAAAAAAAAAAAAA', device: 'smoke-dev' }),
+    body: JSON.stringify({ code: 'AAAAAAAAAAAAAAAA', device: '0123456789abcdef' }),
   }), { ...licEnv, ...strict }))
   check('license 错误激活码拒绝', badCode.status === 400, badCode.status)
 }

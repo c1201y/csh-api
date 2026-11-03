@@ -1,4 +1,4 @@
-const path = 'file:///C:/csh-tencent-backend/functions/api/%5B%5Bdefault%5D%5D.js'
+const path = new URL('./functions/api/[[default]].js', import.meta.url).href
 
 // blob 路径：不注入 CSH_STATE，走 @edgeone/pages-blob stub（见 node_modules）
 
@@ -87,7 +87,8 @@ function check(name, cond, extra) {
     body: JSON.stringify({ key: 'upload/2026/10/test.zip', fp: '0123456789abcdef0123456789abcdef' }),
   }), env))
   const j = await r.json()
-  check('dl-ticket rejects bad fp size', r.status === 400 || r.status === 403, { s: r.status, j })
+  // 客户端 fp 只作兼容：配额键由服务端按设备码/可信 IP 派生，短 fp 不再拒绝。
+  check('dl-ticket ignores client fp', r.status !== 400, { s: r.status, j })
 }
 
 await Promise.allSettled(waiters)

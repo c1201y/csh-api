@@ -77,6 +77,7 @@
 | `CSH_ADMIN_PASS` | 密钥 | 后台密码（明文比对，定长比较）。与 `CSH_ADMIN_PASS_SHA256` 二选一 |
 | `CSH_ADMIN_PASS_SHA256` | 密钥 | 密码的 SHA-256 十六进制（小写）。设置后优先于 `CSH_ADMIN_PASS`，避免在控制台留明文 |
 | `CSH_ADMIN_SESSION_SECRET` | 密钥 | 会话签名密钥；留空时回落 `CSH_LICENSE_SECRET`。建议单独配一把，便于轮换会话而不动激活码 |
+| `CSH_ADMIN_API_TOKEN` | 密钥 | 服务间令牌（≥16 位）。观测台用它调用 `/api/admin/*`，无需浏览器会话；留空则只能走 Cookie 登录 |
 
 会话有效期 12 小时，Cookie 为 `csh_adm`，属性 `HttpOnly; Secure; SameSite=Strict; Path=/`。
 同一来源连续登录失败 10 次锁定 30 分钟；写操作额外校验 `Sec-Fetch-Site` 与 `Origin`/`Referer`，
@@ -91,7 +92,22 @@
    要停用某台设备，点「封禁」选时长（1 天 / 3 天 / 7 天 / 30 天 / 永久）并填原因，
    原因会原样出现在客户端提示里。
 4. 封禁立即生效：被停用设备调受保护接口（提交、回声洞、反馈、OSS 直传、教室喊话）与再次激活
-   都返回 `403 {"code":"csh_device_banned"}`，即使手里的令牌还没过期。
+   都返回 `429 {"code":"csh_device_banned"}`，即使手里的令牌还没过期。
+
+### 设备信誉与 429
+
+客户端在请求头 `X-CSH-Did`（或 `X-CSH-Device`）里带上设备标识后，服务端会：
+
+1. **封禁优先**：命中 `lic:ban:<device>` 的请求直接回 `429`，`code=csh_device_banned`，
+   换 IP / 换网络也甩不掉。被停用设备重新激活同样 429。
+2. **按设备限速**：`dl-ticket` 60 次/分、`oss-sign` 与 `mirror-sign` 40 次/分、
+   `submit` 6 次/分、`echocave` 20 次/分、`feedback` 10 次/分、`activate` 10 次/分；
+   超限回 `429`，`code=csh_device_rate_limited`，并记录一条违规事件。
+3. **活动日志**：通过时把最近请求写入 `lic:ev:<device>`（每 10 分钟最多一条），
+   后台可经 `GET /api/admin/device-events?device=...` 查看事件、封禁与当日报数。
+
+设备标识建议用 `SystemIdentification.GetSystemIdForPublisher()`（Win10+）生成，
+取不到时退回本地持久随机 ID。没有设备码的请求仍走各接口原有的 IP/配额逻辑。
 
 语义边界（重要）：
 
