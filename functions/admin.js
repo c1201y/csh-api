@@ -95,6 +95,35 @@ tr:last-child td{border-bottom:none}
 .shout-form textarea:focus{border-color:var(--brand);box-shadow:0 0 0 3px var(--brand-soft)}
 .online-check{width:16px;height:16px;accent-color:var(--brand);vertical-align:middle}
 
+/* 参数设置 */
+.tabs{display:flex;flex-wrap:wrap;gap:6px;margin:2px 0 14px}
+.tab{border:1px solid var(--line);background:var(--card);border-radius:999px;padding:6px 12px;font-size:12.5px;color:var(--muted)}
+.tab:hover{border-color:var(--muted)}
+.tab.active{background:var(--brand-soft);border-color:var(--brand);color:var(--fg);font-weight:600}
+.set-row{display:flex;gap:14px;align-items:flex-start;padding:10px 0;border-bottom:1px dashed var(--line)}
+.set-row:last-child{border-bottom:none}
+.set-row.dirty{background:var(--warn-bg);border-radius:10px;padding:10px;border-bottom-color:transparent}
+.set-main{flex:1;min-width:0}
+.set-label{font-size:13px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.set-hint{color:var(--muted);font-size:11.5px;margin-top:3px}
+.set-input{display:flex;align-items:center;gap:8px;flex:0 0 auto;justify-content:flex-end;flex-wrap:wrap}
+.set-input input[type=number],.set-input select{padding:6px 9px;font-size:12.5px;border-radius:8px;width:132px}
+.set-input input[type=text]{padding:6px 9px;font-size:12px;border-radius:8px;width:214px;font-family:var(--mono)}
+.set-unit{color:var(--muted);font-size:11.5px;min-width:24px}
+.set-foot{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:14px;padding-top:12px;border-top:1px solid var(--line);flex-wrap:wrap}
+.switch{width:38px;height:22px;appearance:none;-webkit-appearance:none;background:var(--line);border-radius:999px;position:relative;cursor:pointer;transition:background .15s;flex:0 0 auto;margin:0;padding:0}
+.switch:checked{background:var(--brand)}
+.switch::after{content:"";position:absolute;top:3px;left:3px;width:16px;height:16px;border-radius:50%;background:#fff;transition:transform .15s}
+.switch:checked::after{transform:translateX(16px)}
+.log-row{display:flex;gap:12px;padding:8px 0;border-bottom:1px dashed var(--line);font-size:12.5px}
+.log-row:last-child{border-bottom:none}
+.log-when{color:var(--muted);font-size:11.5px;white-space:nowrap;min-width:132px}
+.log-body{flex:1;min-width:0;word-break:break-word}
+@media (max-width:600px){
+  .set-input input[type=number],.set-input input[type=text],.set-input select{width:104px}
+  .log-when{min-width:0}
+}
+
 /* 弹窗 */
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.42);display:flex;align-items:center;justify-content:center;padding:20px;z-index:20}
 .modal-card{width:100%;max-width:360px;background:var(--card);border-radius:14px;padding:20px}
@@ -117,7 +146,7 @@ tr:last-child td{border-bottom:none}
   <div class="login-card">
     <div class="brand"><span class="dot"></span> ClassSoftwareHub</div>
     <h1>管理后台</h1>
-    <p class="sub">维护者专用。登录后可签发激活码、查看已激活设备、封禁设备。</p>
+    <p class="sub">维护者专用。登录后可签发激活码、查看设备、调整限额参数。</p>
     <label class="field">账号<input id="user" autocomplete="username" autocapitalize="off" spellcheck="false" value="admin"></label>
     <label class="field">密码<input id="pass" type="password" autocomplete="current-password"></label>
     <button id="loginBtn" class="primary" style="width:100%;margin-top:4px">登录</button>
@@ -214,6 +243,36 @@ tr:last-child td{border-bottom:none}
       </div>
     </section>
 
+    <section class="card">
+      <div class="card-head">
+        <h2>参数设置</h2>
+        <div class="tools">
+          <span id="setDirty" class="dim"></span>
+          <button id="setSave" class="primary sm" disabled>保存修改</button>
+        </div>
+      </div>
+      <p class="hint">这里的值直接决定线上限额，保存后下一个请求就生效。改过的项标「已改」，可单项还原或一键还原到出厂值。</p>
+      <div id="setTabs" class="tabs"></div>
+      <div id="setBody"></div>
+      <div class="set-foot">
+        <button id="setResetAll" class="ghost sm">全部还原出厂值</button>
+        <span id="setUpdated" class="dim"></span>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>操作日志</h2>
+        <div class="tools">
+          <span id="auditCount" class="dim"></span>
+          <button id="reloadAudit" class="ghost sm">刷新</button>
+        </div>
+      </div>
+      <p class="hint">记录参数修改、签发 / 吊销、封禁 / 解封、喊话，保留最近 300 条。</p>
+      <div id="auditBody"></div>
+      <p id="auditEmpty" class="empty hidden">还没有操作记录。</p>
+    </section>
+
     <p class="foot">激活码是离线签名凭证：吊销只对未激活的码生效；已激活的设备要失效，需要在这里封禁。</p>
   </main>
 </div>
@@ -242,7 +301,7 @@ tr:last-child td{border-bottom:none}
 <div id="toast" class="toast hidden"></div>
 
 <script>
-var state = { codes: [], devices: [], pendingBan: '', license: null, online: [], onlinePicked: {} };
+var state = { codes: [], devices: [], pendingBan: '', license: null, online: [], onlinePicked: {}, settings: null, setActive: '' };
 
 function $(id) { return document.getElementById(id); }
 function el(tag, cls, text) {
@@ -326,6 +385,7 @@ function enterApp(info) {
   loadCodes();
   loadDevices();
   loadOnline();
+  loadSettings();
   if (!state.onlineTimer) {
     state.onlineTimer = setInterval(function () {
       if (!document.hidden && !$('app').classList.contains('hidden')) loadOnline();
@@ -670,6 +730,271 @@ async function sendShout() {
   }
 }
 
+async function loadSettings() {
+  var r = await api('/settings');
+  if (r.status === 401) return enterLogin({});
+  if (!r.ok) return toast(r.error || '读取参数失败');
+  state.settings = r;
+  var groups = r.groups || [];
+  if (!state.setActive || !groups.some(function (g) { return g.id === state.setActive; })) {
+    state.setActive = groups.length ? groups[0].id : '';
+  }
+  renderSettingsTabs();
+  renderSettings();
+  renderAudit(r.audit || []);
+  $('setUpdated').textContent = r.updatedAt
+    ? '上次修改：' + fmtTime(r.updatedAt) + (r.updatedBy ? ' · ' + r.updatedBy : '')
+    : '全部为出厂值';
+}
+
+function renderSettingsTabs() {
+  var box = $('setTabs');
+  box.innerHTML = '';
+  ((state.settings && state.settings.groups) || []).forEach(function (g) {
+    var b = el('button', 'tab' + (g.id === state.setActive ? ' active' : ''), g.title);
+    if (g.hint) b.title = g.hint;
+    b.addEventListener('click', function () {
+      state.setActive = g.id;
+      renderSettingsTabs();
+      renderSettings();
+    });
+    box.appendChild(b);
+  });
+}
+
+function applyFieldValue(input, field) {
+  if (field.type === 'bool') input.checked = !!field.value;
+  else input.value = field.value === null || field.value === undefined ? '' : String(field.value);
+}
+
+function readField(input, field) {
+  if (field.type === 'bool') return input.checked;
+  if (field.type === 'num') {
+    var n = Number(input.value);
+    return input.value === '' ? '' : (isFinite(n) ? n : input.value);
+  }
+  return String(input.value).trim();
+}
+
+function fieldDirty(field) {
+  var input = document.querySelector('[data-k="' + field.key + '"]');
+  if (!input) return false;
+  var v = readField(input, field);
+  if (field.type === 'bool') return !!v !== !!field.value;
+  if (field.type === 'num') return Number(v) !== Number(field.value) || (v === '' && field.value !== '');
+  return String(v) !== String(field.value === null || field.value === undefined ? '' : field.value);
+}
+
+function refreshDirty() {
+  var changed = 0;
+  ((state.settings && state.settings.groups) || []).forEach(function (g) {
+    g.fields.forEach(function (f) {
+      var input = document.querySelector('[data-k="' + f.key + '"]');
+      if (!input) return;
+      var dirty = fieldDirty(f);
+      if (dirty) changed += 1;
+      var row = input.closest('.set-row');
+      if (row) row.classList.toggle('dirty', dirty);
+    });
+  });
+  $('setSave').disabled = changed === 0;
+  $('setDirty').textContent = changed ? '有 ' + changed + ' 项未保存' : '';
+}
+
+function renderSettings() {
+  var box = $('setBody');
+  box.innerHTML = '';
+  var group = ((state.settings && state.settings.groups) || []).filter(function (g) {
+    return g.id === state.setActive;
+  })[0];
+  if (!group) return;
+
+  group.fields.forEach(function (f) {
+    var row = el('div', 'set-row');
+    var main = el('div', 'set-main');
+    var label = el('div', 'set-label');
+    label.appendChild(el('span', '', f.label));
+    if (f.overridden) label.appendChild(el('span', 'badge b-warn', '已改'));
+    main.appendChild(label);
+    if (f.hint) main.appendChild(el('div', 'set-hint', f.hint));
+    row.appendChild(main);
+
+    var wrap = el('div', 'set-input');
+    var input = document.createElement('input');
+    input.setAttribute('data-k', f.key);
+
+    if (f.type === 'bool') {
+      input.type = 'checkbox';
+      input.className = 'switch';
+      input.checked = !!f.value;
+    } else if (f.type === 'enum') {
+      input = document.createElement('select');
+      input.setAttribute('data-k', f.key);
+      (f.options || []).forEach(function (opt) {
+        var o = document.createElement('option');
+        o.value = opt;
+        o.textContent = opt;
+        input.appendChild(o);
+      });
+      input.value = String(f.value);
+    } else if (f.type === 'num') {
+      input.type = 'number';
+      input.min = f.min === undefined ? '' : String(f.min);
+      input.max = f.max === undefined ? '' : String(f.max);
+      input.value = f.value === null || f.value === undefined ? '' : String(f.value);
+    } else {
+      input.type = 'text';
+      input.placeholder = f.type === 'iso' ? '2026-12-02T00:00:00Z' : '';
+      input.value = f.value === null || f.value === undefined ? '' : String(f.value);
+    }
+    wrap.appendChild(input);
+    if (f.unit) wrap.appendChild(el('span', 'set-unit', f.unit));
+
+    if (f.overridden) {
+      var undo = el('button', 'ghost sm', '还原');
+      undo.title = '还原为出厂值 ' + (f.type === 'bool' ? (f.def ? '开' : '关') : String(f.def));
+      undo.addEventListener('click', function () {
+        var fresh = Object.assign({}, f, { value: f.def, overridden: false });
+        applyFieldValue(input, fresh);
+        refreshDirty();
+        toast('已设为出厂值，点「保存修改」生效');
+      });
+      wrap.appendChild(undo);
+    }
+
+    var onEdit = function () { refreshDirty(); };
+    input.addEventListener('input', onEdit);
+    input.addEventListener('change', onEdit);
+    row.appendChild(wrap);
+    box.appendChild(row);
+  });
+
+  refreshDirty();
+}
+
+function collectSettings() {
+  var patch = {};
+  var reset = [];
+  ((state.settings && state.settings.groups) || []).forEach(function (g) {
+    g.fields.forEach(function (f) {
+      var input = document.querySelector('[data-k="' + f.key + '"]');
+      if (!input) return;
+      var v = readField(input, f);
+      if (!fieldDirty(f)) return;
+      var sameAsDef = f.type === 'bool' ? !!v === !!f.def : String(v) === String(f.def === null || f.def === undefined ? '' : f.def);
+      if (sameAsDef && f.overridden) reset.push(f.key);
+      else patch[f.key] = v;
+    });
+  });
+  return { patch: patch, reset: reset };
+}
+
+async function saveSettings() {
+  var body = collectSettings();
+  var n = Object.keys(body.patch).length + body.reset.length;
+  if (!n) { toast('没有改动'); return; }
+
+  var btn = $('setSave');
+  btn.disabled = true;
+  btn.textContent = '保存中…';
+  try {
+    var r = await api('/settings', { method: 'POST', body: { patch: body.patch, reset: body.reset } });
+    if (r.errors) {
+      var first = Object.keys(r.errors)[0];
+      toast('「' + first + '」' + r.errors[first]);
+      return;
+    }
+    if (!r.ok) { toast(r.error || '保存失败'); return; }
+    toast('已保存 ' + (r.changed || n) + ' 项');
+    await loadSettings();
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '保存修改';
+  }
+}
+
+async function resetAllSettings() {
+  if (!confirm('把所有参数还原成出厂值？改过的限额会全部失效。')) return;
+  var r = await api('/settings', { method: 'POST', body: { reset: true } });
+  if (!r.ok) return toast(r.error || '还原失败');
+  toast(r.changed ? '已还原 ' + r.changed + ' 项' : '本来就是出厂值');
+  loadSettings();
+}
+
+var AUDIT_LABEL = {
+  settings: '参数修改',
+  ban: '封禁设备',
+  unban: '解封设备',
+  'code-issue': '签发激活码',
+  'code-revoke': '吊销激活码',
+  'code-restore': '恢复激活码',
+  shout: '发送喊话',
+};
+
+function shortDevice(d) {
+  var s = String(d || '');
+  return s.length > 12 ? s.slice(0, 12) + '…' : s;
+}
+
+function fmtValue(v) {
+  if (v === true) return '开';
+  if (v === false) return '关';
+  if (v === '' || v === null || v === undefined) return '空';
+  return String(v);
+}
+
+function auditText(entry) {
+  var d = entry.detail || {};
+  if (entry.act === 'settings') {
+    var list = Array.isArray(d.changes) ? d.changes : [];
+    var parts = list.map(function (c) {
+      return c.label + ' ' + fmtValue(c.from) + ' → ' + fmtValue(c.to);
+    });
+    return '改了 ' + list.length + ' 项：' + parts.join('；');
+  }
+  if (entry.act === 'ban') {
+    var span = Number(d.hours) > 0 ? d.hours + ' 小时' : '永久';
+    return shortDevice(d.device) + ' · ' + span + (d.reason ? ' · ' + d.reason : '');
+  }
+  if (entry.act === 'unban') return shortDevice(d.device);
+  if (entry.act === 'code-issue') {
+    return '签发 ' + (d.count || 0) + ' 个' + (d.note ? ' · ' + d.note : '');
+  }
+  if (entry.act === 'code-revoke' || entry.act === 'code-restore') return '#' + d.serial;
+  if (entry.act === 'shout') {
+    return '送达 ' + (d.delivered || 0) + ' 台 · ' + (d.text || '');
+  }
+  return d.text || '';
+}
+
+function renderAudit(list) {
+  var box = $('auditBody');
+  box.innerHTML = '';
+  var rows = Array.isArray(list) ? list : [];
+  rows.forEach(function (a) {
+    var row = el('div', 'log-row');
+    row.appendChild(el('div', 'log-when', fmtTime(a.at)));
+    var body = el('div', 'log-body');
+    var head = el('div');
+    head.appendChild(el('b', '', AUDIT_LABEL[a.act] || a.act));
+    if (a.by) head.appendChild(el('span', 'dim', ' · ' + a.by));
+    body.appendChild(head);
+    var text = auditText(a);
+    if (text) body.appendChild(el('div', 'dim', text));
+    row.appendChild(body);
+    box.appendChild(row);
+  });
+  $('auditCount').textContent = rows.length ? rows.length + ' 条' : '';
+  show($('auditEmpty'), rows.length === 0);
+}
+
+async function loadAudit() {
+  var r = await api('/audit');
+  if (r.status === 401) return enterLogin({});
+  if (!r.ok) return toast(r.error || '读取日志失败');
+  renderAudit(r.audit || []);
+}
+
 async function confirmBan() {
   var device = state.pendingBan;
   if (!device) return;
@@ -700,6 +1025,9 @@ $('onlineAll').addEventListener('change', function () {
 $('shoutText').addEventListener('keydown', function (e) {
   if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) sendShout();
 });
+$('setSave').addEventListener('click', saveSettings);
+$('setResetAll').addEventListener('click', resetAllSettings);
+$('reloadAudit').addEventListener('click', loadAudit);
 $('banCancel').addEventListener('click', function () { show($('banModal'), false); });
 $('banOk').addEventListener('click', confirmBan);
 $('banModal').addEventListener('click', function (e) { if (e.target === $('banModal')) show($('banModal'), false); });

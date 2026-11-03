@@ -304,3 +304,104 @@ log('未配置后台密码时拒绝登录', noPass.status === 503 && noPass.data
 
 const adminHtml = await adminPage().text()
 log('后台页面可渲染', adminHtml.includes('管理后台') && adminHtml.includes('/api/admin'))
+log('后台页面含参数设置与日志', adminHtml.includes('参数设置') && adminHtml.includes('操作日志'))
+
+// ── 参数设置 ──────────────────────────────────────────────────────────
+const setAnon = await jsonOf(await call('/api/admin/settings'))
+log('未登录读不到参数', setAnon.status === 401)
+
+const setGet = await jsonOf(await call('/api/admin/settings', { headers: { cookie } }))
+const groupIds = (setGet.data.groups || []).map((g) => g.id)
+const fieldCount = (setGet.data.groups || []).reduce((n, g) => n + g.fields.length, 0)
+log('参数分组齐全', setGet.status === 200 && groupIds.includes('download') &&
+  groupIds.includes('license') && groupIds.includes('admin') && fieldCount >= 20, 'fields=' + fieldCount)
+
+const repGroup = (setGet.data.groups || []).find((g) => g.id === 'reputation')
+log('设备信誉档位可调', !!repGroup && repGroup.fields.length === 14 &&
+  repGroup.fields.some((f) => f.key === 'repDlTicketMin' && f.value === 60))
+
+const dlField = setGet.data.groups.flatMap((g) => g.fields).find((f) => f.key === 'dlDailyLimit')
+log('参数带默认值与当前值', dlField && dlField.value === 25 && dlField.def === 25 && dlField.overridden === false)
+
+const badRange = await jsonOf(await call('/api/admin/settings', {
+  method: 'POST', headers: { cookie },
+  body: { patch: { dlDailyLimit: -5 } },
+}))
+log('越界值被拒并说明原因', badRange.status === 400 && !!badRange.data.errors.dlDailyLimit)
+
+const unknownKey = await jsonOf(await call('/api/admin/settings', {
+  method: 'POST', headers: { cookie },
+  body: { patch: { notARealKey: 1 } },
+}))
+log('未知参数被拒', unknownKey.status === 400 && unknownKey.data.errors.notARealKey === '未知参数')
+
+const saved = await jsonOf(await call('/api/admin/settings', {
+  method: 'POST', headers: { cookie },
+  body: { patch: { dlDailyLimit: 3, annPairDeviceMax: 2, licEnforceAt: '2027-01-01T00:00:00Z' } },
+}))
+log('批量保存参数', saved.status === 200 && saved.data.changed === 3)
+
+const setAfter = await jsonOf(await call('/api/admin/settings', { headers: { cookie } }))
+const afterMap = {}
+setAfter.data.groups.forEach((g) => g.fields.forEach((f) => { afterMap[f.key] = f }))
+log('保存后读到新值并标记已改', afterMap.dlDailyLimit.value === 3 && afterMap.dlDailyLimit.overridden === true)
+log('时间参数被规范成 ISO', afterMap.licEnforceAt.value === '2027-01-01T00:00:00.000Z', afterMap.licEnforceAt.value)
+
+// 生效性：配对码在线设备上限改成 2 后，第三台应当被拒
+const pair = '881122'
+const p1 = await jsonOf(await call(`/api/announce/poll?deviceId=aaaa000011112222&pairCode=${pair}`))
+const p2 = await jsonOf(await call(`/api/announce/poll?deviceId=bbbb000011112222&pairCode=${pair}`))
+const p3 = await jsonOf(await call(`/api/announce/poll?deviceId=cccc000011112222&pairCode=${pair}`))
+log('改动的上限立刻生效', p1.status < 300 && p2.status < 300 && p3.status === 429, 'p1=' + p1.status + ' p2=' + p2.status + ' p3=' + p3.status)
+
+// 缓存失效：保存时已经作废进程内缓存，这里确认读到的是新值而不是 15 秒前的旧值
+const afterSave = await jsonOf(await call('/api/admin/settings', { headers: { cookie } }))
+const freshField = afterSave.data.groups.flatMap((g) => g.fields).find((f) => f.key === 'annPairDeviceMax')
+log('保存后缓存立即失效', freshField.value === 2)
+
+const resetOne = await jsonOf(await call('/api/admin/settings', {
+  method: 'POST', headers: { cookie },
+  body: { reset: ['annPairDeviceMax'] },
+}))
+log('单项还原', resetOne.status === 200 && resetOne.data.changed === 1)
+
+const resetAll = await jsonOf(await call('/api/admin/settings', {
+  method: 'POST', headers: { cookie },
+  body: { reset: true },
+}))
+const backToDef = await jsonOf(await call('/api/admin/settings', { headers: { cookie } }))
+const backField = backToDef.data.groups.flatMap((g) => g.fields).find((f) => f.key === 'dlDailyLimit')
+log('全部还原出厂值', resetAll.status === 200 && backField.value === 25 && backField.overridden === false)
+
+// 跨站提交仍然拒绝
+const crossSave = await jsonOf(await call('/api/admin/settings', {
+  method: 'POST', headers: { cookie, origin: 'https://evil.test', 'sec-fetch-site': 'cross-site' },
+  body: { patch: { dlDailyLimit: 99 } },
+}))
+log('跨站改参数被拒', crossSave.status === 403)
+
+// 生效性：设备信誉档位（每分钟 1 次）改动后按设备码计数
+await call('/api/admin/settings', {
+  method: 'POST', headers: { cookie }, body: { patch: { repMirrorSignMin: 1 } },
+})
+const repDev = 'abcd000011112222'
+const repCall = () => call('/api/mirror-sign?url=https://github.com/x/y/releases/download/v1/tag', {
+  headers: { 'x-csh-did': repDev },
+})
+const rep1 = await jsonOf(await repCall())
+const rep2 = await jsonOf(await repCall())
+log('设备信誉限速按设置生效',
+  rep1.data.code !== 'csh_device_rate_limited' && rep2.status === 429 &&
+  rep2.data.code === 'csh_device_rate_limited',
+  'first=' + rep1.status + ' second=' + rep2.status)
+await call('/api/admin/settings', {
+  method: 'POST', headers: { cookie }, body: { reset: ['repMirrorSignMin'] },
+})
+
+// ── 操作日志 ──────────────────────────────────────────────────────────
+const audit = await jsonOf(await call('/api/admin/audit', { headers: { cookie } }))
+const acts = (audit.data.audit || []).map((a) => a.act)
+log('操作日志记录了签发/封禁/参数', audit.status === 200 &&
+  acts.includes('settings') && acts.includes('code-issue') && acts.includes('ban'), acts.join(',').slice(0, 80))
+log('日志带操作者', (audit.data.audit || []).every((a) => !!a.by))
+log('未登录读不到日志', (await jsonOf(await call('/api/admin/audit'))).status === 401)

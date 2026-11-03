@@ -53,8 +53,9 @@ const DL_TICKET_TTL = 900
 
 const DL_DAILY_LIMIT = 25
 
-function dlDailyLimit(env) {
-  return pickNum(null, env && env.DL_DAILY_LIMIT, DL_DAILY_LIMIT)
+async function dlDailyLimit(env, S) {
+  const values = S || (await settingsOf(env))
+  return Number(values.dlDailyLimit) >= 0 ? Number(values.dlDailyLimit) : DL_DAILY_LIMIT
 }
 
 const DL_KEY_PREFIX = /^(?:upload|soft|releases)\//
@@ -562,6 +563,571 @@ function pickBool(cfgValue, envValue, fallback) {
   return fallback
 }
 
+// ── 可调参数 ───────────────────────────────────────────────────────────
+//
+// 生效值 = 出厂默认（可被同名环境变量覆盖）→ 后台在 `/admin` 里保存的覆盖层。
+// 环境变量仍然是“出厂值”，后台改的是覆盖层，可以逐项或整体还原。
+//
+// 字段结构：{ key, group, label, type, def(env), min, max, unit, options, hint }
+// type: num | bool | text | iso | enum
+
+const SETTINGS_KEY = 'cfg:settings'
+const SETTINGS_CACHE_MS = 15 * 1000
+
+const SETTING_GROUPS = [
+  { id: 'download', title: '下载与分发', hint: '下载票据、上传签名与流量配额' },
+  { id: 'submit', title: '投稿与审核', hint: '软件投稿的频次与待审上限' },
+  { id: 'community', title: '社区内容', hint: '回声洞与反馈的每日额度，两者都会在 GitHub 仓库落提交' },
+  { id: 'announce', title: '教室喊话', hint: '文本长度、在线注册表规模与限频' },
+  { id: 'reputation', title: '设备信誉', hint: '按设备码计的上限：超限 429，封禁优先' },
+  { id: 'license', title: '授权与激活', hint: '激活有效期、授权闸门与设备登记' },
+  { id: 'admin', title: '后台与安全', hint: '会话时长、登录失败锁定' },
+]
+
+const SETTING_FIELDS = [
+  {
+    key: 'dlDailyLimit',
+    group: 'download',
+    label: '每设备每日下载次数',
+    type: 'num',
+    min: 0,
+    max: 10000,
+    unit: '次',
+    def: (env) => pickNum(null, env.DL_DAILY_LIMIT, DL_DAILY_LIMIT),
+    hint: '同一台设备 24 小时内最多取几次下载票据，0 表示不限。',
+  },
+  {
+    key: 'dlTicketMinutes',
+    group: 'download',
+    label: '下载票据有效期',
+    type: 'num',
+    min: 5,
+    max: 240,
+    unit: '分钟',
+    def: () => Math.round(DL_TICKET_TTL / 60),
+    hint: '票据与直链同一时间过期。调长会让被转发链接的风险窗口变大。',
+  },
+  {
+    key: 'dlMode',
+    group: 'download',
+    label: '下载通道',
+    type: 'enum',
+    options: ['auto', 'relay', 'direct'],
+    def: (env) => String(env.DL_MODE || DL_MODE_DEFAULT).toLowerCase(),
+    hint: 'auto 优先直连 OSS；relay 强制走中继；direct 只签直链。',
+  },
+  {
+    key: 'signPerIpPerDay',
+    group: 'download',
+    label: '每来源每日上传签名',
+    type: 'num',
+    min: 1,
+    max: 1000,
+    unit: '次',
+    def: (env) => pickNum(null, env.SIGN_PER_IP_PER_DAY, SIGN_PER_IP_PER_DAY),
+    hint: '上传前取直传签名的次数上限，按来源 IP 计。',
+  },
+  {
+    key: 'signGlobalPerDay',
+    group: 'download',
+    label: '全局每日上传签名',
+    type: 'num',
+    min: 1,
+    max: 100000,
+    unit: '次',
+    def: (env) => pickNum(null, env.SIGN_GLOBAL_PER_DAY, SIGN_GLOBAL_PER_DAY),
+    hint: '所有来源合计的每日上传签名上限。',
+  },
+  {
+    key: 'signGlobalGbPerDay',
+    group: 'download',
+    label: '全局每日上送流量',
+    type: 'num',
+    min: 1,
+    max: 2000,
+    unit: 'GB',
+    def: (env) =>
+      Math.round(pickNum(null, env.SIGN_GLOBAL_BYTES_PER_DAY, SIGN_GLOBAL_BYTES_PER_DAY) / 1073741824),
+    hint: '每日上传总量上限，防止被当成免费网盘。',
+  },
+  {
+    key: 'submitMaxPerDay',
+    group: 'submit',
+    label: '每设备每日投稿',
+    type: 'num',
+    min: 0,
+    max: 200,
+    unit: '次',
+    def: (env) => pickNum(null, env.SUBMIT_MAX_PER_DAY, SUBMIT_MAX_PER_DAY),
+    hint: '同一台设备 24 小时内最多提交几次，0 表示不限。',
+  },
+  {
+    key: 'submitMaxPending',
+    group: 'submit',
+    label: '每设备待审上限',
+    type: 'num',
+    min: 0,
+    max: 100,
+    unit: '条',
+    def: (env) => pickNum(null, env.SUBMIT_MAX_PENDING, SUBMIT_MAX_PENDING),
+    hint: '同设备同时挂起多少条待审投稿后拒绝新提交，0 表示不限。',
+  },
+  {
+    key: 'submitRequireSource',
+    group: 'submit',
+    label: '强制要求安装包或仓库',
+    type: 'bool',
+    def: (env) => pickBool(null, env.SUBMIT_REQUIRE_SOURCE, SUBMIT_REQUIRE_SOURCE),
+    hint: '打开时只填外链的投稿会被拒绝。',
+  },
+  {
+    key: 'echoMaxPerDay',
+    group: 'community',
+    label: '回声洞每日条数',
+    type: 'num',
+    min: 0,
+    max: 200,
+    unit: '条',
+    def: () => ECHO_MAX_PER_DAY,
+    hint: '每来源每天最多投几张字条，0 表示不限。',
+  },
+  {
+    key: 'echoMaxLen',
+    group: 'community',
+    label: '回声洞字数上限',
+    type: 'num',
+    min: 20,
+    max: 2000,
+    unit: '字',
+    def: () => ECHO_MAX_LEN,
+    hint: '单张字条允许的最大字数。',
+  },
+  {
+    key: 'feedbackMaxPerDay',
+    group: 'community',
+    label: '反馈每日条数',
+    type: 'num',
+    min: 0,
+    max: 200,
+    unit: '条',
+    def: () => FEEDBACK_MAX_PER_DAY,
+    hint: '每来源每天最多提交几条反馈，0 表示不限。',
+  },
+  {
+    key: 'annTextMax',
+    group: 'announce',
+    label: '喊话字数上限',
+    type: 'num',
+    min: 10,
+    max: 500,
+    unit: '字',
+    def: () => ANN_TEXT_MAX,
+    hint: '客户端与后台共用这个上限。',
+  },
+  {
+    key: 'annTtlSec',
+    group: 'announce',
+    label: '喊话保留时长',
+    type: 'num',
+    min: 10,
+    max: 3600,
+    unit: '秒',
+    def: () => ANN_TTL,
+    hint: '一条喊话在存储里保留多久；超过仍未被取走就丢弃。',
+  },
+  {
+    key: 'annRateSec',
+    group: 'announce',
+    label: '喊话最小间隔',
+    type: 'num',
+    min: 0,
+    max: 3600,
+    unit: '秒',
+    def: () => Math.round(ANN_RATE_MS / 1000),
+    hint: '同一配对码两次发送之间的冷却时间，0 表示不限（后台发送不受此限）。',
+  },
+  {
+    key: 'annPairDeviceMax',
+    group: 'announce',
+    label: '单配对码在线设备上限',
+    type: 'num',
+    min: 1,
+    max: 1024,
+    unit: '台',
+    def: () => ANN_PAIR_DEVICE_MAX,
+    hint: '一个配对码最多登记多少台设备，超过后新设备返回「已满」。',
+  },
+  {
+    key: 'annNewPairPerIpDay',
+    group: 'announce',
+    label: '每来源每日新建配对码',
+    type: 'num',
+    min: 1,
+    max: 10000,
+    unit: '个',
+    def: () => ANN_NEW_PAIR_PER_IP_DAY,
+    hint: '配对码只有 6 位，这个配额挡住用随机码刷出大量注册表。',
+  },
+  {
+    key: 'repDlTicketMin',
+    group: 'reputation',
+    label: '下载票据 · 每分钟',
+    type: 'num',
+    min: 1,
+    max: 100000,
+    unit: '次',
+    def: () => 60,
+    hint: '同一设备每分钟能取几次下载票据；7 个接口按设备码分别计数。',
+  },
+  {
+    key: 'repDlTicketDay',
+    group: 'reputation',
+    label: '下载票据 · 每日',
+    type: 'num',
+    min: 1,
+    max: 1000000,
+    unit: '次',
+    def: () => 1200,
+  },
+  {
+    key: 'repOssSignMin',
+    group: 'reputation',
+    label: '上传签名 · 每分钟',
+    type: 'num',
+    min: 1,
+    max: 100000,
+    unit: '次',
+    def: () => 40,
+  },
+  {
+    key: 'repOssSignDay',
+    group: 'reputation',
+    label: '上传签名 · 每日',
+    type: 'num',
+    min: 1,
+    max: 1000000,
+    unit: '次',
+    def: () => 800,
+  },
+  {
+    key: 'repMirrorSignMin',
+    group: 'reputation',
+    label: '加速签名 · 每分钟',
+    type: 'num',
+    min: 1,
+    max: 100000,
+    unit: '次',
+    def: () => 40,
+  },
+  {
+    key: 'repMirrorSignDay',
+    group: 'reputation',
+    label: '加速签名 · 每日',
+    type: 'num',
+    min: 1,
+    max: 1000000,
+    unit: '次',
+    def: () => 800,
+  },
+  {
+    key: 'repSubmitMin',
+    group: 'reputation',
+    label: '投稿 · 每分钟',
+    type: 'num',
+    min: 1,
+    max: 10000,
+    unit: '次',
+    def: () => 6,
+  },
+  {
+    key: 'repSubmitDay',
+    group: 'reputation',
+    label: '投稿 · 每日',
+    type: 'num',
+    min: 1,
+    max: 10000,
+    unit: '次',
+    def: () => 30,
+  },
+  {
+    key: 'repEchoMin',
+    group: 'reputation',
+    label: '回声洞 · 每分钟',
+    type: 'num',
+    min: 1,
+    max: 10000,
+    unit: '次',
+    def: () => 20,
+  },
+  {
+    key: 'repEchoDay',
+    group: 'reputation',
+    label: '回声洞 · 每日',
+    type: 'num',
+    min: 1,
+    max: 10000,
+    unit: '次',
+    def: () => 200,
+  },
+  {
+    key: 'repFeedbackMin',
+    group: 'reputation',
+    label: '反馈 · 每分钟',
+    type: 'num',
+    min: 1,
+    max: 10000,
+    unit: '次',
+    def: () => 10,
+  },
+  {
+    key: 'repFeedbackDay',
+    group: 'reputation',
+    label: '反馈 · 每日',
+    type: 'num',
+    min: 1,
+    max: 10000,
+    unit: '次',
+    def: () => 100,
+  },
+  {
+    key: 'repActivateMin',
+    group: 'reputation',
+    label: '激活尝试 · 每分钟',
+    type: 'num',
+    min: 1,
+    max: 10000,
+    unit: '次',
+    def: () => 10,
+  },
+  {
+    key: 'repActivateDay',
+    group: 'reputation',
+    label: '激活尝试 · 每日',
+    type: 'num',
+    min: 1,
+    max: 10000,
+    unit: '次',
+    def: () => 60,
+  },
+  {
+    key: 'licEnforce',
+    group: 'license',
+    label: '授权闸门',
+    type: 'bool',
+    def: (env) => String(env.CSH_LIC_ENFORCE || '').toLowerCase() === 'true',
+    hint: '关闭时只记日志不拦截；打开后未授权的构建立即被拒绝。',
+  },
+  {
+    key: 'licEnforceAt',
+    group: 'license',
+    label: '定时开闸时间',
+    type: 'iso',
+    def: (env) => String(env.CSH_LIC_ENFORCE_AT || ''),
+    hint: '到点后自动开闸，无需人工干预。留空表示不定时。',
+  },
+  {
+    key: 'licDays',
+    group: 'license',
+    label: '激活有效期',
+    type: 'num',
+    min: 1,
+    max: 3650,
+    unit: '天',
+    def: (env) => Number(env.CSH_LICENSE_DAYS || 365),
+    hint: '激活码换来的令牌有效期。',
+  },
+  {
+    key: 'licOfficialDays',
+    group: 'license',
+    label: '官方构建令牌有效期',
+    type: 'num',
+    min: 1,
+    max: 365,
+    unit: '天',
+    def: (env) => Number(env.CSH_OFFICIAL_TOKEN_DAYS || 30),
+    hint: '带构建签名的客户端自动换来的令牌有效期，缩短可加快密钥轮换的生效速度。',
+  },
+  {
+    key: 'licTryPerDay',
+    group: 'license',
+    label: '每来源每日激活尝试',
+    type: 'num',
+    min: 1,
+    max: 1000,
+    unit: '次',
+    def: (env) => Number(env.CSH_LIC_TRY_PER_DAY || 30),
+    hint: '防止离线爆破激活码。',
+  },
+  {
+    key: 'licDeviceRegPerIpDay',
+    group: 'license',
+    label: '每来源每日登记设备',
+    type: 'num',
+    min: 1,
+    max: 100000,
+    unit: '台',
+    def: () => LIC_DEV_REG_PER_IP_DAY,
+    hint: '同一个 IP 每天最多让多少台「首次出现」的设备进入后台列表。',
+  },
+  {
+    key: 'licTouchHours',
+    group: 'license',
+    label: '设备活跃刷新间隔',
+    type: 'num',
+    min: 1,
+    max: 168,
+    unit: '小时',
+    def: () => Math.round(LIC_TOUCH_TTL_MS / 3600000),
+    hint: '同一设备多久刷新一次最近活跃时间，调小会让写入更频繁。',
+  },
+  {
+    key: 'licLegacyUntil',
+    group: 'license',
+    label: '旧客户端豁免截止',
+    type: 'iso',
+    def: (env) => String(env.CSH_LIC_LEGACY_UNTIL || ''),
+    hint: '没有构建签名的老版本在此时间前不受闸门影响。留空表示不豁免。',
+  },
+  {
+    key: 'admSessionHours',
+    group: 'admin',
+    label: '后台会话时长',
+    type: 'num',
+    min: 1,
+    max: 168,
+    unit: '小时',
+    def: () => ADM_SESSION_TTL_HOURS,
+    hint: '登录后 Cookie 的有效期，过期需要重新登录。',
+  },
+  {
+    key: 'admLoginFailLimit',
+    group: 'admin',
+    label: '登录失败锁定阈值',
+    type: 'num',
+    min: 1,
+    max: 100,
+    unit: '次',
+    def: () => ADM_LOGIN_FAIL_LIMIT,
+    hint: '同一来源在窗口期内失败多少次后暂时禁止登录。',
+  },
+  {
+    key: 'admLoginFailWindowMin',
+    group: 'admin',
+    label: '登录失败统计窗口',
+    type: 'num',
+    min: 1,
+    max: 1440,
+    unit: '分钟',
+    def: () => Math.round(ADM_LOGIN_FAIL_WINDOW_MS / 60000),
+    hint: '锁定时长与统计窗口一致，从最后一次失败开始算。',
+  },
+]
+
+/**
+ * 参数缓存挂在 env 上：一次请求内多处用到（授权闸门、信誉闸门、下载票据…）
+ * 只读一次存储，请求结束随 env 一起丢弃。这样后台改完参数，下一个请求就生效，
+ * 不需要等缓存过期——同一进程内不同 env 之间也不会串味。
+ */
+const SETTINGS_MEMO_KEY = '__settingsMemo'
+
+function settingField(key) {
+  return SETTING_FIELDS.find((f) => f.key === key) || null
+}
+
+function settingsDefaults(env) {
+  const out = {}
+  for (const f of SETTING_FIELDS) {
+    try {
+      out[f.key] = f.def(env || {})
+    } catch {
+      out[f.key] = null
+    }
+  }
+  return out
+}
+
+/** 把后台传来的原始值收敛到字段定义上：类型、范围、选项都要过。 */
+function settingCoerce(field, raw) {
+  if (field.type === 'bool') {
+    if (raw === true || raw === 'true' || raw === 1 || raw === '1') return { ok: true, value: true }
+    if (raw === false || raw === 'false' || raw === 0 || raw === '0') return { ok: true, value: false }
+    return { ok: false, error: '只能是开或关' }
+  }
+  if (field.type === 'num') {
+    const n = Number(raw)
+    if (!Number.isFinite(n)) return { ok: false, error: '需要一个数字' }
+    const v = Math.round(n * 1000) / 1000
+    if (field.min !== undefined && v < field.min) return { ok: false, error: `不能小于 ${field.min}` }
+    if (field.max !== undefined && v > field.max) return { ok: false, error: `不能大于 ${field.max}` }
+    return { ok: true, value: v }
+  }
+  if (field.type === 'enum') {
+    const s = String(raw ?? '').trim().toLowerCase()
+    if (!Array.isArray(field.options) || !field.options.includes(s)) {
+      return { ok: false, error: '取值不在允许范围内' }
+    }
+    return { ok: true, value: s }
+  }
+  const s = String(raw ?? '').trim()
+  if (s.length > 64) return { ok: false, error: '太长了' }
+  if (field.type === 'iso') {
+    if (!s) return { ok: true, value: '' }
+    const t = Date.parse(s)
+    if (!Number.isFinite(t)) return { ok: false, error: '需要形如 2026-12-02T00:00:00Z 的时间' }
+    return { ok: true, value: new Date(t).toISOString() }
+  }
+  return { ok: true, value: s }
+}
+
+/** 读一次存储并算出生效值；同一次请求内复用。 */
+async function settingsBundle(env) {
+  const now = Date.now()
+  const memo = env && env[SETTINGS_MEMO_KEY]
+  if (memo && memo.values && now - memo.at < SETTINGS_CACHE_MS) return memo
+
+  const defaults = settingsDefaults(env)
+  let stored = null
+  try {
+    const kv = await gateKv()
+    if (kv) stored = await kvJson(kv, SETTINGS_KEY)
+  } catch {}
+  const raw = stored && stored.v && typeof stored.v === 'object' ? stored.v : {}
+  const overrides = {}
+  const values = Object.assign({}, defaults)
+  for (const key of Object.keys(raw)) {
+    const field = settingField(key)
+    if (!field) continue
+    const out = settingCoerce(field, raw[key])
+    if (!out.ok) continue
+    overrides[key] = out.value
+    values[key] = out.value
+  }
+  const bundle = {
+    at: now,
+    values,
+    defaults,
+    overrides,
+    meta: stored ? { at: Number(stored.at) || 0, by: String(stored.by || '') } : null,
+  }
+  if (env && typeof env === 'object') {
+    try {
+      Object.defineProperty(env, SETTINGS_MEMO_KEY, {
+        value: bundle,
+        writable: true,
+        configurable: true,
+        enumerable: false,
+      })
+    } catch {}
+  }
+  return bundle
+}
+
+/** 最常用的入口：只要生效值。 */
+async function settingsOf(env) {
+  const bundle = await settingsBundle(env)
+  return bundle.values || {}
+}
+
 async function registryHas(env, key) {
   const out = await registryOp(env, { op: 'file-get', key })
   if (out === null) return null
@@ -596,11 +1162,31 @@ async function countPendingIssues(env, sid) {
   }
 }
 
-async function submitGate(env, data, sid) {
+/** 后台是否显式改过这一项（改过就以后台为准，没改过保留旧的注册表配置语义）。 */
+function settingOverridden(bundle, key) {
+  return !!(bundle && bundle.overrides &&
+    Object.prototype.hasOwnProperty.call(bundle.overrides, key))
+}
+
+/** 投稿三项限制的生效值：后台设置 → 旧的注册表配置 → 出厂默认。 */
+async function submitLimits(env) {
   const cfg = await registryCfgGet(env)
-  const requireSource = pickBool(cfg && cfg.requireSource, env.SUBMIT_REQUIRE_SOURCE, SUBMIT_REQUIRE_SOURCE)
-  const maxPending = pickNum(cfg && cfg.maxPending, env.SUBMIT_MAX_PENDING, SUBMIT_MAX_PENDING)
-  const maxPerDay = pickNum(cfg && cfg.maxPerDay, env.SUBMIT_MAX_PER_DAY, SUBMIT_MAX_PER_DAY)
+  const bundle = await settingsBundle(env)
+  return {
+    requireSource: settingOverridden(bundle, 'submitRequireSource')
+      ? !!bundle.overrides.submitRequireSource
+      : pickBool(cfg && cfg.requireSource, env.SUBMIT_REQUIRE_SOURCE, SUBMIT_REQUIRE_SOURCE),
+    maxPending: settingOverridden(bundle, 'submitMaxPending')
+      ? Number(bundle.overrides.submitMaxPending)
+      : pickNum(cfg && cfg.maxPending, env.SUBMIT_MAX_PENDING, SUBMIT_MAX_PENDING),
+    maxPerDay: settingOverridden(bundle, 'submitMaxPerDay')
+      ? Number(bundle.overrides.submitMaxPerDay)
+      : pickNum(cfg && cfg.maxPerDay, env.SUBMIT_MAX_PER_DAY, SUBMIT_MAX_PER_DAY),
+  }
+}
+
+async function submitGate(env, data, sid) {
+  const { requireSource, maxPending, maxPerDay } = await submitLimits(env)
 
   if (requireSource) {
     const hasUpload = collectOssKeys(data).some((k) => /^upload\//.test(k))
@@ -645,6 +1231,7 @@ async function submitGate(env, data, sid) {
 
 async function signGate(env, src, bytes) {
   if (!env.DL_GATE) return { allowed: true }
+  const S = await settingsOf(env)
   try {
     const id = env.DL_GATE.idFromName('__sign__')
     const res = await env.DL_GATE.get(id).fetch('https://dl-gate/sign-check', {
@@ -656,9 +1243,13 @@ async function signGate(env, src, bytes) {
         ip: src,
         bytes: Math.max(0, Number(bytes) || 0),
 
-        perIp: pickNum(null, env.SIGN_PER_IP_PER_DAY, SIGN_PER_IP_PER_DAY),
-        perDay: pickNum(null, env.SIGN_GLOBAL_PER_DAY, SIGN_GLOBAL_PER_DAY),
-        bytesPerDay: pickNum(null, env.SIGN_GLOBAL_BYTES_PER_DAY, SIGN_GLOBAL_BYTES_PER_DAY),
+        perIp: pickNum(null, S.signPerIpPerDay, SIGN_PER_IP_PER_DAY),
+        perDay: pickNum(null, S.signGlobalPerDay, SIGN_GLOBAL_PER_DAY),
+        bytesPerDay: pickNum(
+          null,
+          gbToBytes(S.signGlobalGbPerDay),
+          SIGN_GLOBAL_BYTES_PER_DAY
+        ),
       }),
     })
     const out = await res.json()
@@ -1274,16 +1865,19 @@ async function handleEchoCave(request, env) {
     return json({ error: '请求格式错误' }, 400, request, env)
   }
 
+  const S = await settingsOf(env)
   const text = typeof data?.text === 'string' ? data.text.trim() : ''
   if (!text) return json({ error: '先写一句话再投稿吧。' }, 400, request, env)
-  if (text.length > ECHO_MAX_LEN) {
-    return json({ error: `字条太长啦，最多 ${ECHO_MAX_LEN} 个字。` }, 400, request, env)
+  const maxLen = Math.max(20, Number(S.echoMaxLen) || ECHO_MAX_LEN)
+  if (text.length > maxLen) {
+    return json({ error: `字条太长啦，最多 ${maxLen} 个字。` }, 400, request, env)
   }
 
   // 每张字条都会在仓库里落一个文件，按来源限量，避免被刷成垃圾提交
   const echoKv = await gateKv()
-  if (!(await ipDailyAllow(echoKv, 'echo', ECHO_MAX_PER_DAY, request))) {
-    return json({ error: `今天已经投过 ${ECHO_MAX_PER_DAY} 条了，明天再来吧。` }, 429, request, env)
+  const dailyMax = Number(S.echoMaxPerDay) || 0
+  if (dailyMax > 0 && !(await ipDailyAllow(echoKv, 'echo', dailyMax, request))) {
+    return json({ error: `今天已经投过 ${dailyMax} 条了，明天再来吧。` }, 429, request, env)
   }
 
   const apiBase = `https://api.github.com/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/contents`
@@ -1332,8 +1926,9 @@ async function handleFeedback(request, env) {
 
   // 反馈会开 GitHub Issue，同样按来源限量
   const fbKv = await gateKv()
-  if (!(await ipDailyAllow(fbKv, 'fb', FEEDBACK_MAX_PER_DAY, request))) {
-    return json({ error: `今天已经提交过 ${FEEDBACK_MAX_PER_DAY} 条反馈了，明天再来吧。` }, 429, request, env)
+  const fbMax = Number((await settingsOf(env)).feedbackMaxPerDay) || 0
+  if (fbMax > 0 && !(await ipDailyAllow(fbKv, 'fb', fbMax, request))) {
+    return json({ error: `今天已经提交过 ${fbMax} 条反馈了，明天再来吧。` }, 429, request, env)
   }
 
   const str = (value) => (typeof value === 'string' ? value.trim() : '')
@@ -1759,9 +2354,12 @@ async function relayList(env, prefix) {
 }
 
 async function dlModeWanted(env) {
+  const bundle = await settingsBundle(env)
+  const fromAdmin = bundle.overrides && bundle.overrides.dlMode
+  if (fromAdmin) return fromAdmin
   const out = await registryOp(env, { op: 'cfg-get' })
   const stored = out && out.cfg && out.cfg.mode
-  const raw = String(stored || env.DL_MODE || DL_MODE_DEFAULT).trim().toLowerCase()
+  const raw = String(stored || bundle.values.dlMode || env.DL_MODE || DL_MODE_DEFAULT).trim().toLowerCase()
   return raw === 'relay' || raw === 'backend' || raw === 'direct' ? raw : 'auto'
 }
 
@@ -1828,12 +2426,18 @@ async function handleDlTicket(request, env, ctx) {
     }
   }
 
+  const S = await settingsOf(env)
+  const ticketTtl = Math.min(
+    86400,
+    Math.max(60, Math.round(Number(S.dlTicketMinutes) * 60) || DL_TICKET_TTL)
+  )
+
   if (env.DL_GATE) {
     try {
       const id = env.DL_GATE.idFromName(fpHash)
       const res = await env.DL_GATE.get(id).fetch('https://dl-gate/check', {
         method: 'POST',
-        body: JSON.stringify({ limit: dlDailyLimit(env) }),
+        body: JSON.stringify({ limit: await dlDailyLimit(env, S) }),
       })
       const gate = await res.json()
       if (!gate.allowed) {
@@ -1868,7 +2472,7 @@ async function handleDlTicket(request, env, ctx) {
   const relayCap = gbToBytes(env.DL_RELAY_MONTHLY_GB)
   const relayFull = relayCap > 0 && relayUsed >= relayCap
 
-  const exp = Math.floor(Date.now() / 1000) + DL_TICKET_TTL
+  const exp = Math.floor(Date.now() / 1000) + ticketTtl
   const origin = new URL(request.url).origin
   // /api/dl 入口：中继与后端直连都走它，上游由票据里的 m 参数决定
   const backendReady = relayReady || ossReady
@@ -1927,9 +2531,12 @@ async function handleDlTicket(request, env, ctx) {
       key,
       size: size || undefined,
 
-      expiresIn: mode === 'direct' ? directTtl : DL_TICKET_TTL,
-      dailyLimit: dlDailyLimit(env),
-      remaining: gateInfo ? Math.max(0, gateInfo.limit - gateInfo.used) : undefined,
+      expiresIn: mode === 'direct' ? directTtl : ticketTtl,
+      dailyLimit: gateInfo && gateInfo.limit > 0 ? gateInfo.limit : undefined,
+      remaining:
+        gateInfo && gateInfo.limit > 0
+          ? Math.max(0, gateInfo.limit - gateInfo.used)
+          : undefined,
     },
     200,
     request,
@@ -2171,11 +2778,7 @@ async function handleDlStats(request, env) {
 
 
       lastGc: (cfg && cfg.lastGc) || null,
-      submitGate: {
-        requireSource: pickBool(cfg && cfg.requireSource, env.SUBMIT_REQUIRE_SOURCE, SUBMIT_REQUIRE_SOURCE),
-        maxPending: pickNum(cfg && cfg.maxPending, env.SUBMIT_MAX_PENDING, SUBMIT_MAX_PENDING),
-        maxPerDay: pickNum(cfg && cfg.maxPerDay, env.SUBMIT_MAX_PER_DAY, SUBMIT_MAX_PER_DAY),
-      },
+      submitGate: await submitLimits(env),
     },
     200,
     request,
@@ -2231,6 +2834,7 @@ async function handleDlMode(request, env) {
 
   if (request.method === 'GET') {
     const cfg = await registryCfgGet(env)
+    const limits = await submitLimits(env)
     return json(
       {
         success: true,
@@ -2241,9 +2845,9 @@ async function handleDlMode(request, env) {
         staleRecordHours: await gcStaleRecordHours(env),
 
 
-        requireSource: pickBool(cfg && cfg.requireSource, env.SUBMIT_REQUIRE_SOURCE, SUBMIT_REQUIRE_SOURCE),
-        maxPending: pickNum(cfg && cfg.maxPending, env.SUBMIT_MAX_PENDING, SUBMIT_MAX_PENDING),
-        maxPerDay: pickNum(cfg && cfg.maxPerDay, env.SUBMIT_MAX_PER_DAY, SUBMIT_MAX_PER_DAY),
+        requireSource: limits.requireSource,
+        maxPending: limits.maxPending,
+        maxPerDay: limits.maxPerDay,
         lastGc: (cfg && cfg.lastGc) || null,
         updatedAt: (cfg && cfg.updatedAt) || null,
         options: ['auto', 'relay', 'backend', 'direct'],
@@ -2827,6 +3431,8 @@ async function gateQuota(kv, name, body) {
   const key = 'gate:q:' + String(name).slice(0, 80)
   let rec = (await kvJson(kv, key)) || null
   if (!alive(rec) || rec.day !== day) rec = { day, n: 0 }
+  // limit <= 0 视为不限：既不计次也不拦（后台把每日下载次数设成 0 就是关掉限制）
+  if (limit <= 0) return { allowed: true, day, used: Number(rec.n) || 0, limit: 0, unlimited: true }
   if (rec.n >= limit) return { allowed: false, day, used: rec.n, limit }
   rec.n += 1
   await kvSave(kv, key, rec)
@@ -3004,6 +3610,11 @@ async function gateRegistry(kv, body) {
 async function gateAnn(kv, body) {
   const op = String(body.op || '')
   const pairCode = String(body.pairCode || '')
+  // 生效参数由调用方随请求带来（见 announceOp），缺省回落到常量
+  const C = body && body.cfg && typeof body.cfg === 'object' ? body.cfg : {}
+  const annTtlSec = Number(C.ttlSec) > 0 ? Number(C.ttlSec) : ANN_TTL
+  const annRateMs = Number.isFinite(Number(C.rateMs)) ? Number(C.rateMs) : ANN_RATE_MS
+  const pairDeviceMax = Number(C.pairDeviceMax) > 0 ? Number(C.pairDeviceMax) : ANN_PAIR_DEVICE_MAX
   if (op === 'ann-send') {
     // 按来源（IP + 设备码摘要）限速：仅按 pairCode 限流时，攻击者可轮换 6 位码刷屏。
     const src = String(body.src || '').slice(0, 40)
@@ -3019,8 +3630,8 @@ async function gateAnn(kv, body) {
     }
     const rateKey = 'gate:ann:r:' + pairCode
     const prev = (await kvJson(kv, rateKey)) || null
-    // rate: false 供管理后台使用：喊话由已登录的维护者触发，不受 10 秒/配对码限制
-    if (body.rate !== false && alive(prev) && Number.isFinite(prev.t) && Date.now() - prev.t < ANN_RATE_MS) {
+    // rate: false 供管理后台使用：喊话由已登录的维护者触发，不受间隔限制
+    if (body.rate !== false && alive(prev) && Number.isFinite(prev.t) && Date.now() - prev.t < annRateMs) {
       return { ok: false, error: 'rate_limited' }
     }
     const regKey = 'gate:ann:d:' + pairCode
@@ -3042,7 +3653,7 @@ async function gateAnn(kv, body) {
     }
     await kvSave(kv, rateKey, { t: Date.now() })
     await kvSave(kv, 'gate:ann:m:' + pairCode, {
-      _exp: Date.now() + ANN_TTL * 1000,
+      _exp: Date.now() + annTtlSec * 1000,
       id: String(body.id || ''),
       text: String(body.text || ''),
       from: String(body.from || ''),
@@ -3058,7 +3669,7 @@ async function gateAnn(kv, body) {
     const regKey = 'gate:ann:d:' + pairCode
     const reg = (await kvJson(kv, regKey)) || {}
     // 单个配对码下最多登记这么多台在线设备，防止用随机设备码把注册表撑大
-    if (!reg[deviceId] && Object.keys(reg).length >= ANN_PAIR_DEVICE_MAX) {
+    if (!reg[deviceId] && Object.keys(reg).length >= pairDeviceMax) {
       return { ok: false, error: 'pair_full' }
     }
     reg[deviceId] = { t: Date.now(), n: String(body.name || '').slice(0, 32) }
@@ -3244,10 +3855,21 @@ async function handleIcon(request, env, ctx) {
 async function announceOp(env, payload) {
   if (!env.DL_GATE) return null
   try {
+    // 参数随请求下发：门实现（本地 gateDispatch 或 Durable Object）只拿到 kv，
+    // 不能自己读设置，所以由这里带上当前的生效值。
+    const S = await settingsOf(env)
+    const body = Object.assign({}, payload, {
+      cfg: {
+        textMax: Number(S.annTextMax) || ANN_TEXT_MAX,
+        ttlSec: Number(S.annTtlSec) || ANN_TTL,
+        rateMs: Number.isFinite(Number(S.annRateSec)) ? Number(S.annRateSec) * 1000 : ANN_RATE_MS,
+        pairDeviceMax: Number(S.annPairDeviceMax) || ANN_PAIR_DEVICE_MAX,
+      },
+    })
     const id = env.DL_GATE.idFromName(ANN_ID)
     const res = await env.DL_GATE.get(id).fetch('https://dl-gate/op', {
       method: 'POST',
-      body: JSON.stringify(payload),
+      body: JSON.stringify(body),
     })
     return await res.json()
   } catch (err) {
@@ -3268,9 +3890,10 @@ async function handleAnnounceSend(request, env) {
   const text = String(data?.text || '').trim()
   const from = String(data?.from || '').trim()
   let duration = Number(data?.duration) || ANN_DURATION_DEFAULT
+  const annTextMax = Math.max(10, Number((await settingsOf(env)).annTextMax) || ANN_TEXT_MAX)
 
   if (!/^\d{6}$/.test(pairCode)) return json({ error: 'bad_request' }, 400, request, env)
-  if (!text || text.length > ANN_TEXT_MAX) {
+  if (!text || text.length > annTextMax) {
     return json({ error: 'bad_request' }, 400, request, env)
   }
   if (from.length > ANN_FROM_MAX) return json({ error: 'bad_request' }, 400, request, env)
@@ -3304,6 +3927,7 @@ async function handleAnnouncePoll(request, env) {
 
   // 新配对码注册表按来源限量；已存在的配对码不受影响（轮询本身是正常高频行为）
   const kv = await gateKv()
+  const newPairMax = Math.max(1, Number((await settingsOf(env)).annNewPairPerIpDay) || ANN_NEW_PAIR_PER_IP_DAY)
   if (kv) {
     try {
       if (!(await kvJson(kv, 'gate:ann:d:' + pairCode))) {
@@ -3311,7 +3935,7 @@ async function handleAnnouncePoll(request, env) {
         const day = new Date().toISOString().slice(0, 10)
         const key = `ann:pair:${ipHash}:${day}`
         const used = Number((await kvJson(kv, key))?.n) || 0
-        if (used >= ANN_NEW_PAIR_PER_IP_DAY) {
+        if (used >= newPairMax) {
           return json({ error: 'pair_quota' }, 429, request, env)
         }
         await kvSave(kv, key, { n: used + 1, _exp: Date.now() + 2 * 86400 * 1000 })
@@ -3551,8 +4175,9 @@ async function admPasswordOk(env, pass) {
   return plain.length > 0 && ctEqual(pass, plain)
 }
 
-async function admIssueSession(env) {
-  const exp = Math.floor(Date.now() / 1000) + ADM_SESSION_TTL_HOURS * 3600
+async function admIssueSession(env, hours) {
+  const span = Number(hours) > 0 ? Number(hours) : ADM_SESSION_TTL_HOURS
+  const exp = Math.floor(Date.now() / 1000) + Math.round(span * 3600)
   const mac = new Uint8Array(
     await hmacSha256(textEncoder.encode(admSecret(env)), `admin|v1|${admUser(env)}|${exp}`)
   )
@@ -3687,8 +4312,12 @@ async function licTouchDevice(env, request) {
   const build = String(request.headers.get('x-csh-build') || '').slice(0, 96)
   const ver = String(request.headers.get('x-csh-ver') || '').slice(0, 32)
 
+  const S = await settingsOf(env)
+  const touchTtlMs = Math.max(1, Number(S.licTouchHours) || 6) * 3600 * 1000
+  const regMax = Math.max(1, Number(S.licDeviceRegPerIpDay) || LIC_DEV_REG_PER_IP_DAY)
+
   const prev = await kvJson(kv, LIC_DEVICE_KEY + device)
-  if (prev && now - (Number(prev.at) || 0) < LIC_TOUCH_TTL_MS) return
+  if (prev && now - (Number(prev.at) || 0) < touchTtlMs) return
 
   // 只有“首次出现”的设备才消耗配额；老设备刷新不计数
   if (!prev) {
@@ -3696,7 +4325,7 @@ async function licTouchDevice(env, request) {
     const day = new Date(now).toISOString().slice(0, 10)
     const regKey = `${LIC_DEV_REG_KEY}${ipHash}:${day}`
     const used = Number((await kvJson(kv, regKey))?.n) || 0
-    if (used >= LIC_DEV_REG_PER_IP_DAY) return
+    if (used >= regMax) return
     try {
       await kvSave(kv, regKey, { n: used + 1, _exp: now + 2 * 86400 * 1000 })
     } catch {}
@@ -3717,7 +4346,7 @@ async function licTouchDevice(env, request) {
     const devices = await admIndex(kv, ADM_DEV_INDEX_KEY)
     const hit = devices.find((d) => d && d.d === device)
     if (hit) {
-      if (now - (Number(hit.at) || 0) < LIC_TOUCH_TTL_MS) return
+      if (now - (Number(hit.at) || 0) < touchTtlMs) return
       hit.at = now
       if (build && !hit.build) hit.build = build
       if (ver && !hit.ver) hit.ver = ver
@@ -3743,22 +4372,33 @@ const REP_EVENT_PREFIX = 'lic:ev:'
 const REP_EVENT_CAP = 80
 const REP_EVENT_THROTTLE_MS = 10 * 60 * 1000
 
-// 路径 → 每分钟 / 每日上限。未列出的 /api/* 只做封禁检查，不额外计数。
-const REP_TIERS = [
-  ['/api/dl-ticket', 60, 1200],
-  ['/api/oss-sign', 40, 800],
-  ['/api/mirror-sign', 40, 800],
-  ['/api/submit', 6, 30],
-  ['/api/echocave', 20, 200],
-  ['/api/feedback', 10, 100],
-  ['/api/license/activate', 10, 60],
+// 路径 → [每分钟参数键, 每日参数键, 出厂每分钟, 出厂每日]。未列出的 /api/* 只做封禁检查。
+const REP_TIER_BASE = [
+  ['/api/dl-ticket', 'repDlTicketMin', 'repDlTicketDay', 60, 1200],
+  ['/api/oss-sign', 'repOssSignMin', 'repOssSignDay', 40, 800],
+  ['/api/mirror-sign', 'repMirrorSignMin', 'repMirrorSignDay', 40, 800],
+  ['/api/submit', 'repSubmitMin', 'repSubmitDay', 6, 30],
+  ['/api/echocave', 'repEchoMin', 'repEchoDay', 20, 200],
+  ['/api/feedback', 'repFeedbackMin', 'repFeedbackDay', 10, 100],
+  ['/api/license/activate', 'repActivateMin', 'repActivateDay', 10, 60],
 ]
 
-function repTierOf(pathname) {
-  for (const [p, perMin, perDay] of REP_TIERS) {
-    if (pathname === p || pathname.startsWith(p + '/')) return { perMin, perDay }
+/** 先按路径找到这一档（不读设置），命中后再算生效值。 */
+function repTierBase(pathname) {
+  for (const row of REP_TIER_BASE) {
+    if (pathname === row[0] || pathname.startsWith(row[0] + '/')) return row
   }
   return null
+}
+
+/** 生效上限：后台设置 → 出厂值。 */
+function repTierOf(pathname, S) {
+  const row = repTierBase(pathname)
+  if (!row) return null
+  const [, minKey, dayKey, defMin, defDay] = row
+  const perMin = Number(S && S[minKey]) > 0 ? Number(S[minKey]) : defMin
+  const perDay = Number(S && S[dayKey]) > 0 ? Number(S[dayKey]) : defDay
+  return { perMin, perDay }
 }
 
 /** 设备事件环形日志。默认 10 分钟节流，避免每个请求都写存储。 */
@@ -3821,7 +4461,8 @@ async function deviceGuard(request, env) {
     )
   }
 
-  const tier = repTierOf(url.pathname)
+  if (!repTierBase(url.pathname)) return null
+  const tier = repTierOf(url.pathname, await settingsOf(env))
   if (!tier) return null
 
   const r = await repCheck(kv, device, tier, url.pathname)
@@ -3851,7 +4492,13 @@ async function deviceGuard(request, env) {
   )
 }
 
-function licEnforce(env) {
+function licEnforce(env, S) {
+  // 后台显式设置过就以设置为准，否则回落到环境变量的旧语义
+  if (S && typeof S.licEnforce === 'boolean') {
+    if (S.licEnforce) return true
+    const at = Date.parse(String(S.licEnforceAt || ''))
+    return Number.isFinite(at) && Date.now() >= at
+  }
   if (String((env && env.CSH_LIC_ENFORCE) ?? '').toLowerCase() === 'true') return true
   // 定时开闸：到点自动生效，避免「到日子还得有人记得去控制台改一下再重新部署」。
   const at = Date.parse(String((env && env.CSH_LIC_ENFORCE_AT) || ''))
@@ -4044,8 +4691,8 @@ function licBrowserAllowed(request, env) {
 }
 
 /** 旧客户端豁免窗口：完全不带构建标识的版本在截止日前照常放行。 */
-function licLegacyOpen(env) {
-  const until = String(env.CSH_LIC_LEGACY_UNTIL || '').trim()
+function licLegacyOpen(env, S) {
+  const until = String((S && S.licLegacyUntil) || env.CSH_LIC_LEGACY_UNTIL || '').trim()
   if (!until) return false
   const at = Date.parse(until)
   return Number.isFinite(at) && Date.now() < at
@@ -4092,7 +4739,9 @@ async function licenseGuard(request, env) {
   if (build && await licVerifyBuild(build, signature, env)) {
     if (env.CSH_LICENSE_SECRET) {
       // 官方构建只发短期令牌：密钥轮换或构建号作废后，最多一个周期自然失效
-      const issued = await licIssueToken(device, 'official', Number(env.CSH_OFFICIAL_TOKEN_DAYS || 30), env)
+      const S = await settingsOf(env)
+      const officialDays = Math.max(1, Number(S.licOfficialDays) || 30)
+      const issued = await licIssueToken(device, 'official', officialDays, env)
       headers = { 'X-CSH-Lic': issued.token, 'X-CSH-Lic-Exp': String(issued.payload.e) }
     } else {
       headers = null
@@ -4100,10 +4749,11 @@ async function licenseGuard(request, env) {
     return headers ? { headers } : null
   }
 
-  const exempt = (!build && licLegacyOpen(env)) || licBrowserAllowed(request, env)
+  const settings = await settingsOf(env)
+  const exempt = (!build && licLegacyOpen(env, settings)) || licBrowserAllowed(request, env)
   if (exempt) return null
 
-  if (!licEnforce(env)) {
+  if (!licEnforce(env, settings)) {
     console.warn(`license: would deny ${url.pathname} build=${build || '(none)'}`)
     return null
   }
@@ -4159,12 +4809,13 @@ async function handleLicenseActivate(request, env) {
 
   // 防爆破：同一来源每日尝试次数上限（来源 IP 以边缘写入的可信头为准）
   const src = (await sha256Hex(reqIp(request))).slice(0, 24)
+  const tryLimit = Math.max(1, Number((await settingsOf(env)).licTryPerDay) || 30)
   const day = gateDay()
   const tryKey = LIC_TRY_KEY + day + ':' + src
   if (kv) {
     let rec = (await kvJson(kv, tryKey)) || null
     if (!alive(rec) || rec.day !== day) rec = { day, n: 0, _exp: Date.now() + 36 * 3600 * 1000 }
-    const limit = Math.max(1, Number(env.CSH_LIC_TRY_PER_DAY) || 30)
+    const limit = tryLimit
     if (rec.n >= limit) {
       return json({ error: '今日激活尝试次数过多，请明天再试或把设备码发给开发者。' }, 429, request, env)
     }
@@ -4187,7 +4838,8 @@ async function handleLicenseActivate(request, env) {
     } catch {}
   }
 
-  const issued = await licIssueToken(device, code.slice(-4), undefined, env)
+  const licDays = Math.max(1, Number((await settingsOf(env)).licDays) || 365)
+  const issued = await licIssueToken(device, code.slice(-4), licDays, env)
 
   const deviceRec = {
     at: Date.now(),
@@ -4221,13 +4873,14 @@ async function handleLicenseActivate(request, env) {
 
 // ── 后台接口 ─────────────────────────────────────────────────────────
 
-function admLicenseSnapshot(env) {
+function admLicenseSnapshot(env, S) {
+  const s = S || {}
   return {
-    enforce: licEnforce(env),
-    enforceAt: String(env.CSH_LIC_ENFORCE_AT || '') || null,
-    legacyUntil: String(env.CSH_LIC_LEGACY_UNTIL || '') || null,
-    days: Number(env.CSH_LICENSE_DAYS || 365),
-    officialDays: Number(env.CSH_OFFICIAL_TOKEN_DAYS || 30),
+    enforce: licEnforce(env, S),
+    enforceAt: String(s.licEnforceAt || '') || null,
+    legacyUntil: String(s.licLegacyUntil || '') || null,
+    days: Number(s.licDays) || 365,
+    officialDays: Number(s.licOfficialDays) || 30,
     buildSecret: !!env.CSH_BUILD_SECRET,
     licenseSecret: !!env.CSH_LICENSE_SECRET,
   }
@@ -4257,10 +4910,13 @@ async function handleAdminLogin(request, env) {
   const pass = String(body?.pass || '')
   const kv = await gateKv()
   const failKey = ADM_FAIL_KEY + (await sha256Hex(reqIp(request))).slice(0, 24)
+  const S = await settingsOf(env)
+  const failLimit = Math.max(1, Number(S.admLoginFailLimit) || ADM_LOGIN_FAIL_LIMIT)
+  const failWindowMs = Math.max(60000, (Number(S.admLoginFailWindowMin) || 30) * 60000)
 
   if (kv) {
     const rec = await kvJson(kv, failKey)
-    if (rec && Number(rec.n) >= ADM_LOGIN_FAIL_LIMIT && Number(rec._exp) > Date.now()) {
+    if (rec && Number(rec.n) >= failLimit && Number(rec._exp) > Date.now()) {
       const mins = Math.max(1, Math.ceil((Number(rec._exp) - Date.now()) / 60000))
       return admJson({ error: `密码错误次数过多，请 ${mins} 分钟后再试。` }, 429)
     }
@@ -4273,7 +4929,7 @@ async function handleAdminLogin(request, env) {
       const rec = (await kvJson(kv, failKey)) || { n: 0 }
       const n = (Number(rec.n) || 0) + 1
       try {
-        await kvSave(kv, failKey, { n, _exp: Date.now() + ADM_LOGIN_FAIL_WINDOW_MS })
+        await kvSave(kv, failKey, { n, _exp: Date.now() + failWindowMs })
       } catch {}
     }
     console.warn(`admin: login failed from ${reqIp(request)}`)
@@ -4286,10 +4942,11 @@ async function handleAdminLogin(request, env) {
     } catch {}
   }
 
-  const issued = await admIssueSession(env)
+  const sessionHours = Math.max(1, Number(S.admSessionHours) || ADM_SESSION_TTL_HOURS)
+  const issued = await admIssueSession(env, sessionHours)
   console.log(`admin: ${admUser(env)} logged in`)
   return admJson({ ok: true, user: admUser(env), exp: issued.exp }, 200, {
-    'Set-Cookie': admCookieSet(issued.token, ADM_SESSION_TTL_HOURS * 3600),
+    'Set-Cookie': admCookieSet(issued.token, Math.round(sessionHours * 3600)),
   })
 }
 
@@ -4302,7 +4959,14 @@ async function handleAdminLogout(request, env) {
 async function handleAdminSession(request, env) {
   const sess = await admSession(request, env)
   if (!sess) return admJson({ ok: false, ready: admReady(env) }, 401)
-  return admJson({ ok: true, user: sess.user, exp: sess.exp, license: admLicenseSnapshot(env) })
+  const S = await settingsOf(env)
+  return admJson({
+    ok: true,
+    user: sess.user,
+    exp: sess.exp,
+    license: admLicenseSnapshot(env, S),
+    settingsOverrides: Object.keys((await settingsBundle(env)).overrides || {}).length,
+  })
 }
 
 /** GET /api/admin/codes 列表；POST /api/admin/codes 批量签发。 */
@@ -4348,7 +5012,13 @@ async function handleAdminCodes(request, env) {
 
   await kvSave(kv, ADM_SEQ_KEY, { n: seq })
   await admIndexSave(kv, ADM_CODE_INDEX_KEY, created.concat(codes))
-  console.log(`admin: ${(sess && sess.user) || 'service'} issued ${created.length} code(s) note=${note || '-'}`)
+console.log(`admin: ${(sess && sess.user) || 'service'} issued ${created.length} code(s) note=${note || '-'}`)
+  await admAudit(env, 'code-issue', {
+    count: created.length,
+    note,
+    serials: created.map((c) => c.s),
+  })
+
 
   return admJson({
     ok: true,
@@ -4386,7 +5056,9 @@ async function handleAdminCodeRevoke(request, env) {
   }
   hit.r = revoked
   await admIndexSave(kv, ADM_CODE_INDEX_KEY, codes)
-  console.log(`admin: ${(sess && sess.user) || 'service'} ${revoked ? 'revoked' : 'restored'} code #${serial}`)
+console.log(`admin: ${(sess && sess.user) || 'service'} ${revoked ? 'revoked' : 'restored'} code #${serial}`)
+  await admAudit(env, revoked ? 'code-revoke' : 'code-restore', { serial })
+
   return admJson({ ok: true, serial, revoked: !!revoked })
 }
 
@@ -4506,7 +5178,9 @@ async function handleAdminBan(request, env) {
     await admIndexSave(kv, ADM_DEV_INDEX_KEY, devices)
   }
 
-  console.log(`admin: ${(sess && sess.user) || 'service'} banned ${device} until=${until || 'forever'} reason=${reason || '-'}`)
+console.log(`admin: ${(sess && sess.user) || 'service'} banned ${device} until=${until || 'forever'} reason=${reason || '-'}`)
+  await admAudit(env, 'ban', { device, hours, reason, until })
+
   return admJson({ ok: true, device, until })
 }
 
@@ -4533,6 +5207,7 @@ async function handleAdminUnban(request, env) {
   try {
     await kv.delete(ADM_BAN_KEY + device)
   } catch {}
+  await admAudit(env, 'unban', { device })
 
   const devices = await admIndex(kv, ADM_DEV_INDEX_KEY)
   const hit = devices.find((d) => d && d.d === device)
@@ -4630,7 +5305,8 @@ async function handleAdminShout(request, env) {
 
   const text = String(body?.text || '').trim()
   if (!text) return admJson({ error: '喊话内容不能为空' }, 400)
-  if (text.length > ANN_TEXT_MAX) return admJson({ error: `喊话内容最多 ${ANN_TEXT_MAX} 字` }, 400)
+  const shoutMax = Math.max(10, Number((await settingsOf(env)).annTextMax) || ANN_TEXT_MAX)
+  if (text.length > shoutMax) return admJson({ error: `喊话内容最多 ${shoutMax} 字` }, 400)
 
   const duration = Math.min(
     ANN_DURATION_MAX,
@@ -4675,8 +5351,157 @@ async function handleAdminShout(request, env) {
     else failed.push({ pair, error: (out && out.error) || 'internal' })
   }
 
-  console.log(`admin: ${(sess && sess.user) || 'service'} shout ${id} delivered=${delivered} pairs=${groups.size} text=${text.slice(0, 40)}`)
+console.log(`admin: ${(sess && sess.user) || 'service'} shout ${id} delivered=${delivered} pairs=${groups.size} text=${text.slice(0, 40)}`)
+  await admAudit(env, 'shout', { delivered, pairs: groups.size, text: text.slice(0, 120), duration })
+
   return admJson({ ok: true, id, delivered, pairs: groups.size, failed })
+}
+
+// ── 参数设置与操作日志 ──────────────────────────────────────────────
+
+const ADM_AUDIT_KEY = 'cfg:audit'
+const ADM_AUDIT_MAX = 300
+
+/** 记一条后台操作。只保留最近 300 条，读改写一次，够回溯就行。 */
+async function admAudit(env, action, detail) {
+  try {
+    const kv = await gateKv()
+    if (!kv) return
+    const list = (await kvJson(kv, ADM_AUDIT_KEY)) || []
+    const entry = {
+      at: Date.now(),
+      by: admUser(env),
+      act: String(action || '').slice(0, 40),
+      detail: detail && typeof detail === 'object' ? detail : { text: String(detail || '').slice(0, 240) },
+    }
+    const next = [entry].concat(Array.isArray(list) ? list : []).slice(0, ADM_AUDIT_MAX)
+    await kvSave(kv, ADM_AUDIT_KEY, next)
+  } catch {}
+}
+
+function admSameOriginOrFail(request) {
+  return admSameOrigin(request) ? null : admJson({ error: '来源校验失败' }, 403)
+}
+
+/** GET /api/admin/settings —— 分组后的参数、生效值、出厂值、是否被改过。 */
+async function handleAdminSettingsGet(request, env) {
+  const sess = await admSession(request, env)
+  if (!sess) return admJson({ error: '未登录' }, 401)
+
+  const bundle = await settingsBundle(env)
+  const groups = SETTING_GROUPS.map((g) => ({
+    id: g.id,
+    title: g.title,
+    hint: g.hint || '',
+    fields: SETTING_FIELDS.filter((f) => f.group === g.id).map((f) => ({
+      key: f.key,
+      label: f.label,
+      type: f.type,
+      unit: f.unit || '',
+      min: f.min,
+      max: f.max,
+      options: f.options || null,
+      hint: f.hint || '',
+      value: bundle.values[f.key],
+      def: bundle.defaults[f.key],
+      overridden: settingOverridden(bundle, f.key),
+    })),
+  }))
+
+  let audit = []
+  try {
+    const kv = await gateKv()
+    if (kv) audit = ((await kvJson(kv, ADM_AUDIT_KEY)) || []).slice(0, 60)
+  } catch {}
+
+  return admJson({
+    ok: true,
+    groups,
+    audit,
+    updatedAt: bundle.meta ? bundle.meta.at : 0,
+    updatedBy: bundle.meta ? bundle.meta.by : '',
+    overrides: Object.keys(bundle.overrides || {}).length,
+  })
+}
+
+/** POST /api/admin/settings { patch: {key: value}, reset: [key] | true } */
+async function handleAdminSettingsSave(request, env) {
+  const sess = await admSession(request, env)
+  if (!sess) return admJson({ error: '未登录' }, 401)
+  const originFail = admSameOriginOrFail(request)
+  if (originFail) return originFail
+
+  let body
+  try {
+    body = await request.json()
+  } catch {
+    return admJson({ error: '请求格式错误' }, 400)
+  }
+
+  const kv = await gateKv()
+  if (!kv) return admJson({ error: '状态存储不可用' }, 503)
+
+  const bundle = await settingsBundle(env)
+  const stored = (await kvJson(kv, SETTINGS_KEY)) || {}
+  const next = Object.assign({}, stored.v && typeof stored.v === 'object' ? stored.v : {})
+  const errors = {}
+  const changes = []
+
+  const patch = body && body.patch && typeof body.patch === 'object' ? body.patch : {}
+  for (const key of Object.keys(patch)) {
+    const field = settingField(key)
+    if (!field) {
+      errors[key] = '未知参数'
+      continue
+    }
+    const out = settingCoerce(field, patch[key])
+    if (!out.ok) {
+      errors[key] = out.error
+      continue
+    }
+    const before = bundle.values[key]
+    if (before === out.value) continue
+    changes.push({ key, label: field.label, from: before, to: out.value })
+    next[key] = out.value
+  }
+
+  const reset = body && body.reset
+  const resetKeys =
+    reset === true ? Object.keys(next) : Array.isArray(reset) ? reset.map((k) => String(k)) : []
+  for (const key of resetKeys) {
+    if (!Object.prototype.hasOwnProperty.call(next, key)) continue
+    const field = settingField(key)
+    if (!field) continue
+    const before = bundle.values[key]
+    delete next[key]
+    if (before !== bundle.defaults[key]) {
+      changes.push({ key, label: field.label, from: before, to: bundle.defaults[key], reset: true })
+    }
+  }
+
+  if (Object.keys(errors).length > 0) {
+    return admJson({ error: '有参数不合法', errors }, 400)
+  }
+  if (changes.length === 0) {
+    return admJson({ ok: true, changed: 0, message: '没有改动' })
+  }
+
+  await kvSave(kv, SETTINGS_KEY, { v: next, at: Date.now(), by: admUser(env) })
+  await admAudit(env, 'settings', { changes: changes.slice(0, 24) })
+  console.log(`admin: ${sess.user} settings changed=${changes.length}`)
+  return admJson({ ok: true, changed: changes.length, changes })
+}
+
+/** GET /api/admin/audit —— 最近的后台操作。 */
+async function handleAdminAudit(request, env) {
+  const sess = await admSession(request, env)
+  if (!sess) return admJson({ error: '未登录' }, 401)
+  let audit = []
+  try {
+    const kv = await gateKv()
+    if (kv) audit = ((await kvJson(kv, ADM_AUDIT_KEY)) || []).slice(0, ADM_AUDIT_MAX)
+  } catch {}
+  return admJson({ ok: true, audit })
 }
 
 async function workerFetch(request, env, ctx) {
@@ -4686,16 +5511,17 @@ async function workerFetch(request, env, ctx) {
 
     const url = new URL(request.url)
 
+    // 设备信誉先于许可判定：封禁/超限统一回 429（许可闸门对被封禁设备回 403）。
+    // 激活接口同样要过这一关：封禁优先，且激活尝试按设备限速（REP_TIER_BASE 里有这一档）。
+    const rep = await deviceGuard(request, env)
+    if (rep) return rep
+
     if (url.pathname === LIC_ACTIVATE_PATH) return handleLicenseActivate(request, env)
 
     // 凡带设备码的客户端请求都登记一笔（激活接口自己会记，这里跳过）；异步写，不阻塞响应
     if (url.pathname.startsWith('/api/') && !url.pathname.startsWith('/api/admin/')) {
       ctx.waitUntil(licTouchDevice(env, request).catch(() => {}))
     }
-
-    // 设备信誉先于许可判定：封禁/超限统一回 429（许可闸门对被封禁设备回 403）。
-    const rep = await deviceGuard(request, env)
-    if (rep) return rep
 
     const gate = await licenseGuard(request, env)
     if (gate && gate.deny) return gate.deny
@@ -4734,6 +5560,11 @@ async function routeRequest(request, env, ctx) {
       if (url.pathname === '/api/admin/unban' && request.method === 'POST') return handleAdminUnban(request, env)
       if (url.pathname === '/api/admin/online' && request.method === 'GET') return handleAdminOnline(request, env)
       if (url.pathname === '/api/admin/shout' && request.method === 'POST') return handleAdminShout(request, env)
+      if (url.pathname === '/api/admin/settings') {
+        if (request.method === 'GET') return handleAdminSettingsGet(request, env)
+        if (request.method === 'POST') return handleAdminSettingsSave(request, env)
+      }
+      if (url.pathname === '/api/admin/audit' && request.method === 'GET') return handleAdminAudit(request, env)
       return admJson({ error: 'Not Found' }, 404)
     }
 
@@ -4828,12 +5659,13 @@ async function handleStatus(request, env) {
   out.services.licenseConfig = !!(env.CSH_BUILD_SECRET && env.CSH_LICENSE_SECRET)
   out.services.adminConfig = admReady(env)
   out.admin = { user: admUser(env), ready: admReady(env) }
+  const statusSettings = await settingsOf(env)
   out.license = {
-    enforce: licEnforce(env),
-    enforceAt: String(env.CSH_LIC_ENFORCE_AT || '') || null,
+    enforce: licEnforce(env, statusSettings),
+    enforceAt: String(statusSettings.licEnforceAt || '') || null,
     buildSecret: !!env.CSH_BUILD_SECRET,
     licenseSecret: !!env.CSH_LICENSE_SECRET,
-    legacyUntil: String(env.CSH_LIC_LEGACY_UNTIL || '') || null,
+    legacyUntil: String(statusSettings.licLegacyUntil || '') || null,
   }
   out.features = [
     {
