@@ -17,6 +17,10 @@ const PLATFORMS_JSON_PATH = '软件数据/platforms.json'
 const ECHO_MAX_LEN = 200
 const ECHO_MARKER = '回声洞'
 
+// 回声洞 / 反馈的每来源每日上限：两者都会在 GitHub 仓库落提交，不设限会被刷成垃圾
+const ECHO_MAX_PER_DAY = 10
+const FEEDBACK_MAX_PER_DAY = 10
+
 const FEEDBACK_KINDS = ['report', 'suggestion']
 const FEEDBACK_SUBKINDS = ['interaction', 'link', 'other']
 const FEEDBACK_TITLE_MAX = 80
@@ -138,6 +142,12 @@ const ANN_RATE_MS = 10 * 1000
 const ANN_DURATION_MIN = 10
 const ANN_DURATION_MAX = 120
 const ANN_DURATION_DEFAULT = 30
+
+// 单个配对码下最多登记的在线设备数（机房一班 60 台够用），防随机设备码撑大注册表
+const ANN_PAIR_DEVICE_MAX = 128
+
+// 每来源每天最多新建多少个配对码注册表：pairCode 只有 6 位，不设限可被刷出百万个 KV 键
+const ANN_NEW_PAIR_PER_IP_DAY = 100
 
 const UNSAFE_NAME_RE = /[\u0000-\u001f\u007f\u200b-\u200f\u202a-\u202e\u2066-\u2069\\:*?"<>|%#]+/g
 
@@ -643,8 +653,7 @@ async function handleOssSign(request, env, ctx) {
 
 
 
-  const srcRaw = request.headers.get('CF-Connecting-IP') || request.headers.get('x-forwarded-for') || 'unknown'
-  const src = (await sha256Hex(String(srcRaw).split(',')[0].trim())).slice(0, 24)
+  const src = (await sha256Hex(reqIp(request))).slice(0, 24)
   const gate = await signGate(env, src, size)
   if (!gate.allowed) {
     return json({ error: gate.message, scope: gate.scope }, 429, request, env)
@@ -736,7 +745,7 @@ async function handleMirrorSign(request, env) {
   }
 
   try {
-    const srcIp = (request.headers.get('CF-Connecting-IP') || (request.headers.get('x-forwarded-for') || '').split(',')[0] || '').trim()
+    const srcIp = reqIp(request)
     const res = await fetch(
       `https://${MIRROR_SIGN_HOST}/sign?url=${encodeURIComponent(target)}${srcIp ? `&ip=${encodeURIComponent(srcIp)}` : ''}`,
       {
@@ -1146,6 +1155,12 @@ async function handleEchoCave(request, env) {
     return json({ error: `字条太长啦，最多 ${ECHO_MAX_LEN} 个字。` }, 400, request, env)
   }
 
+  // 每张字条都会在仓库里落一个文件，按来源限量，避免被刷成垃圾提交
+  const echoKv = await gateKv()
+  if (!(await ipDailyAllow(echoKv, 'echo', ECHO_MAX_PER_DAY, request))) {
+    return json({ error: `今天已经投过 ${ECHO_MAX_PER_DAY} 条了，明天再来吧。` }, 429, request, env)
+  }
+
   const apiBase = `https://api.github.com/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/contents`
   const headers = githubHeaders(env)
 
@@ -1188,6 +1203,12 @@ async function handleFeedback(request, env) {
     data = await request.json()
   } catch {
     return json({ error: '请求格式错误' }, 400, request, env)
+  }
+
+  // 反馈会开 GitHub Issue，同样按来源限量
+  const fbKv = await gateKv()
+  if (!(await ipDailyAllow(fbKv, 'fb', FEEDBACK_MAX_PER_DAY, request))) {
+    return json({ error: `今天已经提交过 ${FEEDBACK_MAX_PER_DAY} 条反馈了，明天再来吧。` }, 429, request, env)
   }
 
   const str = (value) => (typeof value === 'string' ? value.trim() : '')
@@ -1814,7 +1835,8 @@ async function handleDl(request, env) {
 
 function adminOk(request, env) {
   const expect = String(env.PURGE_TOKEN || '')
-  return !!expect && request.headers.get('X-Purge-Token') === expect
+  if (!expect) return false
+  return ctEqual(request.headers.get('x-purge-token') || '', expect)
 }
 
 function objectKeyOk(key) {
@@ -2854,6 +2876,10 @@ async function gateAnn(kv, body) {
     const deviceId = String(body.deviceId || '')
     const regKey = 'gate:ann:d:' + pairCode
     const reg = (await kvJson(kv, regKey)) || {}
+    // 单个配对码下最多登记这么多台在线设备，防止用随机设备码把注册表撑大
+    if (!reg[deviceId] && Object.keys(reg).length >= ANN_PAIR_DEVICE_MAX) {
+      return { ok: false, error: 'pair_full' }
+    }
     reg[deviceId] = { t: Date.now(), n: String(body.name || '').slice(0, 32) }
     await kvSave(kv, regKey, reg)
     const msgKey = 'gate:ann:m:' + pairCode
@@ -3084,9 +3110,29 @@ async function handleAnnouncePoll(request, env) {
     return json({ error: 'bad_request' }, 400, request, env)
   }
 
+  // 新配对码注册表按来源限量；已存在的配对码不受影响（轮询本身是正常高频行为）
+  const kv = await gateKv()
+  if (kv) {
+    try {
+      if (!(await kvJson(kv, 'gate:ann:d:' + pairCode))) {
+        const ipHash = (await sha256Hex(reqIp(request))).slice(0, 24)
+        const day = new Date().toISOString().slice(0, 10)
+        const key = `ann:pair:${ipHash}:${day}`
+        const used = Number((await kvJson(kv, key))?.n) || 0
+        if (used >= ANN_NEW_PAIR_PER_IP_DAY) {
+          return json({ error: 'pair_quota' }, 429, request, env)
+        }
+        await kvSave(kv, key, { n: used + 1, _exp: Date.now() + 2 * 86400 * 1000 })
+      }
+    } catch {}
+  }
+
   const out = await announceOp(env, { op: 'ann-poll', deviceId, pairCode, name })
   if (!out) return json({ error: 'internal' }, 500, request, env)
   if (!out.ok) {
+    if (out.error === 'pair_full') {
+      return json({ error: 'pair_full', message: '这个配对码下的设备数已满。' }, 429, request, env)
+    }
     return json({ error: out.error || 'unknown_pair' }, 403, request, env)
   }
   if (!out.msg) return new Response(null, { status: 204, headers: corsHeaders(request, env) })
@@ -3247,9 +3293,20 @@ function admSameOrigin(request) {
   }
 }
 
+/**
+ * 来源 IP：优先用边缘注入的可信头；退化到 XFF 时取**最后一段**——
+ * 首段由客户端自行填写，用它做限流会被伪造头直接绕过。
+ */
 function reqIp(request) {
-  const raw = request.headers.get('x-forwarded-for') || request.headers.get('eagleeye-real-ip') || ''
-  return String(raw).split(',')[0].trim() || 'unknown'
+  for (const name of ['eagleeye-real-ip', 'cf-connecting-ip', 'true-client-ip', 'x-real-ip']) {
+    const value = String(request.headers.get(name) || '').trim()
+    if (value) return value
+  }
+  const chain = String(request.headers.get('x-forwarded-for') || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+  return chain.length ? chain[chain.length - 1] : 'unknown'
 }
 
 /** 定长比较，避免按字符提前返回泄漏密码前缀。 */
@@ -3382,11 +3439,21 @@ async function licRecordActivation(kv, info) {
  */
 const LIC_TOUCH_TTL_MS = 6 * 3600 * 1000
 
+/** 每来源每天最多登记多少台“首次出现”的设备，挡住随机设备码刷存储。 */
+const LIC_DEV_REG_PER_IP_DAY = 500
+
+const LIC_DEV_REG_KEY = 'lic:reg:'
+
+/** 设备码合法形态：16–64 位十六进制（与客户端 DeviceIdentity 输出一致）。 */
+function deviceIdOk(device) {
+  return /^[0-9a-f]{16,64}$/i.test(String(device || ''))
+}
+
 async function licTouchDevice(env, request) {
   const device = String(
     request.headers.get('x-csh-did') || request.headers.get('x-csh-device') || ''
   ).slice(0, 64)
-  if (!device) return
+  if (!deviceIdOk(device)) return
 
   const kv = await gateKv()
   if (!kv) return
@@ -3397,6 +3464,18 @@ async function licTouchDevice(env, request) {
 
   const prev = await kvJson(kv, LIC_DEVICE_KEY + device)
   if (prev && now - (Number(prev.at) || 0) < LIC_TOUCH_TTL_MS) return
+
+  // 只有“首次出现”的设备才消耗配额；老设备刷新不计数
+  if (!prev) {
+    const ipHash = (await sha256Hex(reqIp(request))).slice(0, 24)
+    const day = new Date(now).toISOString().slice(0, 10)
+    const regKey = `${LIC_DEV_REG_KEY}${ipHash}:${day}`
+    const used = Number((await kvJson(kv, regKey))?.n) || 0
+    if (used >= LIC_DEV_REG_PER_IP_DAY) return
+    try {
+      await kvSave(kv, regKey, { n: used + 1, _exp: now + 2 * 86400 * 1000 })
+    } catch {}
+  }
 
   const rec = prev || { tail: '', serial: 0 }
   if (!Number(rec.first) || Number(rec.first) > now) rec.first = now
@@ -3703,6 +3782,7 @@ async function handleLicenseActivate(request, env) {
     return json({ error: `激活码长度不对（应为 ${LIC_CODE_LEN} 个字符）。` }, 400, request, env)
   }
   if (!device) return json({ error: '缺少设备码。' }, 400, request, env)
+  if (!deviceIdOk(device)) return json({ error: '设备码格式不对。' }, 400, request, env)
 
   const kv = await gateKv()
 
@@ -3715,8 +3795,7 @@ async function handleLicenseActivate(request, env) {
   }
 
   // 防爆破：同一来源每日尝试次数上限
-  const srcRaw = request.headers.get('x-forwarded-for') || request.headers.get('eagleeye-real-ip') || 'unknown'
-  const src = (await sha256Hex(String(srcRaw).split(',')[0].trim())).slice(0, 24)
+  const src = (await sha256Hex(reqIp(request))).slice(0, 24)
   const day = gateDay()
   const tryKey = LIC_TRY_KEY + day + ':' + src
   if (kv) {
@@ -4019,6 +4098,7 @@ async function handleAdminBan(request, env) {
 
   const device = String(body?.device || '').trim().slice(0, 64)
   if (!device) return admJson({ error: '缺少设备码' }, 400)
+  if (!deviceIdOk(device)) return admJson({ error: '设备码格式不对' }, 400)
 
   const hours = Math.max(0, Math.min(24 * 3650, Number(body?.hours) || 0))
   const until = hours > 0 ? Date.now() + hours * 3600 * 1000 : 0
@@ -4055,6 +4135,7 @@ async function handleAdminUnban(request, env) {
 
   const device = String(body?.device || '').trim().slice(0, 64)
   if (!device) return admJson({ error: '缺少设备码' }, 400)
+  if (!deviceIdOk(device)) return admJson({ error: '设备码格式不对' }, 400)
 
   const kv = await gateKv()
   if (!kv) return admJson({ error: '状态存储不可用' }, 503)
@@ -4072,6 +4153,20 @@ async function handleAdminUnban(request, env) {
 
   console.log(`admin: ${sess.user} unbanned ${device}`)
   return admJson({ ok: true, device })
+}
+
+/** 每来源每日配额（KV 计数，两天过期）。超限返回 false；存储不可用时放行，不因限流挂掉主流程。 */
+async function ipDailyAllow(kv, scope, limit, request) {
+  if (!kv) return true
+  try {
+    const ipHash = (await sha256Hex(reqIp(request))).slice(0, 24)
+    const day = new Date().toISOString().slice(0, 10)
+    const key = `quota:${scope}:${ipHash}:${day}`
+    const used = Number((await kvJson(kv, key))?.n) || 0
+    if (used >= limit) return false
+    await kvSave(kv, key, { n: used + 1, _exp: Date.now() + 2 * 86400 * 1000 })
+  } catch {}
+  return true
 }
 
 /** 通用键前缀枚举：兼容本仓 Blob 适配层（收字符串）与 Cloudflare KV 绑定（收 { prefix }）。 */

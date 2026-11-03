@@ -1,5 +1,6 @@
 // 本地烟测：用内存 KV 跑通「登录 → 签发 → 激活 → 封禁」全链路。
 // 仅用于开发期验证，不参与部署。
+import { createHash } from 'node:crypto'
 import { onRequest } from './functions/api/%5B%5Bdefault%5D%5D.js'
 import { onRequest as adminPage } from './functions/admin.js'
 
@@ -20,6 +21,8 @@ const env = {
   CSH_LIC_ENFORCE_AT: '',
   CSH_LIC_LEGACY_UNTIL: '',
 }
+
+const sha256HexLocal = (text) => createHash('sha256').update(String(text)).digest('hex')
 
 let cookie = ''
 const pendingTasks = []
@@ -198,6 +201,63 @@ log('空内容被拒绝', shoutEmpty.status === 400)
 
 const onlineNoAuth = await jsonOf(await call('/api/admin/online'))
 log('未登录看不到在线设备', onlineNoAuth.status === 401)
+
+// ── 安全回归 ──────────────────────────────────────────────────────────
+// 1) 伪造 XFF 首段不能绕过登录锁定：限流取可信头 / XFF 末段
+for (let i = 0; i < 10; i++) {
+  await call('/api/admin/login', {
+    method: 'POST',
+    headers: { 'x-forwarded-for': `10.9.9.${i}, 203.0.113.9` },
+    body: { user: 'admin', pass: 'wrong-' + i },
+  })
+}
+const locked = await jsonOf(await call('/api/admin/login', {
+  method: 'POST',
+  headers: { 'x-forwarded-for': '172.16.0.1, 203.0.113.9' },
+  body: { user: 'admin', pass: 'wrong-again' },
+}))
+log('伪造 XFF 首段仍被锁定', locked.status === 429)
+
+// 2) 触点只接受 16–64 位十六进制设备码，随机字符串不写入存储
+const before = store.size
+await call('/api/mirror-sign?url=https://github.com/x/y/releases/download/v1/tag', {
+  headers: { 'x-csh-did': 'not-a-real-device-id' },
+})
+await flush()
+log('非法设备码不写存储', store.size === before)
+
+// 3) 每来源每日新设备配额 500 台，超限后不再新增记录
+const regDay = new Date().toISOString().slice(0, 10)
+const ipHash = (await sha256HexLocal('198.51.100.7')).slice(0, 24)
+await store.set('lic:reg:' + ipHash + ':' + regDay, JSON.stringify({ n: 500 }))
+const capBefore = store.size
+await call('/api/mirror-sign?url=https://github.com/x/y/releases/download/v1/tag', {
+  headers: { 'x-csh-did': 'eeee111122223333', 'x-forwarded-for': '198.51.100.7' },
+})
+await flush()
+log('新设备配额用尽后不再登记', store.size === capBefore &&
+  ![...store.keys()].includes('lic:d:eeee111122223333'))
+
+// 4) 单个配对码在线设备上限，防止随机设备码撑大注册表
+let full = 0
+for (let i = 0; i < 130; i++) {
+  const dev = i.toString(16).padStart(16, '0')
+  const r = await jsonOf(await call(`/api/announce/poll?deviceId=${dev}&pairCode=777001`))
+  if (r.status === 429) full += 1
+}
+log('配对码在线设备数有上限', full >= 1, 'rejected=' + full)
+
+// 5) 激活接口拒绝畸形设备码
+const badAct = await jsonOf(await call('/api/license/activate', {
+  method: 'POST', body: { code: issued.data.codes[1].code, device: '../../etc/passwd' },
+}))
+log('激活接口校验设备码格式', badAct.status === 400)
+
+// 6) 删除接口的令牌比较改为定长比较（行为不变：错令牌仍 401）
+const badPurge = await jsonOf(await call('/api/purge', {
+  method: 'POST', headers: { 'x-purge-token': 'wrong-token' }, body: { key: 'upload/x.zip' },
+}))
+log('错 purge 令牌被拒', badPurge.status === 401)
 
 const noCookie = await jsonOf(await call('/api/admin/codes'))
 log('无 Cookie 拿不到签发记录', noCookie.status === 401)

@@ -727,6 +727,9 @@ export function onRequest() {
       'x-frame-options': 'DENY',
       'x-content-type-options': 'nosniff',
       'x-robots-tag': 'noindex, nofollow',
+      // 页面只用内联样式与内联脚本，其他来源一律禁止加载，降低被注入后的影响面
+      'content-security-policy':
+        "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'",
     },
   })
 }
