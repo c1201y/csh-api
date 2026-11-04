@@ -419,6 +419,152 @@ const resetRun = await jsonOf(await call('/api/admin/risk/backfill', {
 log('可重置历史分', resetRun.status === 200 && resetRun.data.reset === true && resetRun.data.summary.hist === 0,
   'hist=' + resetRun.data.summary.hist)
 
+// ── 分面识别：下载 / OSS / 镜像 ────────────────────────────────────────
+// 下载面：缺少签名参数 + 外链 Referer + 多段 Range
+const dlIp = '198.51.100.210'
+await call('/api/dl?k=upload%2Fx.zip&e=1&s=&h=&f=', {
+  headers: { 'x-forwarded-for': dlIp, 'user-agent': uaBrowser, referer: 'https://evil.example/page' },
+})
+await call('/api/icon?k=icon%2Fx.png', {
+  headers: {
+    'x-forwarded-for': dlIp,
+    'user-agent': uaBrowser,
+    range: 'bytes=0-1,2-3,4-5,6-7,8-9,10-11,12-13,14-15,16-17',
+  },
+})
+await flush()
+riskList = await jsonOf(await call('/api/admin/risk?kind=i', { headers: bearer }))
+const dlRow = (riskList.data.items || []).find((x) => x.ip === dlIp)
+log('下载面识别签名探测/外链/多段 Range', !!dlRow &&
+  ['dl_probe', 'dl_hotlink', 'dl_range_abuse'].every((k) => dlRow.reasons.some((r) => r.key === k)),
+  dlRow && dlRow.reasons.map((r) => r.key).join('+'))
+
+// OSS 面：匿名列举 + 鉴权失败
+const ossApiIp = '198.51.100.211'
+await call('/api/files?source=bucket&prefix=soft%2F', {
+  headers: { 'x-forwarded-for': ossApiIp, 'user-agent': uaBrowser },
+})
+await flush()
+riskList = await jsonOf(await call('/api/admin/risk?kind=i', { headers: bearer }))
+const ossRow = (riskList.data.items || []).find((x) => x.ip === ossApiIp)
+log('OSS 面识别列举与鉴权失败', !!ossRow &&
+  ['oss_list', 'oss_auth_fail'].every((k) => ossRow.reasons.some((r) => r.key === k)),
+  ossRow && ossRow.reasons.map((r) => r.key).join('+'))
+
+// 镜像面：目标指向内网/非 GitHub 主机
+const mirIp = '198.51.100.212'
+await call('/api/mirror-sign?url=http%3A%2F%2F169.254.169.254%2Flatest%2Fmeta-data%2F', {
+  headers: { 'x-forwarded-for': mirIp, 'user-agent': uaBrowser },
+})
+await flush()
+riskList = await jsonOf(await call('/api/admin/risk?kind=i', { headers: bearer }))
+const mirRow = (riskList.data.items || []).find((x) => x.ip === mirIp)
+log('镜像面识别内网目标与仓库探测', !!mirRow &&
+  ['mirror_path', 'mirror_repo_probe'].every((k) => mirRow.reasons.some((r) => r.key === k)),
+  mirRow && mirRow.reasons.map((r) => r.key).join('+'))
+
+// ── 服务器侧事件：SSH / OSS 洪峰 / 下载 / 镜像 ──────────────────────────
+const sshIp = '198.51.100.220'
+const sshEvents = [
+  { ts: nowMs - 30e3, ip: sshIp, src: 'ssh', user: 'root', op: 'password', result: 'failed', n: 12 },
+  { ts: nowMs - 25e3, ip: sshIp, src: 'ssh', user: 'admin', op: 'password', result: 'invalid', n: 3 },
+  { ts: nowMs - 20e3, ip: sshIp, src: 'ssh', user: 'root', op: 'publickey', result: 'accepted', n: 1 },
+]
+const sshRun = await jsonOf(await call('/api/admin/risk/backfill', {
+  method: 'POST', headers: bearer, body: { source: 'ssh', events: sshEvents },
+}))
+log('SSH 事件回溯入账', sshRun.status === 200 && sshRun.data.source === 'ssh' && sshRun.data.added === 3,
+  `added=${sshRun.data.added}`)
+riskList = await jsonOf(await call('/api/admin/risk?kind=i', { headers: bearer }))
+const sshRow = (riskList.data.items || []).find((x) => x.ip === sshIp)
+log('SSH 爆破/非法用户/root/成功登录均可识别', !!sshRow &&
+  ['ssh_brute', 'ssh_invalid_user', 'ssh_root_attempt', 'ssh_accepted'].every((k) =>
+    sshRow.histReasons.some((r) => r.key === k)),
+  sshRow && sshRow.histReasons.map((r) => r.key).join('+'))
+const sshAgain = await jsonOf(await call('/api/admin/risk/backfill', {
+  method: 'POST', headers: bearer, body: { source: 'ssh', events: sshEvents },
+}))
+log('SSH 事件重复回溯不叠加', sshAgain.status === 200 && sshAgain.data.added === 0 && sshAgain.data.skipped === 3,
+  `added=${sshAgain.data.added} skipped=${sshAgain.data.skipped}`)
+
+const sshBurstIp = '198.51.100.221'
+const sshBurst = await jsonOf(await call('/api/admin/risk/backfill', {
+  method: 'POST',
+  headers: bearer,
+  body: {
+    source: 'ssh',
+    events: [
+      { ts: nowMs - 15e3, ip: sshBurstIp, src: 'ssh', user: 'oracle', op: 'password', result: 'failed', n: 30 },
+      { ts: nowMs - 10e3, ip: sshBurstIp, src: 'ssh', user: 'ubuntu', op: 'password', result: 'failed', n: 25 },
+    ],
+  },
+}))
+riskList = await jsonOf(await call('/api/admin/risk?kind=i', { headers: bearer }))
+const sshBurstRow = (riskList.data.items || []).find((x) => x.ip === sshBurstIp)
+log('SSH 高频爆破合成为洪峰信号', sshBurst.status === 200 && sshBurst.data.added === 3 &&
+  !!sshBurstRow && sshBurstRow.histReasons.some((r) => r.key === 'ssh_brute'),
+  `added=${sshBurst.data.added}`)
+
+const ossEvtIp = '198.51.100.222'
+const ossRun = await jsonOf(await call('/api/admin/risk/backfill', {
+  method: 'POST',
+  headers: bearer,
+  body: {
+    source: 'oss',
+    events: [
+      { ts: nowMs - 120e3, ip: ossEvtIp, src: 'oss', method: 'GET', status: 403, op: 'list', path: '/bucket?list-type=2&prefix=soft/', n: 80 },
+      { ts: nowMs - 60e3, ip: ossEvtIp, src: 'oss', method: 'GET', status: 403, op: 'list', path: '/bucket?list-type=2&prefix=soft/', n: 80 },
+      { ts: nowMs - 30e3, ip: ossEvtIp, src: 'oss', method: 'DELETE', status: 403, op: 'delete', path: '/bucket/soft/a.zip', n: 80 },
+    ],
+  },
+}))
+riskList = await jsonOf(await call('/api/admin/risk?kind=i', { headers: bearer }))
+const ossEvtRow = (riskList.data.items || []).find((x) => x.ip === ossEvtIp)
+log('OSS 事件识别高频鉴权失败/列举/删除', ossRun.status === 200 && ossRun.data.added === 4 &&
+  !!ossEvtRow && ['oss_auth_fail', 'oss_burst', 'oss_list', 'oss_delete'].every((k) =>
+    ossEvtRow.histReasons.some((r) => r.key === k)),
+  ossEvtRow && ossEvtRow.histReasons.map((r) => r.key).join('+'))
+
+const dlEvtIp = '198.51.100.223'
+const dlEvt = await jsonOf(await call('/api/admin/risk/backfill', {
+  method: 'POST',
+  headers: bearer,
+  body: {
+    source: 'download',
+    events: [
+      { ts: nowMs - 30e3, ip: dlEvtIp, src: 'download', method: 'GET', status: 403, path: '/dl/a.zip', n: 1 },
+      { ts: nowMs - 20e3, ip: dlEvtIp, src: 'download', method: 'GET', status: 200, op: 'hotlink', path: '/dl/b.zip', n: 1 },
+    ],
+  },
+}))
+riskList = await jsonOf(await call('/api/admin/risk?kind=i', { headers: bearer }))
+const dlEvtRow = (riskList.data.items || []).find((x) => x.ip === dlEvtIp)
+log('下载服务事件识别签名失败/盗链', dlEvt.status === 200 && dlEvt.data.added === 2 && !!dlEvtRow &&
+  ['dl_sign_fail', 'dl_hotlink'].every((k) => dlEvtRow.histReasons.some((r) => r.key === k)),
+  dlEvtRow && dlEvtRow.histReasons.map((r) => r.key).join('+'))
+
+const mirEvtIp = '198.51.100.224'
+const mirEvt = await jsonOf(await call('/api/admin/risk/backfill', {
+  method: 'POST',
+  headers: bearer,
+  body: {
+    source: 'mirror',
+    events: [
+      { ts: nowMs - 30e3, ip: mirEvtIp, src: 'mirror', method: 'GET', status: 404, path: '/a/b/../../etc/passwd', n: 1 },
+    ],
+  },
+}))
+riskList = await jsonOf(await call('/api/admin/risk?kind=i', { headers: bearer }))
+const mirEvtRow = (riskList.data.items || []).find((x) => x.ip === mirEvtIp)
+log('镜像服务事件识别路径穿越', mirEvt.status === 200 && mirEvt.data.added === 1 && !!mirEvtRow &&
+  mirEvtRow.histReasons.some((r) => r.key === 'mirror_path'),
+  mirEvtRow && mirEvtRow.histReasons.map((r) => r.key).join('+'))
+
+const bfStatus = await jsonOf(await call('/api/admin/risk/backfill', { headers: bearer }))
+log('回溯状态按来源记录', !!bfStatus.data.marker && bfStatus.data.marker.servers &&
+  ['ssh', 'oss', 'download', 'mirror'].every((k) => bfStatus.data.marker.servers[k]))
+
+
 // ── 安全回归 ──────────────────────────────────────────────────────────
 // 1) 伪造 XFF 首段不能绕过登录锁定：限流取可信头 / XFF 末段
 for (let i = 0; i < 10; i++) {

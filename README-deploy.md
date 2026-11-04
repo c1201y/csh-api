@@ -131,6 +131,28 @@
 - 后台记录只是对账用的索引（`lic:c:idx` / `lic:dev:idx`，各保留最近 200 条），
   删记录不影响已发出激活码的可用性。
 
+### 风险识别与自动封禁
+
+客户端 `/api/*` 请求在**响应前**同步完成规则打分与模型推理（模型按 60 秒缓存，未上传时自动退回纯规则），
+高置信命中会在本次请求直接返回 `429 {"code":"csh_ip_restricted"}` 并写入临时封禁；
+SSH 日志由观测台近实时上报（`source=ssh`），失败量达标同样落边缘封禁。
+
+| 名称 | 类型 | 说明 |
+|---|---|---|
+| `CSH_RISK_AUTOBAN` | 文本 | 总开关，默认 `on`；`off` 时只识别不封禁 |
+| `CSH_RISK_ML_ACT` | 文本 | 模型自动封禁的最低分，默认 `0.9`（且需叠加至少一条强规则信号） |
+| `CSH_RISK_AUTOBAN_MIN` / `CSH_RISK_AUTOBAN_MAX_MIN` | 文本 | 首封分钟数与上限，默认 `10` / `60`；7 天内再犯按 10→30→60 升级 |
+| `CSH_RISK_ALLOW_IPS` | 文本 | 封禁白名单，精确 IP 或 IPv4 CIDR，逗号分隔。**维护者常用出口 IP 必须放进来** |
+| `CSH_RISK_SSH_BAN` | 文本 | SSH 上报触发封禁的开关，默认 `on` |
+| `CSH_RISK_SSH_BAN_HITS` / `CSH_RISK_SSH_BAN_MIN` / `CSH_RISK_SSH_WINDOW_MS` | 文本 | 失败次数阈值（8）、封禁分钟（60）、统计窗口（15 分钟） |
+
+管理接口（会话 Cookie 或 `CSH_ADMIN_API_TOKEN` 服务令牌）：
+`GET /api/admin/ip-bans`、`POST /api/admin/ip-ban {ip,minutes,reason}`（`minutes=0` 永久）、
+`POST /api/admin/ip-unban {ip}`、`POST /api/admin/risk/report {source:"ssh",events:[...]}`。
+
+说明：边缘封禁只拦该 IP 的 API 访问；主机层 SSH 封禁仍由两侧 fail2ban 执行（观测台服务无特权，
+不调用 `fail2ban-client`）。白名单优先级最高，手动封禁也会被拒绝。
+
 ## 已知行为差异 / 风险
 
 1. **KV 最终一致**：原 Durable Object 是强一致单点；KV 为最终一致。每日配额（票据 25 次/设备/天）在极端并发下可能少量超发；文件登记表在低频管理操作下实际无竞争。原 15 分钟孤儿回收窗口不受影响。

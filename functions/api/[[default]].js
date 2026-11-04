@@ -580,6 +580,7 @@ const SETTING_GROUPS = [
   { id: 'community', title: '社区内容', hint: '回声洞与反馈的每日额度，两者都会在 GitHub 仓库落提交' },
   { id: 'announce', title: '教室喊话', hint: '文本长度、在线注册表规模与限频' },
   { id: 'reputation', title: '设备信誉', hint: '按设备码计的上限：超限 429，封禁优先' },
+  { id: 'risk', title: '风险模型', hint: '模型推理、自动封禁、IP 白名单与 SSH 联动' },
   { id: 'license', title: '授权与激活', hint: '激活有效期、授权闸门与设备登记' },
   { id: 'admin', title: '后台与安全', hint: '会话时长、登录失败锁定' },
 ]
@@ -1021,6 +1022,103 @@ const SETTING_FIELDS = [
     def: () => Math.round(ADM_LOGIN_FAIL_WINDOW_MS / 60000),
     hint: '锁定时长与统计窗口一致，从最后一次失败开始算。',
   },
+  {
+    key: 'riskMlOn',
+    group: 'risk',
+    label: '模型推理',
+    type: 'bool',
+    def: (env) => riskEnvFlag(env, 'CSH_RISK_ML', true),
+    hint: '关闭后只用规则信号；模型管理、解释与本地巡检仍可用。',
+  },
+  {
+    key: 'riskAutoBan',
+    group: 'risk',
+    label: '模型自动封禁',
+    type: 'bool',
+    def: (env) => riskEnvFlag(env, 'CSH_RISK_AUTOBAN', true),
+    hint: '高置信请求在本次响应直接 429，并临时封禁来源 IP。',
+  },
+  {
+    key: 'riskMlAct',
+    group: 'risk',
+    label: '自动封禁最低模型分',
+    type: 'num',
+    min: 0.5,
+    max: 0.999,
+    def: (env) => riskEnvNum(env, 'CSH_RISK_ML_ACT', 0.9, 0.5, 0.999),
+    hint: '还需叠加至少一条强规则信号；调低会增加误封。',
+  },
+  {
+    key: 'riskBanBaseMin',
+    group: 'risk',
+    label: '首次封禁时长',
+    type: 'num',
+    min: 1,
+    max: 1440,
+    unit: '分钟',
+    def: (env) => riskEnvNum(env, 'CSH_RISK_AUTOBAN_MIN', 10, 1, 1440),
+    hint: '7 天内再犯按 3 倍递进，最长不超过下面的上限。',
+  },
+  {
+    key: 'riskBanMaxMin',
+    group: 'risk',
+    label: '封禁时长上限',
+    type: 'num',
+    min: 1,
+    max: 1440,
+    unit: '分钟',
+    def: (env) => riskEnvNum(env, 'CSH_RISK_AUTOBAN_MAX_MIN', 60, 1, 1440),
+    hint: '递进封禁的封顶值；手动封禁不受此限制。',
+  },
+  {
+    key: 'riskAllowIps',
+    group: 'risk',
+    label: '封禁白名单',
+    type: 'ips',
+    def: (env) => String(env.CSH_RISK_ALLOW_IPS || '').trim(),
+    hint: '精确 IP 或 IPv4 CIDR，逗号分隔。白名单最高优先，手动封禁也会被拒绝。',
+  },
+  {
+    key: 'riskSshBan',
+    group: 'risk',
+    label: 'SSH 失败联动封禁',
+    type: 'bool',
+    def: (env) => riskEnvFlag(env, 'CSH_RISK_SSH_BAN', true),
+    hint: '观测台上报的 SSH 失败量达标时，封禁该 IP 的 API 访问。',
+  },
+  {
+    key: 'riskSshHits',
+    group: 'risk',
+    label: 'SSH 失败次数阈值',
+    type: 'num',
+    min: 2,
+    max: 500,
+    unit: '次',
+    def: (env) => riskEnvNum(env, 'CSH_RISK_SSH_BAN_HITS', 8, 2, 500),
+    hint: '统计窗口内累计失败次数达到该值即封禁。',
+  },
+  {
+    key: 'riskSshBanMin',
+    group: 'risk',
+    label: 'SSH 联动封禁时长',
+    type: 'num',
+    min: 1,
+    max: 1440,
+    unit: '分钟',
+    def: (env) => riskEnvNum(env, 'CSH_RISK_SSH_BAN_MIN', 60, 1, 1440),
+    hint: 'SSH 攻击 IP 的 API 封禁时长。',
+  },
+  {
+    key: 'riskSshWindowMin',
+    group: 'risk',
+    label: 'SSH 统计窗口',
+    type: 'num',
+    min: 1,
+    max: 1440,
+    unit: '分钟',
+    def: (env) => Math.round(riskEnvNum(env, 'CSH_RISK_SSH_WINDOW_MS', 15 * 60000, 60000, 86400000) / 60000),
+    hint: '只统计最近这段时间内的 SSH 失败。',
+  },
 ]
 
 /**
@@ -1067,6 +1165,24 @@ function settingCoerce(field, raw) {
       return { ok: false, error: '取值不在允许范围内' }
     }
     return { ok: true, value: s }
+  }
+  if (field.type === 'ips') {
+    const s = String(raw ?? '').trim()
+    if (s.length > 512) return { ok: false, error: 'IP 列表太长了' }
+    const parts = s.split(',').map((x) => x.trim()).filter(Boolean)
+    for (const part of parts) {
+      const [base, bits] = part.split('/')
+      if (bits === undefined) {
+        if (riskIpv4Int(part) != null) continue
+        if (/^[0-9a-fA-F:.]{3,64}$/.test(part) && part.includes(':')) continue
+        return { ok: false, error: `IP 格式不正确：${part.slice(0, 32)}` }
+      }
+      const n = Number(bits)
+      if (riskIpv4Int(base) == null || !Number.isInteger(n) || n < 0 || n > 32) {
+        return { ok: false, error: `CIDR 格式不正确：${part.slice(0, 32)}` }
+      }
+    }
+    return { ok: true, value: parts.join(',') }
   }
   const s = String(raw ?? '').trim()
   if (s.length > 64) return { ok: false, error: '太长了' }
@@ -4471,29 +4587,132 @@ const RISK_PATH_CAP = 60
 const RISK_COMBO_GAP_MS = 15 * 60 * 1000
 const RISK_BACKFILL_KEY = 'lic:risk:backfill'
 
+// 自动封禁：模型高置信 + 规则佐证（或同一来源短时重复）才落封禁，
+// 默认开启，用环境变量调时长/阈值/白名单，不在代码里写死。
+const RISK_IP_BAN_PREFIX = 'lic:banip:'
+const RISK_IP_BAN_INDEX_KEY = 'lic:banip:idx'
+const RISK_IP_BAN_INDEX_CAP = 300
+const RISK_IP_BAN_RETAIN_MS = 7 * 86400000
+const RISK_ML_HIT_WINDOW_MS = 10 * 60 * 1000
+const RISK_ML_HIT_CAP = 40
+// 这些规则信号本身不足以判死刑，但足以佐证模型的高置信判断。
+const RISK_AUTOBAN_STRONG = [
+  'probe_path', 'sensitive_query', 'scanner_ua', 'headless_ua', 'script_ua', 'bad_method',
+  'bad_device_id', 'dl_probe', 'mirror_path', 'mirror_repo_probe', 'dl_range_abuse',
+  'header_abuse', 'missing_device',
+]
+
+function riskEnvFlag(env, name, fallback) {
+  const raw = String((env && env[name]) ?? '').trim().toLowerCase()
+  if (!raw) return fallback
+  if (['off', '0', 'false', 'no'].includes(raw)) return false
+  if (['on', '1', 'true', 'yes'].includes(raw)) return true
+  return fallback
+}
+
+function riskEnvNum(env, name, fallback, min, max) {
+  const n = Number((env && env[name]) ?? '')
+  if (!Number.isFinite(n)) return fallback
+  return Math.max(min, Math.min(max, n))
+}
+
+/** 生效配置：后台参数（KV）优先，环境变量只提供出厂值。 */
+function riskAutoBanCfg(env, S) {
+  const V = S || {}
+  const pick = (key, fallback) => (V[key] !== undefined && V[key] !== null ? V[key] : fallback)
+  const winMin = Number(V.riskSshWindowMin)
+  const cfg = {
+    on: pick('riskAutoBan', riskEnvFlag(env, 'CSH_RISK_AUTOBAN', true)),
+    mlOn: pick('riskMlOn', riskEnvFlag(env, 'CSH_RISK_ML', true)),
+    mlAct: pick('riskMlAct', riskEnvNum(env, 'CSH_RISK_ML_ACT', 0.9, 0.5, 0.999)),
+    baseMin: pick('riskBanBaseMin', riskEnvNum(env, 'CSH_RISK_AUTOBAN_MIN', 10, 1, 1440)),
+    maxMin: pick('riskBanMaxMin', riskEnvNum(env, 'CSH_RISK_AUTOBAN_MAX_MIN', 60, 1, 1440)),
+    sshOn: pick('riskSshBan', riskEnvFlag(env, 'CSH_RISK_SSH_BAN', true)),
+    sshHits: pick('riskSshHits', riskEnvNum(env, 'CSH_RISK_SSH_BAN_HITS', 8, 2, 500)),
+    sshMin: pick('riskSshBanMin', riskEnvNum(env, 'CSH_RISK_SSH_BAN_MIN', 60, 1, 1440)),
+    sshWindowMs: Number.isFinite(winMin) && winMin > 0
+      ? Math.max(60000, Math.min(86400000, Math.round(winMin * 60000)))
+      : riskEnvNum(env, 'CSH_RISK_SSH_WINDOW_MS', 15 * 60000, 60000, 86400000),
+    allow: String(pick('riskAllowIps', (env && env.CSH_RISK_ALLOW_IPS) || ''))
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean),
+  }
+  riskMlRuntimeOn = !!cfg.mlOn
+  return cfg
+}
+
+/** 白名单支持单个 IP 与 IPv4 CIDR；为空时不放行任何来源。 */
+function riskIpAllowlisted(env, ip, allow) {
+  const text = String(ip || '').trim()
+  if (!text) return false
+  const list = Array.isArray(allow) ? allow : riskAutoBanCfg(env).allow
+  for (const item of list) {
+    if (item === text) return true
+    const m = /^(\d{1,3}(?:\.\d{1,3}){3})\/(\d{1,2})$/.exec(item)
+    if (!m) continue
+    const bits = Number(m[2])
+    const a = riskIpv4Int(text)
+    const b = riskIpv4Int(m[1])
+    if (a == null || b == null || bits < 0 || bits > 32) continue
+    if (bits === 0) return true
+    const mask = bits === 32 ? 0xffffffff : (~((1 << (32 - bits)) - 1)) >>> 0
+    if ((a & mask) === (b & mask)) return true
+  }
+  return false
+}
+
+function riskIpv4Int(ip) {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(String(ip || ''))
+  if (!m) return null
+  const parts = m.slice(1).map(Number)
+  if (parts.some((n) => n > 255)) return null
+  return ((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]) >>> 0
+}
+
 // 单信号权重刻意都低于 RISK_HIGH，避免“一个指标就判死刑”。
 const RISK_WEIGHTS = {
   probe_path: 35,
+  ssh_brute: 32,
   banned_hit: 30,
   scanner_ua: 25,
   rate_limited: 25,
   auth_brute: 25,
+  dl_probe: 25,
+  mirror_path: 25,
   sensitive_query: 22,
+  oss_auth_fail: 22,
   bad_device_id: 20,
   bad_method: 20,
   path_sweep: 20,
+  oss_list_abuse: 20,
+  dl_sign_fail: 18,
   crawl_sweep: 15,
   header_abuse: 15,
   burst: 12,
   multi_probe: 12,
   headless_ua: 12,
+  oss_burst: 15,
+  dl_range_abuse: 15,
+  ssh_invalid_user: 14,
+  ssh_root_attempt: 14,
+  ssh_sudo_fail: 14,
+  oss_delete: 14,
+  mirror_repo_probe: 12,
   combo: 10,
   repeat_offender: 10,
   empty_ua: 10,
   script_ua: 10,
+  dl_hotlink: 8,
+  ssh_accepted: 8,
   missing_device: 8,
   bot_ua: 8,
   err4xx: 8,
+  oss_list: 4,
+  // 模型只作辅助证据：阈值以上给基础分，高置信再加一档，仍不足以单独判高风险。
+  ml_anomaly: 10,
+  ml_high: 18,
+  ml_repeat: 12,
 }
 
 const RISK_LABELS = {
@@ -4518,6 +4737,25 @@ const RISK_LABELS = {
   bot_ua: '爬虫/采集 UA',
   err4xx: '连续 4xx 错误',
   auth_brute: '后台登录爆破',
+  ssh_brute: 'SSH 密码爆破',
+  ssh_invalid_user: 'SSH 探测非法用户',
+  ssh_root_attempt: 'SSH 尝试 root 登录',
+  ssh_sudo_fail: 'SSH 提权失败',
+  ssh_accepted: 'SSH 登录成功',
+  oss_auth_fail: 'OSS 鉴权失败',
+  oss_list_abuse: 'OSS 高频列举',
+  oss_burst: 'OSS 请求洪峰',
+  oss_delete: 'OSS 删除操作',
+  oss_list: 'OSS 列举操作',
+  dl_probe: '下载接口探测',
+  dl_sign_fail: '下载签名校验失败',
+  dl_range_abuse: '异常 Range 请求',
+  dl_hotlink: '下载外链盗用',
+  mirror_path: '镜像路径穿越',
+  mirror_repo_probe: '镜像仓库探测',
+  ml_anomaly: '模型判定异常请求',
+  ml_high: '模型高置信异常',
+  ml_repeat: '模型高置信重复',
 }
 
 // 由引擎根据上下文推导，不接受请求特征直接注入。
@@ -4599,9 +4837,130 @@ function riskMethodSignal(method) {
   return ['GET', 'HEAD', 'POST', 'OPTIONS'].includes(m) ? {} : { bad_method: m }
 }
 
+// 分面识别：同一组请求特征在不同接口面上含义不同。下载面看签名/Range/外链，
+// OSS 面看签发/列举/删除/鉴权失败，镜像面看目标地址与仓库路径，站点面沿用通用探测。
+const RISK_SURFACE = new Map([
+  ['/api/dl', 'download'],
+  ['/api/dl-ticket', 'download'],
+  ['/api/icon', 'download'],
+  ['/api/link', 'download'],
+  ['/api/oss-sign', 'oss'],
+  ['/api/oss-check', 'oss'],
+  ['/api/files', 'oss'],
+  ['/api/purge', 'oss'],
+  ['/api/promote', 'oss'],
+  ['/api/gc', 'oss'],
+  ['/api/dl-mode', 'oss'],
+  ['/api/mirror-sign', 'mirror'],
+  ['/api/registry-sync', 'mirror'],
+  ['/api/submit', 'site'],
+  ['/api/feedback', 'site'],
+  ['/api/echocave', 'site'],
+  ['/api/status', 'site'],
+])
+
+function riskSurfaceOf(pathname) {
+  const p = String(pathname || '')
+  const hit = RISK_SURFACE.get(p)
+  if (hit) return hit
+  if (p.startsWith('/api/admin/')) return 'admin'
+  return p.startsWith('/api/') ? 'other' : ''
+}
+
+/** 日志里带服务标识时以服务为准：github-dl=下载，oss=OSS，github-site/gh-mirror=镜像。 */
+function riskSurfaceOfEvent(ev) {
+  const service = String((ev && ev.service) || '')
+  if (service === 'github-dl') return 'download'
+  if (service === 'oss') return 'oss'
+  if (service === 'github-site' || service === 'github-mirror' || service === 'gh-mirror') return 'mirror'
+  return riskSurfaceOf(ev && ev.path)
+}
+
+// 同站判定用后两级域名（classsoftwarehub.cn / 132614.xyz），够用且不需要 PSL。
+function riskRootHost(host) {
+  const parts = String(host || '').toLowerCase().split('.').filter(Boolean)
+  return parts.length <= 2 ? parts.join('.') : parts.slice(-2).join('.')
+}
+
+function riskRefererSignal(referer, host) {
+  if (!referer) return {}
+  let ref
+  try { ref = new URL(referer) } catch { return { dl_hotlink: 'bad-referer' } }
+  if (ref.protocol !== 'https:' && ref.protocol !== 'http:') return {}
+  const a = riskRootHost(ref.hostname)
+  const b = riskRootHost(host)
+  if (!a || !b || a === b) return {}
+  return { dl_hotlink: ref.hostname.slice(0, 60) }
+}
+
+function riskRangeSignal(range) {
+  const text = String(range || '')
+  if (!text) return {}
+  const parts = text.split(',').length
+  return parts > 8 ? { dl_range_abuse: `${parts} 段` } : {}
+}
+
+const RISK_INTERNAL_TARGET_RE = /(?:^|[/@:])(?:127\.0\.0\.1|localhost|0\.0\.0\.0|169\.254\.169\.254|10\.\d|192\.168\.\d|172\.(?:1[6-9]|2\d|3[01])\.|\[::1\])|(?:^|\/)\.\.(?:\/|$)/i
+const RISK_GITHUB_HOST_RE = /(?:^|\.)(?:github\.com|githubusercontent\.com|codeload\.github\.com)$/i
+
+/** 下载/镜像面的目标参数：内网地址或穿越路径是明确的探测行为。 */
+function riskTargetSignals(surface, search) {
+  const out = {}
+  let params
+  try { params = new URLSearchParams(search) } catch { return out }
+  const raw = params.get('url') || params.get('target') || params.get('key') || params.get('path') || ''
+  if (!raw) return out
+  let decoded = raw
+  try { decoded = decodeURIComponent(raw) } catch {}
+  if (RISK_INTERNAL_TARGET_RE.test(decoded)) {
+    if (surface === 'download') out.dl_probe = decoded.slice(0, 80)
+    else if (surface === 'mirror') out.mirror_path = decoded.slice(0, 80)
+  }
+  if (surface === 'mirror' && params.get('url')) {
+    try {
+      const u = new URL(raw)
+      if (u.protocol !== 'https:' && u.protocol !== 'http:') out.mirror_repo_probe = raw.slice(0, 80)
+      else if (!RISK_GITHUB_HOST_RE.test(u.hostname)) out.mirror_repo_probe = `${u.hostname}${u.pathname}`.slice(0, 80)
+    } catch {
+      out.mirror_repo_probe = raw.slice(0, 80)
+    }
+  }
+  return out
+}
+
+/** 按接口面补充请求特征；返回额外信号，不改动通用信号。 */
+function riskSurfaceSignals(surface, request, url) {
+  if (!surface) return {}
+  if (surface === 'download') {
+    const out = { ...riskRangeSignal(request.headers.get('range')), ...riskRefererSignal(request.headers.get('referer'), url.host) }
+    if (url.pathname === '/api/dl') {
+      const p = url.searchParams
+      if (!p.get('s') || !p.get('e') || !p.get('h') || !p.get('f')) out.dl_probe = '缺少签名参数'
+    }
+    return { ...out, ...riskTargetSignals(surface, url.search) }
+  }
+  if (surface === 'oss') {
+    // 签发/列举类接口没有 body 可看，请求方法与查询参数就是全部特征。
+    const out = {}
+    if (url.pathname === '/api/files' && (url.searchParams.get('source') === 'bucket' || url.searchParams.get('all') === '1')) {
+      out.oss_list = (url.searchParams.get('prefix') || '*').slice(0, 80)
+    }
+    const key = url.searchParams.get('k') || url.searchParams.get('key') || ''
+    if (key && RISK_INTERNAL_TARGET_RE.test(key)) out.dl_probe = key.slice(0, 80)
+    return out
+  }
+  if (surface === 'mirror') return riskTargetSignals(surface, url.search)
+  return {}
+}
+
 /** 只读取请求本身的特征，不产生存储写入。 */
 function riskSignalsOf(request, url) {
-  const out = { ...riskPathSignals(url.pathname, url.search), ...riskUaSignal(request.headers.get('user-agent')) }
+  const surface = riskSurfaceOf(url.pathname)
+  const out = {
+    ...riskPathSignals(url.pathname, url.search),
+    ...riskUaSignal(request.headers.get('user-agent')),
+    ...riskSurfaceSignals(surface, request, url),
+  }
   Object.assign(out, riskMethodSignal(request.method))
 
   let headerCount = 0
@@ -4622,11 +4981,497 @@ function riskSignalsOf(request, url) {
 
 /** 历史日志只有字段没有 Request 对象，用同一套规则还原信号。 */
 function riskHistSignalsOfEvent(ev) {
+  const surface = riskSurfaceOfEvent(ev)
   const out = { ...riskPathSignals(ev.path, ev.query), ...riskUaSignal(ev.ua) }
   Object.assign(out, riskMethodSignal(ev.method))
   const status = Number(ev.status) || 0
   if ([401, 403, 404, 405].includes(status)) out.err4xx = status
+  if (surface === 'download') {
+    if (status === 401 || status === 403) out.dl_sign_fail = status
+    const target = String(ev.target || ev.path || '')
+    if (RISK_PROBE_RE.test(target)) out.dl_probe = target.slice(0, 80)
+    if (ev.op === 'range-many') out.dl_range_abuse = String(ev.path || '').slice(0, 80)
+    if (ev.op === 'hotlink') out.dl_hotlink = String(ev.path || '').slice(0, 80)
+  } else if (surface === 'oss') {
+    if (status === 401 || status === 403) out.oss_auth_fail = status
+    if (String(ev.method || '').toUpperCase() === 'DELETE') out.oss_delete = String(ev.path || '').slice(0, 80)
+    if (ev.op === 'list' || /[?&](?:list-type=2|prefix=|delimiter=|marker=)/.test(String(ev.path || ''))) {
+      out.oss_list = String(ev.path || '').slice(0, 80)
+    }
+  } else if (surface === 'mirror') {
+    const target = String(ev.path || ev.target || '')
+    if (RISK_PROBE_RE.test(target)) out.mirror_path = target.slice(0, 80)
+    if (status >= 400 && status < 500 && (/^\/[^/]+\/[^/]+\//.test(target) || /\.git/.test(target))) {
+      out.mirror_repo_probe = `${status} ${target}`.slice(0, 80)
+    }
+  }
+  const ml = riskMlSignalsWithModel(riskMlCachedModel(), riskMlHistEvent(ev, surface))
+  Object.assign(out, ml)
   return out
+}
+
+// ── 轻量请求风险模型（特征哈希 + 逻辑回归）────────────────────────────
+// 与 tools/train-risk-model.mjs 共用同一套 token/向量化规则（RISK_ML_FEATURE 固定版本号）。
+// 模型存在 KV（lic:risk:model），运行时只读、按 60 秒缓存；模型缺失或损坏时规则引擎照常工作。
+// 权重刻意压得比规则信号低：单靠模型不足以判高风险，只作为叠加证据。
+const RISK_MODEL_KEY = 'lic:risk:model'
+const RISK_ML_FEATURE = 'risk-request-v2'
+const RISK_ML_DIM_MAX = 4096
+const RISK_ML_CACHE_MS = 60 * 1000
+const RISK_ML_RETRY_MS = 5 * 60 * 1000
+const RISK_ML_MAX_JSON = 8 * 1024 * 1024
+const RISK_ML_KNOWN_HOSTS = new Set([
+  'classsoftwarehub.cn', 'www.classsoftwarehub.cn', 'download.classsoftwarehub.cn',
+  'api.classsoftwarehub.cn', 'submit.132614.xyz', '132614.xyz', 'xfane.com',
+  '209.33.174.187', '8.159.148.101', '127.0.0.1', 'localhost',
+])
+const RISK_ML_PATH_KEYWORDS = [
+  '.env', '.git', 'wp-admin', 'wp-login', 'wp-content', 'xmlrpc', 'phpmyadmin', 'adminer',
+  'cgi-bin', 'actuator', 'swagger', 'graphql', 'console', 'manager', 'admin', 'login',
+  'config', 'backup', 'database', 'dump', 'passwd', 'shadow', 'secret', 'token', 'shell',
+  'webshell', 'vendor', 'debug', 'test', 'upload', 'install', 'setup', 'private',
+]
+const RISK_ML_SENSITIVE_QUERY = [
+  'url', 'file', 'path', 'cmd', 'exec', 'command', 'redirect', 'token', 'key', 'secret',
+  'password', 'passwd', 'callback', 'next',
+]
+const RISK_ML_ASSET_EXT = new Set(['js', 'css', 'png', 'jpg', 'jpeg', 'gif', 'svg', 'ico', 'woff', 'woff2', 'ttf', 'map', 'webp', 'avif'])
+const RISK_ML_LEN_EDGES = [0, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096]
+const RISK_ML_RANGE_START_EDGES = [0, 1048576, 16777216, 268435456, 4294967296]
+// 模型训练自服务器访问日志，csh-api 只看到 /api/* 路径，分布有差异。
+// 因此模型分只作为“高置信才动作、普通请求不入库”的辅助证据，由 workerFetch 统一判定。
+let riskMlCache = { at: 0, failedAt: 0, model: null }
+// 后台可整体关闭模型推理；回溯与实时共用同一开关（隔离实例内 15 秒内收敛）。
+let riskMlRuntimeOn = true
+
+function riskMlHash(str) {
+  let h = 0x811c9dc5
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i)
+    h = Math.imul(h, 0x01000193) >>> 0
+  }
+  return h >>> 0
+}
+
+function riskMlIndex(tok, dim) {
+  return riskMlHash(tok) % dim
+}
+
+function riskMlLenBucket(n, edges = RISK_ML_LEN_EDGES) {
+  for (let i = 1; i < edges.length; i++) if (n < edges[i]) return `${edges[i - 1]}-${edges[i]}`
+  return `>=${edges[edges.length - 1]}`
+}
+
+function riskMlCountBucket(n) {
+  if (n <= 0) return '0'
+  if (n === 1) return '1'
+  if (n === 2) return '2'
+  if (n <= 4) return '3-4'
+  if (n <= 8) return '5-8'
+  if (n <= 16) return '9-16'
+  if (n <= 32) return '17-32'
+  return '>32'
+}
+
+function riskMlRatioBucket(part, total) {
+  if (!total) return '0'
+  const r = part / total
+  if (!part) return '0'
+  if (r < 0.1) return '<10%'
+  if (r < 0.25) return '<25%'
+  if (r < 0.5) return '<50%'
+  if (r < 0.75) return '<75%'
+  return '>=75%'
+}
+
+function riskMlSafeExt(p) {
+  const m = /\.([A-Za-z0-9]{1,8})$/.exec(p)
+  return m ? m[1].toLowerCase() : ''
+}
+
+function riskMlNormSeg(seg) {
+  return String(seg || '').toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 24)
+}
+
+function riskMlUaClass(ua) {
+  const s = String(ua || '').toLowerCase()
+  if (!s) return { cls: 'empty', vendor: '' }
+  if (/sqlmap|nikto|nmap|masscan|zgrab|nuclei|acunetix|nessus|w3af|dirbuster|gobuster|ffuf|feroxbuster|wpscan|xsstrike|commix|visionheight|zern-scanner|l9scan|leakix|censys|shodan|expanse|palo alto|cortex-xpanse|binaryedge|netlas|onyphe|internet-measurement|securitytrails|driftnet|\bscan(?:ner)?\b/.test(s)) return { cls: 'scanner', vendor: '' }
+  if (/python-requests|python-urllib|aiohttp|httpx|scrapy/.test(s)) return { cls: 'python', vendor: '' }
+  if (/curl\//.test(s)) return { cls: 'curl', vendor: '' }
+  if (/wget\//.test(s)) return { cls: 'wget', vendor: '' }
+  if (/^git\/|git\/\d/.test(s)) return { cls: 'git', vendor: '' }
+  if (/docker\/|containerd|skopeo|podman/.test(s)) return { cls: 'container', vendor: '' }
+  if (/npm\/|yarn\/|pnpm\/|pip\/|cargo\/|composer\//.test(s)) return { cls: 'pkg', vendor: '' }
+  if (/go-http-client|golang/.test(s)) return { cls: 'go', vendor: '' }
+  if (/okhttp|java\/|httpclient|apache-httpclient/.test(s)) return { cls: 'java', vendor: '' }
+  if (/node-fetch|axios|undici/.test(s)) return { cls: 'node', vendor: '' }
+  if (/bot|crawler|spider|headlesschrome|phantomjs/.test(s)) return { cls: 'bot', vendor: '' }
+  if (/mozilla|chrome|safari|firefox|edg\/|opr\//.test(s)) {
+    const mobile = /mobile|android|iphone|ipad|harmonyos/.test(s) ? 'mobile' : 'desktop'
+    const vendor = /edg\//.test(s) ? 'edge' : /firefox/.test(s) ? 'firefox' : /opr\//.test(s) ? 'opera' : /chrome/.test(s) ? 'chrome' : 'safari'
+    return { cls: `browser-${mobile}`, vendor }
+  }
+  return { cls: 'other', vendor: '' }
+}
+
+function riskMlRefClass(referer) {
+  const s = String(referer || '').trim()
+  if (!s) return 'none'
+  try {
+    const u = new URL(s)
+    if (u.hostname === '127.0.0.1' || u.hostname === 'localhost') return 'local'
+    if (RISK_ML_KNOWN_HOSTS.has(u.hostname.toLowerCase())) return 'known'
+    return 'external'
+  } catch { return 'bad' }
+}
+
+function riskMlAcceptClass(accept) {
+  const s = String(accept || '').toLowerCase()
+  if (!s) return 'none'
+  if (s.includes('text/html')) return 'html'
+  if (s.includes('application/json')) return 'json'
+  if (s.includes('image/')) return 'image'
+  if (s.includes('application/octet-stream') || s.includes('application/zip') || s.includes('application/x-')) return 'binary'
+  if (s.includes('text/event-stream')) return 'stream'
+  if (s.includes('text/')) return 'text'
+  if (s.includes('*/*')) return 'any'
+  return 'other'
+}
+
+function riskMlRangeClass(range) {
+  const s = String(range || '').trim().toLowerCase()
+  if (!s) return 'none'
+  if (s.includes(',')) return 'multi'
+  const m = /^bytes=(\d*)-(\d*)$/.exec(s)
+  if (!m) return 'bad'
+  if (!m[1] && m[2]) return 'suffix'
+  if (m[1] && !m[2]) return 'open'
+  const start = Number(m[1])
+  const end = Number(m[2])
+  if (Number.isFinite(end) && end - start > 100 * 1024 * 1024) return 'huge'
+  return 'single'
+}
+
+function riskMlRangeStart(range) {
+  const m = /^bytes=(\d+)-/.exec(String(range || '').trim())
+  return m ? Number(m[1]) : 0
+}
+
+function riskMlHostClass(host) {
+  const h = String(host || '').toLowerCase().split(':')[0]
+  if (!h) return 'none'
+  return RISK_ML_KNOWN_HOSTS.has(h) ? 'known' : 'other'
+}
+
+function riskMlPathTraits(p) {
+  const s = String(p || '')
+  const lower = s.toLowerCase()
+  const out = []
+  if (lower.includes('..') || lower.includes('%2e%2e') || lower.includes('%252e')) out.push('traversal')
+  if (lower.includes('%00') || lower.includes('\0')) out.push('nullbyte')
+  if (/\/\//.test(s)) out.push('doubleslash')
+  if (lower.includes('${') || lower.includes('jndi')) out.push('jndi')
+  const enc = (s.match(/%[0-9a-f]{2}/gi) || []).length
+  out.push(`enc:${riskMlCountBucket(enc)}`)
+  out.push(`dig:${riskMlRatioBucket((s.match(/\d/g) || []).length, s.length)}`)
+  out.push(`up:${riskMlRatioBucket((s.match(/[A-Z]/g) || []).length, s.length)}`)
+  out.push(`sp:${riskMlCountBucket((s.match(/[^A-Za-z0-9/._~-]/g) || []).length)}`)
+  out.push(`dot:${riskMlCountBucket((s.match(/\./g) || []).length)}`)
+  return out
+}
+
+/** ev = {service, method, path, query, headers, host, http}；headers 用小写键。 */
+function riskMlTokens(ev) {
+  const method = String(ev.method || 'GET').toUpperCase()
+  const service = ['download', 'oss', 'mirror', 'site'].includes(ev.service) ? ev.service : 'site'
+  const rawPath = String(ev.path || '/')
+  const query = String(ev.query || '').replace(/^\?/, '')
+  const headers = ev.headers || {}
+  const ua = headers['user-agent'] || headers['User-Agent'] || ''
+  const referer = headers.referer || headers.Referer || ''
+  const accept = headers.accept || headers.Accept || ''
+  const range = headers.range || headers.Range || ''
+  const xff = headers['x-forwarded-for'] || headers['X-Forwarded-For'] || ''
+  const host = ev.host || headers.host || headers.Host || ''
+  const proto = ev.proto || headers['x-forwarded-proto'] || ''
+  const httpVer = ev.http || headers[':version'] || ''
+
+  const tokens = [`svc:${service}`, `m:${method}`, `ms:${method}:${service}`]
+  const pathOnly = rawPath.split('?')[0] || '/'
+  const segs = pathOnly.split('/').filter(Boolean)
+  const lowerPath = pathOnly.toLowerCase()
+  const ext = riskMlSafeExt(lowerPath)
+
+  tokens.push(`plen:${riskMlLenBucket(pathOnly.length)}`)
+  tokens.push(`pdepth:${Math.min(12, segs.length)}`)
+  tokens.push(`pext:${ext || 'none'}`)
+  if (!segs.length) tokens.push('proot')
+  if (RISK_ML_ASSET_EXT.has(ext)) tokens.push('passet')
+  if (segs.length) tokens.push(`pfirst:${riskMlNormSeg(segs[0]) || 'empty'}`)
+  if (segs.length > 1) tokens.push(`plast:${riskMlNormSeg(segs[segs.length - 1]) || 'empty'}`)
+  if (segs[0] === 'gh') {
+    tokens.push('pgh')
+    if (segs[1]) tokens.push(`pgh2:${riskMlNormSeg(segs[1])}`)
+    if (segs[1] === 'api' || segs[1] === 'api.github.com') tokens.push('pghapi')
+  }
+  if (segs[0] === 'api' && segs[1]) tokens.push(`papi2:${riskMlNormSeg(segs[1])}`)
+  for (const kw of RISK_ML_PATH_KEYWORDS) if (lowerPath.includes(kw)) tokens.push(`pk:${kw}`)
+  for (const t of riskMlPathTraits(pathOnly)) tokens.push(`pt:${t}`)
+  if (/\/api(\/|$)/.test(lowerPath)) tokens.push('papi')
+  if (/\/(login|signin|signup|register|auth)(\/|$)/.test(lowerPath)) tokens.push('pauth')
+  if (segs.length) {
+    const last = segs[segs.length - 1]
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(last)) tokens.push('puuid')
+    else if (/^[0-9a-f]{32,128}$/i.test(last)) tokens.push('phex')
+    else if (/^\d{1,12}$/.test(last)) tokens.push('pnum')
+    else if (last.startsWith('.')) tokens.push('pdotfile')
+    else if (last.length >= 24 && /[a-z]/i.test(last) && /\d/.test(last)) tokens.push('prand')
+  }
+
+  let qp = null
+  try { qp = new URLSearchParams(query) } catch {}
+  const qkeys = qp ? Array.from(new Set(qp.keys())) : []
+  let qpairs = 0
+  tokens.push(`qkeys:${riskMlCountBucket(qkeys.length)}`)
+  tokens.push(`qlen:${riskMlLenBucket(query.length)}`)
+  for (const k of qkeys.slice(0, 8)) tokens.push(`qk:${riskMlNormSeg(k) || 'empty'}`)
+  for (const k of RISK_ML_SENSITIVE_QUERY) if (qkeys.includes(k)) tokens.push(`qsens:${k}`)
+  if (qp) {
+    for (const [k, v] of qp) {
+      qpairs++
+      const val = String(v || '')
+      if (/^https?:\/\//i.test(val)) tokens.push('qhttp')
+      if (val.includes('..')) tokens.push('qtraversal')
+      if (/<script|javascript:|onerror=/i.test(val)) tokens.push('qxss')
+      if (val.length > 200) tokens.push('qverylong')
+      if (RISK_ML_SENSITIVE_QUERY.includes(k) && /^[A-Za-z0-9+/=_-]{16,}$/.test(val)) tokens.push('qopaque')
+      if (k === 'url' || k === 'redirect' || k === 'next') tokens.push(`qredirect:${riskMlRefClass(val)}`)
+      if (/^\d+$/.test(val)) tokens.push('qnum')
+      if (/^[0-9a-f]{16,}$/i.test(val)) tokens.push('qhex')
+      if (/^eyJ[A-Za-z0-9_-]{8,}/.test(val)) tokens.push('qjwt')
+      if (val.includes('/')) tokens.push('qpath')
+      if (/\s/.test(val)) tokens.push('qspace')
+      if (/['"]/.test(val)) tokens.push('qquote')
+      if (/[<>]/.test(val)) tokens.push('qangle')
+      if (/[;|`]/.test(val)) tokens.push('qshell')
+    }
+  }
+  tokens.push(`qpairs:${riskMlCountBucket(qpairs)}`)
+  if (qpairs > qkeys.length) tokens.push('qdup')
+  if (qkeys.length) tokens.push(`qset:${qkeys.slice(0, 4).map(riskMlNormSeg).filter(Boolean).sort().join('+')}`)
+
+  const uaInfo = riskMlUaClass(ua)
+  tokens.push(`ua:${uaInfo.cls}`)
+  if (uaInfo.vendor) tokens.push(`uav:${uaInfo.vendor}`)
+  tokens.push(`ualen:${riskMlLenBucket(String(ua).length)}`)
+  tokens.push(`ref:${riskMlRefClass(referer)}`)
+  tokens.push(`accept:${riskMlAcceptClass(accept)}`)
+  tokens.push(`range:${riskMlRangeClass(range)}`)
+  const rs = riskMlRangeStart(range)
+  if (rs) tokens.push(`rstart:${riskMlLenBucket(rs, RISK_ML_RANGE_START_EDGES)}`)
+  const hops = xff ? String(xff).split(',').filter(Boolean).length : 0
+  tokens.push(`xff:${riskMlCountBucket(hops)}`)
+  if (headers.authorization || headers.Authorization) tokens.push('h:auth')
+  if (headers.cookie || headers.Cookie) tokens.push('h:cookie')
+  if (headers.origin || headers.Origin) tokens.push('h:origin')
+  if (headers['content-type'] || headers['Content-Type']) tokens.push('h:ctype')
+  tokens.push(`host:${riskMlHostClass(host)}`)
+  if (proto) tokens.push(`proto:${String(proto).toLowerCase() === 'https' ? 'https' : 'http'}`)
+  if (httpVer) tokens.push(`http:${String(httpVer).replace(/[^0-9.]/g, '').slice(0, 4)}`)
+  return tokens
+}
+
+/**
+ * 稀疏计数：同一 token 落桶后最多计 3 次，再按 L2 归一化。
+ * 与训练器的向量空间一致，但运行时不再为 4096 维分配稠密数组——
+ * 单次请求通常只有 25~35 个 token，直接累加点积即可；ECS 上批量回溯同样受益。
+ */
+function riskMlCounts(tokens, dim) {
+  const counts = new Map()
+  for (const t of tokens) {
+    const i = riskMlIndex(t, dim)
+    const c = counts.get(i) || 0
+    if (c < 3) counts.set(i, c + 1)
+  }
+  return counts
+}
+
+function riskMlSparseScore(model, tokens) {
+  const counts = riskMlCounts(tokens, model.dim)
+  let norm2 = 0
+  for (const c of counts.values()) norm2 += c * c
+  const norm = Math.sqrt(norm2) || 1
+  let z = model.bias
+  for (const [i, c] of counts) {
+    const w = model.weights[i]
+    if (w) z += w * (c / norm)
+  }
+  return { counts, norm, z }
+}
+
+/** 只接受与训练器同版本的稀疏权重模型；任何不合规字段都整份拒绝。 */
+function riskMlCompile(raw) {
+  if (!raw || typeof raw !== 'object') return null
+  if (Number(raw.v) !== 1) return null
+  if (String(raw.feature || '') !== RISK_ML_FEATURE) return null
+  const dim = Math.floor(Number(raw.dim) || 0)
+  if (dim < 64 || dim > RISK_ML_DIM_MAX) return null
+  const list = Array.isArray(raw.weights) ? raw.weights : []
+  if (!list.length || list.length > dim) return null
+  const weights = new Float32Array(dim)
+  let nonzero = 0
+  for (const row of list) {
+    if (!Array.isArray(row) || row.length !== 2) continue
+    const i = Math.floor(Number(row[0]))
+    const w = Number(row[1])
+    if (!(i >= 0 && i < dim) || !Number.isFinite(w)) continue
+    weights[i] = w
+    if (w) nonzero++
+  }
+  if (!nonzero) return null
+  const bias = Number(raw.bias)
+  if (!Number.isFinite(bias)) return null
+  const threshold = Math.min(0.99, Math.max(0.01, Number(raw.threshold) || 0.5))
+  const highRaw = Number(raw.high)
+  const high = Math.min(0.99, Math.max(threshold, Number.isFinite(highRaw) && highRaw > 0 ? highRaw : threshold + 0.15))
+  return {
+    v: 1,
+    feature: RISK_ML_FEATURE,
+    dim,
+    bias,
+    threshold,
+    high,
+    weights,
+    createdAt: String(raw.createdAt || ''),
+    samples: raw.samples && typeof raw.samples === 'object' ? raw.samples : null,
+    metrics: raw.metrics && typeof raw.metrics === 'object' ? raw.metrics : null,
+    nonzero,
+  }
+}
+
+async function riskMlModel() {
+  const now = Date.now()
+  if (riskMlCache.model && now - riskMlCache.at < RISK_ML_CACHE_MS) return riskMlCache.model
+  if (!riskMlCache.model && riskMlCache.failedAt && now - riskMlCache.failedAt < RISK_ML_RETRY_MS) return null
+  riskMlCache.at = now
+  try {
+    const kv = await gateKv()
+    if (!kv) {
+      riskMlCache.failedAt = now
+      return riskMlCache.model
+    }
+    const model = riskMlCompile(await kvJson(kv, RISK_MODEL_KEY))
+    if (model) {
+      riskMlCache.model = model
+      riskMlCache.failedAt = 0
+    } else {
+      riskMlCache.failedAt = now
+    }
+    return model || riskMlCache.model
+  } catch {
+    riskMlCache.failedAt = now
+    return riskMlCache.model
+  }
+}
+
+/** 历史回溯是同步循环，直接用最近一次加载的模型；未加载过就跳过。 */
+function riskMlCachedModel() {
+  if (!riskMlRuntimeOn) return null
+  return riskMlCache.model && Date.now() - riskMlCache.at < RISK_ML_CACHE_MS ? riskMlCache.model : null
+}
+
+function riskMlRequestEvent(request, url) {
+  const headers = {}
+  try {
+    for (const [k, v] of request.headers) headers[String(k).toLowerCase()] = String(v).slice(0, 1024)
+  } catch {}
+  return {
+    service: riskSurfaceOf(url.pathname) || 'site',
+    method: request.method,
+    path: url.pathname.slice(0, 512),
+    query: url.search.replace(/^\?/, '').slice(0, 512),
+    headers,
+    host: url.host,
+    http: headers[':version'] || '',
+  }
+}
+
+function riskMlHistEvent(ev, surface) {
+  const headers = {
+    'user-agent': ev.ua || '',
+    referer: ev.referer || '',
+    range: ev.range || '',
+    accept: ev.accept || '',
+    'x-forwarded-for': ev.xff || '',
+    host: ev.host || '',
+  }
+  return {
+    service: surface || 'site',
+    method: ev.method || 'GET',
+    path: String(ev.path || '/').slice(0, 512),
+    query: String(ev.query || '').replace(/^\?/, '').slice(0, 512),
+    headers,
+    host: ev.host || '',
+    http: ev.http || '',
+  }
+}
+
+/** 同步打分：返回 {p, signals, tokens}；纯内存，不读写存储。 */
+function riskMlAssess(model, ev) {
+  if (!model) return { p: 0, signals: {}, tokens: [] }
+  const tokens = riskMlTokens(ev)
+  const { counts, norm, z } = riskMlSparseScore(model, tokens)
+  const p = z >= 0 ? 1 / (1 + Math.exp(-z)) : Math.exp(z) / (1 + Math.exp(z))
+  if (p < model.threshold) return { p, signals: {}, tokens }
+  const byIndex = new Map()
+  for (const t of tokens) {
+    const i = riskMlIndex(t, model.dim)
+    if (!byIndex.has(i)) byIndex.set(i, t)
+  }
+  const hits = []
+  for (const [i, c] of counts) {
+    const w = model.weights[i]
+    if (w > 0) hits.push([byIndex.get(i) || `#${i}`, w * (c / norm)])
+  }
+  hits.sort((a, b) => b[1] - a[1])
+  const ex = `${p.toFixed(3)}${hits.length ? ' ' + hits.slice(0, 3).map((h) => h[0]).join(',') : ''}`.slice(0, 80)
+  const signals = { ml_anomaly: ex }
+  if (p >= model.high) signals.ml_high = ex
+  return { p, signals, tokens }
+}
+
+/** 返回 {ml_anomaly[, ml_high]}；值附带最高贡献 token，方便后台解释。 */
+function riskMlSignalsWithModel(model, ev) {
+  try {
+    return riskMlAssess(model, ev).signals
+  } catch {
+    return {}
+  }
+}
+
+/** 后台/测试用：返回分数、命中信号和特征 token，不写存储。 */
+function riskMlExplain(model, ev) {
+  const tokens = riskMlTokens(ev)
+  const { counts, norm, z } = riskMlSparseScore(model, tokens)
+  const p = z >= 0 ? 1 / (1 + Math.exp(-z)) : Math.exp(z) / (1 + Math.exp(z))
+  const contrib = []
+  for (const [i, c] of counts) {
+    const w = model.weights[i]
+    if (!w) continue
+    contrib.push([i, Math.round(w * (c / norm) * 1e6) / 1e6])
+  }
+  contrib.sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]))
+  const byIndex = new Map()
+  for (const t of tokens) if (!byIndex.has(riskMlIndex(t, model.dim))) byIndex.set(riskMlIndex(t, model.dim), t)
+  return {
+    score: Math.round(p * 1e6) / 1e6,
+    threshold: model.threshold,
+    high: model.high,
+    signals: riskMlSignalsWithModel(model, ev),
+    tokens,
+    top: contrib.slice(0, 12).map(([i, v]) => ({ token: byIndex.get(i) || `#${i}`, value: v })),
+  }
 }
 
 // 同一键、同一组信号在 30 秒内只写一次；出现新信号（例如先探测、后扫描器）立即补写。
@@ -4868,10 +5713,11 @@ async function riskHistApplyMany(kv, kind, key, id, events, meta) {
     if (droppedBefore && ts <= droppedBefore) { skipped++; continue }
     hid[eh] = ts
     const sigs = ev._signals || riskHistSignalsOfEvent(ev)
+    const weight = Math.max(1, Math.min(500, Number(ev.n) || 1))
     for (const [name, info] of Object.entries(sigs)) {
       if (!RISK_WEIGHTS[name]) continue
       const e = hb[name] || { n: 0, first: ts, last: ts }
-      e.n = Math.min(999, (Number(e.n) || 0) + 1)
+      e.n = Math.min(999, (Number(e.n) || 0) + weight)
       e.first = Math.min(Number(e.first) || ts, ts)
       e.last = Math.max(Number(e.last) || 0, ts)
       if (typeof info === 'string' && info) e.ex = String(info).slice(0, 80)
@@ -4968,10 +5814,246 @@ async function riskObserve(request, env, signals, extra, force) {
       if (known && alive(known)) await riskApply(kv, 'd', device, device, all, meta)
     }
     if (ip && ip !== 'unknown') {
-      const key = (await sha256Hex(ip)).slice(0, 24)
-      await riskApply(kv, 'i', key, ip, all, meta)
+      const key = await riskIpHash(ip)
+      if (key) await riskApply(kv, 'i', key, ip, all, meta)
     }
   } catch {}
+}
+
+// ── IP 临时封禁与模型即时处置 ─────────────────────────────────────────
+// 模型在请求路径内同步打分；高置信且被规则佐证（或短时重复）时立即封禁，
+// 下一个请求起由 ipGuard 直接 429。所有时长/阈值/白名单都可由环境变量覆盖。
+const riskIpHashCache = new Map()
+const riskIpBanCache = new Map()
+const RISK_IP_BAN_CACHE_MS = 15 * 1000
+const riskMlHits = new Map()
+
+function riskIpHash(ip) {
+  const key = String(ip || '')
+  if (!key) return Promise.resolve('')
+  const hit = riskIpHashCache.get(key)
+  if (hit) return hit
+  const task = sha256Hex(key).then((h) => h.slice(0, 24)).catch(() => '')
+  riskIpHashCache.set(key, task)
+  if (riskIpHashCache.size > 2000) {
+    for (const k of riskIpHashCache.keys()) {
+      if (riskIpHashCache.size <= 1500) break
+      riskIpHashCache.delete(k)
+    }
+  }
+  return task
+}
+
+/** 记录同一 IP 的高置信命中；路径数用于区分“单次误报”和“持续探测”。 */
+function riskMlNote(ip, path, now) {
+  const key = String(ip || '')
+  if (!key || key === 'unknown') return { n: 0, paths: 0 }
+  let entry = riskMlHits.get(key)
+  if (!entry || now - entry.at > RISK_ML_HIT_WINDOW_MS) {
+    entry = { at: now, n: 0, paths: new Map() }
+    riskMlHits.set(key, entry)
+  }
+  entry.n = Math.min(999, entry.n + 1)
+  entry.at = now
+  entry.paths.set(riskFnv(path), now)
+  if (entry.paths.size > RISK_ML_HIT_CAP) {
+    const keys = [...entry.paths.keys()]
+    for (const k of keys.slice(0, keys.length - RISK_ML_HIT_CAP)) entry.paths.delete(k)
+  }
+  if (riskMlHits.size > 5000) {
+    for (const [k, v] of riskMlHits) {
+      if (now - v.at <= RISK_ML_HIT_WINDOW_MS) continue
+      riskMlHits.delete(k)
+      if (riskMlHits.size <= 3000) break
+    }
+  }
+  return { n: entry.n, paths: entry.paths.size }
+}
+
+function riskBanMinutes(base, level, max) {
+  const d = base * Math.pow(3, Math.min(2, Math.max(0, level)))
+  return Math.max(1, Math.min(max, Math.round(d)))
+}
+
+function riskIpBanActive(rec, now = Date.now()) {
+  if (!rec) return false
+  const until = Number(rec.until) || 0
+  return until === 0 || until > now
+}
+
+function riskIpBanCached(hash, now) {
+  const hit = riskIpBanCache.get(hash)
+  return hit && now - hit.at < RISK_IP_BAN_CACHE_MS ? hit : null
+}
+
+async function riskIpBanIndexPut(kv, hash, rec, now) {
+  try {
+    const idx = await kvJson(kv, RISK_IP_BAN_INDEX_KEY)
+    const items = Array.isArray(idx && idx.items) ? idx.items : []
+    const item = {
+      ip: rec.ip, at: rec.at, until: rec.until, reason: rec.reason,
+      s: rec.s, src: rec.src, lv: rec.lv, by: rec.by, h: hash,
+    }
+    const at = items.findIndex((x) => x && (x.h === hash || x.ip === rec.ip))
+    if (at >= 0) items[at] = item
+    else items.unshift(item)
+    const active = (x) => Number(x.until) === 0 || Number(x.until) > now
+    items.sort((a, b) => (active(b) - active(a)) || (Number(b.at) || 0) - (Number(a.at) || 0))
+    const kept = items.slice(0, RISK_IP_BAN_INDEX_CAP)
+    const dropped = items.slice(RISK_IP_BAN_INDEX_CAP)
+    for (const x of dropped.slice(0, 20)) {
+      if (x && x.h && !active(x)) {
+        try { await kv.delete(RISK_IP_BAN_PREFIX + x.h) } catch {}
+      }
+    }
+    await kvSave(kv, RISK_IP_BAN_INDEX_KEY, { at: now, items: kept })
+  } catch {}
+}
+
+/** 落地一条 IP 封禁；7 天内再次命中按时长升级（10m → 30m → 60m）。 */
+async function riskIpBanApply(kv, env, ip, opts) {
+  if (!kv) return null
+  const text = String(ip || '').trim().slice(0, 64)
+  if (!text || text === 'unknown') return null
+  const cfg = (opts && opts.cfg) || riskAutoBanCfg(env)
+  if (riskIpAllowlisted(env, text, cfg.allow)) return { skipped: 'allow', ip: text }
+  const now = Date.now()
+  const hash = await riskIpHash(text)
+  if (!hash) return null
+  const prev = await kvJson(kv, RISK_IP_BAN_PREFIX + hash)
+  let lv = 0
+  if (prev && now - (Number(prev.at) || 0) < RISK_IP_BAN_RETAIN_MS) {
+    lv = Math.min(3, (Number(prev.lv) || 0) + 1)
+  }
+  const manual = opts && opts.manual === true
+  const fixed = Math.max(0, Number(opts && opts.fixedMin) || 0)
+  const minutes = manual ? Math.max(0, Number(opts.minutes) || 0)
+    : fixed > 0 ? Math.min(1440, Math.round(fixed))
+      : riskBanMinutes(cfg.baseMin, lv, cfg.maxMin)
+  const until = manual && minutes === 0 ? 0 : now + Math.max(1, minutes) * 60000
+  const rec = {
+    at: now,
+    until,
+    ip: text,
+    reason: String((opts && opts.reason) || '').slice(0, 80),
+    s: Math.max(0, Math.min(100, Math.round(Number(opts && opts.score) || 0))),
+    sig: Array.isArray(opts && opts.signals) ? opts.signals.slice(0, 8).map((x) => String(x).slice(0, 32)) : [],
+    lv,
+    src: String((opts && opts.src) || 'ml').slice(0, 12),
+    by: String((opts && opts.by) || 'auto').slice(0, 32),
+  }
+  if (until > 0) rec._exp = until + RISK_IP_BAN_RETAIN_MS
+  await kvSave(kv, RISK_IP_BAN_PREFIX + hash, rec)
+  riskIpBanCache.set(hash, { rec, at: now })
+  await riskIpBanIndexPut(kv, hash, rec, now)
+  if (opts && opts.audit !== false) {
+    await admAudit(env, 'ip_ban', { ip: text, minutes, until, reason: rec.reason, src: rec.src }).catch(() => {})
+  }
+  return rec
+}
+
+async function riskIpBanClear(kv, env, ip, by) {
+  if (!kv) return false
+  const text = String(ip || '').trim()
+  if (!text) return false
+  const hash = await riskIpHash(text)
+  const had = !!(await kvJson(kv, RISK_IP_BAN_PREFIX + hash))
+  try { await kv.delete(RISK_IP_BAN_PREFIX + hash) } catch {}
+  riskIpBanCache.set(hash, { rec: null, at: Date.now() })
+  try {
+    const idx = await kvJson(kv, RISK_IP_BAN_INDEX_KEY)
+    const items = Array.isArray(idx && idx.items) ? idx.items : []
+    const hit = items.find((x) => x && (x.h === hash || x.ip === text))
+    if (hit) {
+      hit.rev = Date.now()
+      hit.until = Date.now()
+      await kvSave(kv, RISK_IP_BAN_INDEX_KEY, { at: Date.now(), items })
+    }
+  } catch {}
+  if (had) await admAudit(env, 'ip_unban', { ip: text, by: by || 'admin' }).catch(() => {})
+  return had
+}
+
+/** 同步闸门：返回 Response = 直接 429；null = 放行。命中结果在进程内缓存 15 秒。 */
+async function riskIpGuard(request, env, info, signals, url, cfg) {
+  const ip = reqIp(request)
+  if (!ip || ip === 'unknown' || riskIpAllowlisted(env, ip, cfg && cfg.allow)) return null
+  const hash = await riskIpHash(ip)
+  if (!hash) return null
+  const now = Date.now()
+  let hit = riskIpBanCached(hash, now)
+  if (!hit) {
+    const hot = !!signals && Object.keys(signals).length > 0
+    const device = deviceIdOf(request)
+    const surface = riskSurfaceOf(url.pathname)
+    const sensitive = !!device || RISK_DEVICE_REQUIRED.has(url.pathname) ||
+      surface === 'download' || surface === 'oss' || surface === 'mirror'
+    // 干净的普通请求不额外读存储；带设备码/敏感面/可疑特征的请求才查一次封禁表。
+    if (!hot && !sensitive) return null
+    const kv = await gateKv()
+    if (!kv) return null
+    let rec = null
+    try { rec = await kvJson(kv, RISK_IP_BAN_PREFIX + hash) } catch {}
+    hit = { rec, at: now }
+    riskIpBanCache.set(hash, hit)
+    if (riskIpBanCache.size > 4000) {
+      for (const [k, v] of riskIpBanCache) {
+        if (now - v.at <= RISK_IP_BAN_CACHE_MS) continue
+        riskIpBanCache.delete(k)
+        if (riskIpBanCache.size <= 3000) break
+      }
+    }
+  }
+  const rec = hit && hit.rec
+  if (!riskIpBanActive(rec, now)) return null
+  if (info) info.ip_banned = `${rec.reason || rec.src}:${Number(rec.until) || 0}`
+  return riskIpBanResponse(rec, request, env)
+}
+
+function riskIpBanResponse(rec, request, env) {
+  const until = Number(rec && rec.until) || 0
+  const when = until > 0 ? new Date(until).toLocaleString('zh-CN') : ''
+  const resp = json(
+    {
+      error: until > 0 ? `该来源已被临时限制，请 ${when} 后再试。` : '该来源已被限制访问。',
+      code: 'csh_ip_restricted',
+      until,
+      reason: String((rec && rec.reason) || '').slice(0, 80),
+    },
+    429,
+    request,
+    env
+  )
+  if (until > 0) resp.headers.set('Retry-After', String(Math.max(1, Math.ceil((until - Date.now()) / 1000))))
+  return resp
+}
+
+/** 模型高置信 + 规则佐证（或短时多路径重复）才触发自动封禁，避免仅凭模型误伤。 */
+function riskLiveVerdict(env, request, url, model, p, signals, repeat, cfg) {
+  cfg = cfg || riskAutoBanCfg(env)
+  if (!cfg.on || !model) return null
+  const ip = reqIp(request)
+  if (!ip || ip === 'unknown' || riskIpAllowlisted(env, ip, cfg.allow)) return null
+  if (!(p >= Number(model.high))) return null
+  const strong = RISK_AUTOBAN_STRONG.filter((k) => signals && signals[k])
+  const actP = Math.max(Number(model.high) || 0.85, cfg.mlAct)
+  if (p >= actP && strong.length) {
+    return {
+      ip,
+      reason: `ml+${strong.slice(0, 3).join('+')}`,
+      score: Math.round(p * 100),
+      signals: strong.concat(['ml_high']),
+    }
+  }
+  if (repeat && repeat.n >= 3 && repeat.paths >= 2) {
+    return {
+      ip,
+      reason: `ml_repeat ${repeat.n}/${repeat.paths}`,
+      score: Math.round(p * 100),
+      signals: ['ml_high', 'ml_repeat'],
+    }
+  }
+  return null
 }
 
 /**
@@ -5688,6 +6770,138 @@ async function handleAdminRisk(request, env) {
   return admJson({ ok: true, now, counts, items: items.slice(0, RISK_INDEX_CAP) })
 }
 
+/** GET/POST /api/admin/risk/model —— 查看、更新或删除轻量模型。 */
+async function handleAdminRiskModel(request, env) {
+  const sess = await admSession(request, env)
+  const svc = admServiceOk(request, env)
+  if (!sess && !svc) return admJson({ error: '未登录' }, 401)
+  if (!svc) {
+    const originFail = admSameOriginOrFail(request)
+    if (originFail) return originFail
+  }
+  const kv = await gateKv()
+  if (!kv) return admJson({ error: '状态存储不可用' }, 503)
+
+  if (request.method === 'GET') {
+    const model = await riskMlModel()
+    const full = new URL(request.url).searchParams.get('full') === '1'
+    const meta = model
+      ? {
+          loaded: true,
+          feature: model.feature,
+          dim: model.dim,
+          weights: model.nonzero,
+          bias: model.bias,
+          threshold: model.threshold,
+          high: model.high,
+          createdAt: model.createdAt,
+          samples: model.samples,
+          metrics: model.metrics,
+          cachedAt: riskMlCache.at,
+        }
+      : { loaded: false, cachedAt: riskMlCache.at, failedAt: riskMlCache.failedAt }
+    // full=1 供观测台同步本地评分副本（约 70KB），元数据接口保持轻量。
+    let raw = null
+    if (full && model) {
+      try {
+        const stored = await kvJson(kv, RISK_MODEL_KEY)
+        if (stored && typeof stored === 'object') raw = stored
+      } catch {}
+    }
+    return admJson(raw ? { ok: true, model: meta, raw } : { ok: true, model: meta })
+  }
+
+  let body
+  try {
+    body = await request.json()
+  } catch {
+    return admJson({ error: '请求格式错误' }, 400)
+  }
+  body = body && typeof body === 'object' ? body : {}
+
+  if (body.delete === true) {
+    if (typeof kv.delete === 'function') await kv.delete(RISK_MODEL_KEY)
+    riskMlCache = { at: 0, failedAt: 0, model: null }
+    await admAudit(env, 'risk-model-delete', {})
+    return admJson({ ok: true, deleted: true })
+  }
+
+  const source = body.model && typeof body.model === 'object' ? body.model : body
+  if (!Array.isArray(source.weights) || JSON.stringify(source).length > RISK_ML_MAX_JSON) {
+    return admJson({ error: '模型过大或缺少 weights' }, 400)
+  }
+  const model = riskMlCompile(source)
+  if (!model) return admJson({ error: '模型格式不合规（feature/dim/weights 校验失败）' }, 400)
+
+  if (body.dryRun === true) {
+    return admJson({
+      ok: true,
+      dryRun: true,
+      model: { feature: model.feature, dim: model.dim, weights: model.nonzero, threshold: model.threshold, high: model.high },
+    })
+  }
+
+  const weights = []
+  for (let i = 0; i < model.dim; i++) if (model.weights[i]) weights.push([i, model.weights[i]])
+  await kvSave(kv, RISK_MODEL_KEY, {
+    v: 1,
+    feature: RISK_ML_FEATURE,
+    dim: model.dim,
+    bias: model.bias,
+    threshold: model.threshold,
+    high: model.high,
+    weights,
+    createdAt: model.createdAt || new Date().toISOString(),
+    samples: model.samples,
+    metrics: model.metrics,
+  })
+  riskMlCache = { at: Date.now(), failedAt: 0, model }
+  await admAudit(env, 'risk-model-save', { dim: model.dim, weights: model.nonzero, threshold: model.threshold, high: model.high })
+  console.log(`admin: risk model saved dim=${model.dim} weights=${model.nonzero} high=${model.high}`)
+  return admJson({
+    ok: true,
+    model: { feature: model.feature, dim: model.dim, weights: model.nonzero, threshold: model.threshold, high: model.high },
+  })
+}
+
+/** POST /api/admin/risk/explain { event } —— 用当前模型给一条请求打分，不写存储。 */
+async function handleAdminRiskExplain(request, env) {
+  const sess = await admSession(request, env)
+  const svc = admServiceOk(request, env)
+  if (!sess && !svc) return admJson({ error: '未登录' }, 401)
+  if (!svc) {
+    const originFail = admSameOriginOrFail(request)
+    if (originFail) return originFail
+  }
+
+  const model = await riskMlModel()
+  if (!model) return admJson({ error: '模型未加载', model: null }, 503)
+
+  let body
+  try {
+    body = await request.json()
+  } catch {
+    return admJson({ error: '请求格式错误' }, 400)
+  }
+  const input = body && typeof body === 'object' ? body.event || body : null
+  if (!input || typeof input !== 'object') return admJson({ error: '缺少 event' }, 400)
+
+  const headers = {}
+  if (input.headers && typeof input.headers === 'object') {
+    for (const [k, v] of Object.entries(input.headers)) headers[String(k).toLowerCase().slice(0, 64)] = String(v).slice(0, 1024)
+  }
+  const event = {
+    service: String(input.service || 'site').slice(0, 16),
+    method: String(input.method || 'GET').slice(0, 16),
+    path: String(input.path || '/').slice(0, 512),
+    query: String(input.query || '').replace(/^\?/, '').slice(0, 512),
+    headers,
+    host: String(input.host || '').slice(0, 200),
+    http: String(input.http || '').slice(0, 8),
+  }
+  return admJson({ ok: true, ...riskMlExplain(model, event) })
+}
+
 /** GET /api/admin/device-events?device= —— 单设备信誉详情：事件、封禁、当日报数。 */
 async function handleAdminDeviceEvents(request, env) {
   const sess = await admSession(request, env)
@@ -5777,7 +6991,7 @@ async function riskBackfillReset(kv) {
     }
   }
   try { await kvSave(kv, RISK_INDEX_KEY, { at: now, items: kept.slice(0, RISK_INDEX_CAP) }) } catch {}
-  try { await kvSave(kv, RISK_BACKFILL_KEY, { v: 1, at: now, resetAt: now, state: {}, events: {} }) } catch {}
+  try { await kvSave(kv, RISK_BACKFILL_KEY, { v: 1, at: now, resetAt: now, state: {}, events: {}, servers: {} }) } catch {}
   return { reset: true, kept: kept.length }
 }
 
@@ -5796,6 +7010,171 @@ function riskHistEventOfDeviceEvent(device, e) {
   }
   return null
 }
+
+// ── 服务器侧事件（SSH / OSS / 下载 / 镜像）──────────────────────────────
+// gh-dash 把两台服务器的日志按 (ip, 时间桶) 聚合成 {src, user, op, result, n, ...}，
+// 这里补上与实时请求同一套信号语义，再走历史证据入账（幂等、水位线、索引批量写）。
+const RISK_SERVER_SRC = new Set(['ssh', 'oss', 'download', 'mirror'])
+
+function riskServerEvent(raw, hint) {
+  if (!raw || typeof raw !== 'object') return null
+  const hintSrc = RISK_SERVER_SRC.has(hint) ? hint : ''
+  const src = RISK_SERVER_SRC.has(raw.src) ? raw.src : hintSrc
+  if (!src) return null
+  const ts = Number(raw.ts) || 0
+  if (!ts) return null
+  const ip = String(raw.ip || '').trim().slice(0, 64)
+  if (!ip || ip === 'unknown') return null
+  // 事件 ID 必须稳定：同一份日志重放时要命中同一条证据，不能每次换 ID 重复计分。
+  const id = String(raw.id || '').slice(0, 80) || `v${riskFnv([src, ts, ip, raw.user, raw.op, raw.result, raw.path, raw.method, raw.status].join('|'))}`
+  const ev = {
+    id,
+    ts,
+    ip,
+    src,
+    status: Number(raw.status) || 0,
+    method: String(raw.method || '').toUpperCase().slice(0, 8),
+    path: String(raw.path || raw.uri || raw.key || raw.target || '').slice(0, 300),
+    ua: String(raw.ua || '').slice(0, 300),
+    user: String(raw.user || '').slice(0, 64),
+    op: String(raw.op || '').slice(0, 40),
+    result: String(raw.result || '').slice(0, 24),
+    n: Math.max(1, Math.min(500, Number(raw.n) || 1)),
+  }
+  // 服务器事件没有 Request/URL 结构，信号直接按来源语义生成，避免走通用路径推断。
+  ev._signals = riskServerSignalsOfEvent(ev)
+  return ev
+}
+
+function riskServerSignalsOfEvent(ev) {
+  const out = {}
+  const result = String(ev.result || '').toLowerCase()
+  if (ev.src === 'ssh') {
+    const user = String(ev.user || '')
+    if (/invalid|nosuch|no such|unknown/.test(result)) out.ssh_invalid_user = (user || 'invalid').slice(0, 40)
+    else if (/fail|denied|error/.test(result)) out.ssh_brute = (user || ev.op || 'auth').slice(0, 40)
+    if (user.toLowerCase() === 'root' && !/accept|success|ok/.test(result)) out.ssh_root_attempt = 'root'
+    if (/accept|success/.test(result) || ev.op === 'accepted') out.ssh_accepted = `${user || '-'}@${ev.op || '-'}`.slice(0, 40)
+    if (ev.op === 'sudo' && /fail|denied/.test(result)) out.ssh_sudo_fail = (user || 'sudo').slice(0, 40)
+  } else if (ev.src === 'oss') {
+    if (ev.status === 401 || ev.status === 403) out.oss_auth_fail = `${ev.method || 'GET'} ${ev.path || ''}`.slice(0, 80)
+    if (ev.method === 'DELETE' || ev.op === 'delete') out.oss_delete = ev.path.slice(0, 80)
+    if (ev.op === 'list' || /[?&](?:list-type=2|prefix=|delimiter=|marker=)/.test(ev.path)) out.oss_list = ev.path.slice(0, 80)
+  } else if (ev.src === 'download') {
+    if (ev.status === 401 || ev.status === 403) out.dl_sign_fail = `${ev.status} ${ev.path}`.slice(0, 80)
+    if (RISK_PROBE_RE.test(ev.path)) out.dl_probe = ev.path.slice(0, 80)
+    if (ev.op === 'range-many') out.dl_range_abuse = ev.path.slice(0, 80)
+    if (ev.op === 'hotlink') out.dl_hotlink = ev.path.slice(0, 80)
+  } else if (ev.src === 'mirror') {
+    if (RISK_PROBE_RE.test(ev.path)) out.mirror_path = ev.path.slice(0, 80)
+    if (ev.status >= 400 && ev.status < 500 && (/^\/[^/]+\/[^/]+\//.test(ev.path) || /\.git/.test(ev.path))) {
+      out.mirror_repo_probe = `${ev.status} ${ev.path}`.slice(0, 80)
+    }
+  }
+  return out
+}
+
+/**
+ * 同一批里同一 IP 的请求总量/失败量合成一条“桶事件”：ID 按事件时间所在小时
+ * 固定，重放同一批不会重复计分；跨小时的持续洪峰则每小时各记一次。
+ */
+function riskServerAggEvent(ip, src, events) {
+  let total = 0
+  let fail = 0
+  let newest = 0
+  for (const ev of events) {
+    total += ev.n
+    newest = Math.max(newest, ev.ts)
+    if (ev.status === 401 || ev.status === 403 || /fail|denied|invalid/.test(String(ev.result || ''))) fail += ev.n
+  }
+  const sigs = {}
+  if (src === 'ssh') {
+    if (total >= 40) sigs.ssh_brute = `${total} 次/时段`
+  } else if (src === 'oss') {
+    if (total >= 200) sigs.oss_burst = `${total} 次/时段`
+    if (fail >= 40) sigs.oss_auth_fail = `${fail} 次失败`
+  } else if (src === 'download' || src === 'mirror') {
+    if (total >= 200) sigs.burst = `${total} 次/时段`
+  }
+  if (!Object.keys(sigs).length) return null
+  const bucket = Math.floor(newest / 3600000) * 3600000
+  return { id: `agg:${src}:${ip}:${bucket}`, ts: bucket, ip, path: '', ua: '', method: '', status: 0, src, n: 1, _signals: sigs }
+}
+
+async function riskBackfillServerEvents(kv, body, dryRun, src) {
+  const list = Array.isArray(body.events) ? body.events.slice(0, 3000) : []
+  if (!list.length) return { status: 400, data: { error: '缺少 events' } }
+  const now = Date.now()
+  const byIp = new Map()
+  let ignored = 0
+  for (const raw of list) {
+    const ev = riskServerEvent(raw, src)
+    if (!ev || ev.ts > now + 5 * 60000) { ignored++; continue }
+    if (!byIp.has(ev.ip)) byIp.set(ev.ip, [])
+    byIp.get(ev.ip).push(ev)
+  }
+
+  let added = 0
+  let skipped = 0
+  let touched = 0
+  let errors = 0
+  const indexEntries = []
+  const tasks = [...byIp.entries()]
+  let next = 0
+  const worker = async () => {
+    while (next < tasks.length) {
+      const [ip, events] = tasks[next++]
+      try {
+        const agg = riskServerAggEvent(ip, src, events)
+        const all = agg ? events.concat([agg]) : events
+        const key = (await sha256Hex(ip)).slice(0, 24)
+        const r = await riskHistApplyMany(kv, 'i', key, ip, all, { now, dryRun, ip, noIndex: true })
+        added += r.added
+        skipped += r.skipped
+        if (r.added) {
+          touched++
+          if (r.rec) indexEntries.push({ kind: 'i', id: ip, rec: r.rec })
+        }
+      } catch {
+        errors++
+      }
+    }
+  }
+  await Promise.all(new Array(Math.min(6, tasks.length)).fill(0).map(worker))
+  if (!dryRun) await riskIndexPutMany(kv, indexEntries, now)
+
+  if (!dryRun) {
+    const marker = (await kvJson(kv, RISK_BACKFILL_KEY)) || { v: 1, state: {}, events: {} }
+    marker.v = 1
+    marker.at = now
+    const servers = marker.servers && typeof marker.servers === 'object' ? marker.servers : {}
+    const prev = servers[src] || {}
+    servers[src] = {
+      imported: (Number(prev.imported) || 0) + added,
+      skipped: (Number(prev.skipped) || 0) + skipped,
+      ipsTouched: (Number(prev.ipsTouched) || 0) + touched,
+      lastAt: now,
+    }
+    marker.servers = servers
+    try { await kvSave(kv, RISK_BACKFILL_KEY, marker) } catch {}
+  }
+  return {
+    status: 200,
+    data: {
+      ok: true,
+      source: src,
+      dryRun,
+      processed: list.length,
+      ignored,
+      ips: byIp.size,
+      added,
+      skipped,
+      errors,
+      summary: await riskBackfillStatus(kv),
+    },
+  }
+}
+
 
 async function riskBackfillState(kv, body, dryRun) {
   if (!kv || typeof kv.list !== 'function') return { status: 501, data: { error: '当前存储不支持前缀扫描' } }
@@ -5981,6 +7360,10 @@ async function handleAdminRiskBackfill(request, env) {
     return admJson({ ok: true, ...(await riskBackfillStatus(kv)) })
   }
 
+  // 回溯循环是同步的，先把生效开关与模型装进缓存，后续每条事件即可复用。
+  riskAutoBanCfg(env, await settingsOf(env))
+  await riskMlModel().catch(() => {})
+
   let body = {}
   try {
     body = (await request.json()) || {}
@@ -5989,7 +7372,7 @@ async function handleAdminRiskBackfill(request, env) {
   }
   const dryRun = body.dryRun === true
   const reset = body.reset === true
-  const source = body.source === 'events' ? 'events' : 'state'
+  const source = RISK_SERVER_SRC.has(body.source) ? body.source : body.source === 'events' ? 'events' : 'state'
   let out = {}
   if (reset) {
     if (dryRun) out = { reset: false }
@@ -5999,10 +7382,12 @@ async function handleAdminRiskBackfill(request, env) {
     }
   }
   // 只重置、不导入时直接返回，不必再要求 events。
-  if (reset && source === 'events' && !Array.isArray(body.events)) {
+  if (reset && source !== 'state' && !Array.isArray(body.events)) {
     return admJson({ ok: true, ...out, source, summary: await riskBackfillStatus(kv) })
   }
-  const r = source === 'events' ? await riskBackfillEvents(kv, body, dryRun) : await riskBackfillState(kv, body, dryRun)
+  const r = RISK_SERVER_SRC.has(source)
+    ? await riskBackfillServerEvents(kv, body, dryRun, source)
+    : source === 'events' ? await riskBackfillEvents(kv, body, dryRun) : await riskBackfillState(kv, body, dryRun)
   return admJson({ ...(r.data || {}), ...out }, r.status)
 }
 
@@ -6120,6 +7505,190 @@ async function handleAdminUnban(request, env) {
 
   console.log(`admin: ${(sess && sess.user) || 'service'} unbanned ${device}`)
   return admJson({ ok: true, device })
+}
+
+function validIpText(text) {
+  const s = String(text || '').trim()
+  if (!s || s.length > 64 || s === 'unknown') return ''
+  if (riskIpv4Int(s) != null) return s
+  if (/^[0-9a-fA-F:.]{3,64}$/.test(s) && s.includes(':')) return s
+  return ''
+}
+
+/** GET /api/admin/ip-bans —— 自动/手动 IP 封禁清单（含最近撤销记录）。 */
+async function handleAdminIpBans(request, env) {
+  const sess = await admSession(request, env)
+  if (!sess && !admServiceOk(request, env)) return admJson({ error: '未登录' }, 401)
+  const kv = await gateKv()
+  if (!kv) return admJson({ error: '状态存储不可用' }, 503)
+  const S = await settingsOf(env)
+  const idx = await kvJson(kv, RISK_IP_BAN_INDEX_KEY)
+  const now = Date.now()
+  const items = Array.isArray(idx && idx.items) ? idx.items : []
+  const rows = items
+    .filter((x) => x && x.ip)
+    .map((x) => {
+      const until = Number(x.until) || 0
+      const rev = Number(x.rev) || 0
+      return {
+        ip: String(x.ip),
+        at: Number(x.at) || 0,
+        until,
+        active: !rev && (until === 0 || until > now),
+        revokedAt: rev,
+        reason: String(x.reason || ''),
+        s: Number(x.s) || 0,
+        src: String(x.src || ''),
+        lv: Number(x.lv) || 0,
+        by: String(x.by || ''),
+      }
+    })
+    .sort((a, b) => (b.active - a.active) || b.at - a.at)
+    .slice(0, RISK_IP_BAN_INDEX_CAP)
+  return admJson({
+    ok: true,
+    total: rows.length,
+    active: rows.filter((x) => x.active).length,
+    cfg: (() => {
+      const c = riskAutoBanCfg(env, S)
+      return { on: c.on, mlOn: c.mlOn, mlAct: c.mlAct, baseMin: c.baseMin, maxMin: c.maxMin, sshOn: c.sshOn, sshHits: c.sshHits, sshMin: c.sshMin, sshWindowMs: c.sshWindowMs, allow: c.allow.length }
+    })(),
+    rows,
+  })
+}
+
+/** POST /api/admin/ip-ban { ip, minutes, reason } —— 手动封禁；minutes=0 表示永久。 */
+async function handleAdminIpBan(request, env) {
+  const sess = await admSession(request, env)
+  if (!sess && !admServiceOk(request, env)) return admJson({ error: '未登录' }, 401)
+  if (!admServiceOk(request, env) && !admSameOrigin(request)) return admJson({ error: '来源校验失败' }, 403)
+  let body
+  try { body = await request.json() } catch { return admJson({ error: '请求格式错误' }, 400) }
+  const ip = validIpText(body && body.ip)
+  if (!ip) return admJson({ error: 'IP 格式不正确' }, 400)
+  const minutes = Math.max(0, Math.min(525600, Number(body && body.minutes) || 0))
+  const reason = cleanText(body && body.reason, 80) || '手动封禁'
+  const kv = await gateKv()
+  if (!kv) return admJson({ error: '状态存储不可用' }, 503)
+  const cfg = riskAutoBanCfg(env, await settingsOf(env))
+  const rec = await riskIpBanApply(kv, env, ip, {
+    manual: true, minutes, reason, src: 'manual', by: (sess && sess.user) || 'service', audit: false, cfg,
+  })
+  if (!rec || rec.skipped) return admJson({ error: '该 IP 在白名单内，未封禁' }, 400)
+  await admAudit(env, 'ip_ban', { ip, minutes, until: rec.until, reason, src: 'manual' })
+  return admJson({ ok: true, ip, until: rec.until })
+}
+
+/** POST /api/admin/ip-unban { ip } */
+async function handleAdminIpUnban(request, env) {
+  const sess = await admSession(request, env)
+  if (!sess && !admServiceOk(request, env)) return admJson({ error: '未登录' }, 401)
+  if (!admServiceOk(request, env) && !admSameOrigin(request)) return admJson({ error: '来源校验失败' }, 403)
+  let body
+  try { body = await request.json() } catch { return admJson({ error: '请求格式错误' }, 400) }
+  const ip = validIpText(body && body.ip)
+  if (!ip) return admJson({ error: 'IP 格式不正确' }, 400)
+  const kv = await gateKv()
+  if (!kv) return admJson({ error: '状态存储不可用' }, 503)
+  const had = await riskIpBanClear(kv, env, ip, (sess && sess.user) || 'service')
+  return admJson({ ok: true, ip, removed: had })
+}
+
+/**
+ * POST /api/admin/risk/report { source:'ssh', events:[...] }
+ * 观测台的近实时上报入口：SSH 事件先入历史风险，再按窗口内的失败量触发自动封禁。
+ * 只对“本次新入账”的事件做动作判定，重复上报不会不断升级封禁时长。
+ */
+async function handleAdminRiskReport(request, env) {
+  if (!admServiceOk(request, env)) {
+    const sess = await admSession(request, env)
+    if (!sess) return admJson({ error: '未登录' }, 401)
+  }
+  let body
+  try { body = await request.json() } catch { return admJson({ error: '请求格式错误' }, 400) }
+  if (!body || body.source !== 'ssh') return admJson({ error: '仅支持 source=ssh' }, 400)
+  const list = Array.isArray(body.events) ? body.events.slice(0, 2000) : []
+  if (!list.length) return admJson({ error: '缺少 events' }, 400)
+  const kv = await gateKv()
+  if (!kv) return admJson({ error: '状态存储不可用' }, 503)
+
+  const now = Date.now()
+  const byIp = new Map()
+  let ignored = 0
+  for (const raw of list) {
+    const ev = riskServerEvent({ ...raw, src: 'ssh' }, 'ssh')
+    if (!ev || ev.ts > now + 5 * 60000 || ev.ts < now - 7 * 86400000) { ignored++; continue }
+    if (!byIp.has(ev.ip)) byIp.set(ev.ip, [])
+    byIp.get(ev.ip).push(ev)
+  }
+
+  const cfg = riskAutoBanCfg(env, await settingsOf(env))
+  let added = 0
+  let skipped = 0
+  let errors = 0
+  const actions = []
+  const indexEntries = []
+  const entries = [...byIp.entries()]
+  let cursor = 0
+  const worker = async () => {
+    while (cursor < entries.length) {
+      const [ip, events] = entries[cursor++]
+      try {
+        const key = await riskIpHash(ip)
+        if (!key) { ignored += events.length; continue }
+        const prev = await kvJson(kv, RISK_IP_PREFIX + key)
+        const hid = prev && prev.hid && typeof prev.hid === 'object' ? prev.hid : {}
+        const fresh = events.filter((ev) => !hid[riskEvidenceHash(ev)])
+        const r = await riskHistApplyMany(kv, 'i', key, ip, events, { now, ip, noIndex: true })
+        added += r.added
+        skipped += r.skipped
+        if (r.rec) indexEntries.push({ kind: 'i', id: ip, rec: r.rec })
+        if (!fresh.length || !cfg.on || !cfg.sshOn || riskIpAllowlisted(env, ip, cfg.allow)) continue
+
+        let failN = 0
+        let accepted = false
+        let newest = 0
+        for (const ev of fresh) {
+          if (ev.ts < now - cfg.sshWindowMs) continue
+          const sig = ev._signals || {}
+          if (sig.ssh_brute || sig.ssh_invalid_user || sig.ssh_root_attempt || sig.ssh_sudo_fail) {
+            failN += ev.n
+            newest = Math.max(newest, ev.ts)
+          }
+          if (sig.ssh_accepted) accepted = true
+        }
+        // 登录成功也可以：先有失败、后成功，说明可能已被爆破成功，立即封禁。
+        if (failN >= cfg.sshHits || (accepted && failN >= 2)) {
+          const rec = await riskIpBanApply(kv, env, ip, {
+            reason: accepted ? `ssh_accept_after_${failN}` : `ssh_brute:${failN}`,
+            score: Math.min(100, 40 + Math.min(60, failN * 2)),
+            signals: [accepted ? 'ssh_accepted' : 'ssh_brute', 'ssh_invalid_user'],
+            src: 'ssh',
+            by: 'ssh-report',
+            fixedMin: cfg.sshMin,
+            cfg,
+          })
+          if (rec && !rec.skipped) actions.push({ ip, until: rec.until, reason: rec.reason, failN, accepted, at: newest })
+        }
+      } catch {
+        errors++
+      }
+    }
+  }
+  await Promise.all(new Array(Math.min(6, entries.length)).fill(0).map(worker))
+  await riskIndexPutMany(kv, indexEntries, now)
+
+  return admJson({
+    ok: true,
+    source: 'ssh',
+    processed: list.length,
+    ignored,
+    ips: byIp.size,
+    added,
+    skipped,
+    errors,
+    actions,
+  })
 }
 
 /** 每来源每日配额（KV 计数，两天过期）。超限返回 false；存储不可用时放行，不因限流挂掉主流程。 */
@@ -6288,7 +7857,7 @@ function admSameOriginOrFail(request) {
 /** GET /api/admin/settings —— 分组后的参数、生效值、出厂值、是否被改过。 */
 async function handleAdminSettingsGet(request, env) {
   const sess = await admSession(request, env)
-  if (!sess) return admJson({ error: '未登录' }, 401)
+  if (!sess && !admServiceOk(request, env)) return admJson({ error: '未登录' }, 401)
 
   const bundle = await settingsBundle(env)
   const groups = SETTING_GROUPS.map((g) => ({
@@ -6329,9 +7898,11 @@ async function handleAdminSettingsGet(request, env) {
 /** POST /api/admin/settings { patch: {key: value}, reset: [key] | true } */
 async function handleAdminSettingsSave(request, env) {
   const sess = await admSession(request, env)
-  if (!sess) return admJson({ error: '未登录' }, 401)
-  const originFail = admSameOriginOrFail(request)
-  if (originFail) return originFail
+  if (!sess && !admServiceOk(request, env)) return admJson({ error: '未登录' }, 401)
+  if (!admServiceOk(request, env)) {
+    const originFail = admSameOriginOrFail(request)
+    if (originFail) return originFail
+  }
 
   let body
   try {
@@ -6390,7 +7961,7 @@ async function handleAdminSettingsSave(request, env) {
 
   await kvSave(kv, SETTINGS_KEY, { v: next, at: Date.now(), by: admUser(env) })
   await admAudit(env, 'settings', { changes: changes.slice(0, 24) })
-  console.log(`admin: ${sess.user} settings changed=${changes.length}`)
+  console.log(`admin: ${(sess && sess.user) || 'service'} settings changed=${changes.length}`)
   return admJson({ ok: true, changed: changes.length, changes })
 }
 
@@ -6422,14 +7993,43 @@ async function workerFetch(request, env, ctx) {
       ctx.waitUntil(licTouchDevice(env, request).catch(() => {}))
     }
 
-    // 请求特征先算一遍（纯内存）；闸门结果和响应状态也并进同一批信号，
-    // 每个请求最多写一次风险存储，避免同一键并发读改写互相覆盖。
+    // 请求特征与模型推理都在请求路径内同步完成（模型按 60 秒缓存，缺失时自动退回纯规则）；
+    // 这样高置信攻击可以在本次请求就拒绝，而不是等响应后的异步分析。
+    // 风险配置读一次（KV 参数 15 秒缓存），后续闸门复用同一份生效值。
     const preRisk = isClientApi ? riskSignalsOf(request, url) : {}
     const riskInfo = {}
+    const riskCfg = isClientApi ? riskAutoBanCfg(env, await settingsOf(env)) : null
+    let mlModel = null
+    let mlScore = 0
+    let mlSignals = {}
+    let mlRepeat = null
+    if (isClientApi && riskCfg.mlOn) {
+      try {
+        mlModel = await riskMlModel()
+        if (mlModel) {
+          const assessed = riskMlAssess(mlModel, riskMlRequestEvent(request, url))
+          mlScore = assessed.p
+          mlSignals = assessed.signals
+          if (mlScore >= mlModel.high) {
+            mlRepeat = riskMlNote(reqIp(request), url.pathname, Date.now())
+          }
+        }
+      } catch {}
+    }
+    const liveSignals = { ...preRisk, ...mlSignals }
+    if (mlRepeat) liveSignals.ml_repeat = `${mlRepeat.n} 次/${mlRepeat.paths} 路径`
+
+    // 记录风险：普通 200 请求只写规则信号；模型证据在“已有规则/已被拒绝/高置信”时才入库，
+    // 避免正常 API 请求仅因模型波动而持续产生记录。
     const recordRisk = () => {
-      if (Object.keys(preRisk).length || Object.keys(riskInfo).length) {
-        ctx.waitUntil(riskObserve(request, env, preRisk, riskInfo))
-      }
+      if (!isClientApi) return
+      ctx.waitUntil((async () => {
+        const keepMl = !!mlSignals.ml_high || Object.keys(preRisk).length > 0 || Object.keys(riskInfo).length > 0
+        const signals = keepMl ? liveSignals : preRisk
+        if (Object.keys(signals).length || Object.keys(riskInfo).length) {
+          await riskObserve(request, env, signals, riskInfo)
+        }
+      })())
     }
 
     // 设备信誉先于许可判定：封禁/超限统一回 429（许可闸门对被封禁设备回 403）。
@@ -6438,14 +8038,48 @@ async function workerFetch(request, env, ctx) {
       recordRisk()
       return rep
     }
+
+    // IP 临时封禁（含模型自动封禁与 SSH 上报封禁）：命中即拒绝，不再进入业务路由。
+    const ipBlocked = await riskIpGuard(request, env, riskInfo, liveSignals, url, riskCfg)
+    if (ipBlocked) {
+      recordRisk()
+      return ipBlocked
+    }
+
+    // 模型高置信 + 规则佐证（或短时多路径重复）→ 立即封禁并拒绝本次请求。
+    const verdict = riskLiveVerdict(env, request, url, mlModel, mlScore, liveSignals, mlRepeat, riskCfg)
+    if (verdict) {
+      try {
+        const kv = await gateKv()
+        const ban = await riskIpBanApply(kv, env, verdict.ip, {
+          reason: verdict.reason,
+          score: verdict.score,
+          signals: verdict.signals,
+          src: 'ml',
+          by: 'auto',
+          cfg: riskCfg,
+        })
+        if (ban && !ban.skipped) {
+          riskInfo.ip_banned = `${ban.reason}:${Number(ban.until) || 0}`
+          recordRisk()
+          return riskIpBanResponse(ban, request, env)
+        }
+      } catch {}
+    }
+
     const gate = await licenseGuard(request, env)
     if (gate && gate.deny) return gate.deny
 
     const response = await routeRequest(request, env, ctx)
 
     // 反复撞 4xx（猜路径/猜参数）也算一个低权重信号，必须与其它因子叠加才升级。
-    if (isClientApi && response && [401, 403, 404, 405].includes(response.status)) {
-      riskInfo.err4xx = response.status
+    // 下载面/OSS 面的 401/403 另有专门含义：签名或鉴权被拒，单独计数便于分面定级。
+    if (isClientApi && response) {
+      const status = response.status
+      if ([401, 403, 404, 405].includes(status)) riskInfo.err4xx = status
+      const surface = riskSurfaceOf(url.pathname)
+      if (surface === 'download' && (status === 401 || status === 403)) riskInfo.dl_sign_fail = status
+      if (surface === 'oss' && (status === 401 || status === 403)) riskInfo.oss_auth_fail = status
     }
     recordRisk()
 
@@ -6480,10 +8114,20 @@ async function routeRequest(request, env, ctx) {
       }
       if (url.pathname === '/api/admin/ban' && request.method === 'POST') return handleAdminBan(request, env)
       if (url.pathname === '/api/admin/unban' && request.method === 'POST') return handleAdminUnban(request, env)
+      if (url.pathname === '/api/admin/ip-bans' && request.method === 'GET') return handleAdminIpBans(request, env)
+      if (url.pathname === '/api/admin/ip-ban' && request.method === 'POST') return handleAdminIpBan(request, env)
+      if (url.pathname === '/api/admin/ip-unban' && request.method === 'POST') return handleAdminIpUnban(request, env)
       if (url.pathname === '/api/admin/online' && request.method === 'GET') return handleAdminOnline(request, env)
       if (url.pathname === '/api/admin/risk' && request.method === 'GET') return handleAdminRisk(request, env)
+      if (url.pathname === '/api/admin/risk/report' && request.method === 'POST') return handleAdminRiskReport(request, env)
       if (url.pathname === '/api/admin/risk/backfill' && (request.method === 'GET' || request.method === 'POST')) {
         return handleAdminRiskBackfill(request, env)
+      }
+      if (url.pathname === '/api/admin/risk/model' && (request.method === 'GET' || request.method === 'POST')) {
+        return handleAdminRiskModel(request, env)
+      }
+      if (url.pathname === '/api/admin/risk/explain' && request.method === 'POST') {
+        return handleAdminRiskExplain(request, env)
       }
       if (url.pathname === '/api/admin/shout' && request.method === 'POST') return handleAdminShout(request, env)
       if (url.pathname === '/api/admin/settings') {
