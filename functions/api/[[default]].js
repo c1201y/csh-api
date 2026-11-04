@@ -4858,10 +4858,14 @@ async function riskHistApplyMany(kv, kind, key, id, events, meta) {
   let added = 0
   let skipped = 0
   let newest = Number(rec.hat) || 0
+  // hm = 已因容量上限被淘汰的最新证据时间。回溯重放时这些旧记录直接跳过，
+  // 否则每次回溯都会把被裁掉的证据重新加进来，去重永远不收敛。
+  const droppedBefore = Number(rec.hm) || 0
   for (const ev of events) {
     const ts = Number(ev.ts) || meta.now
     const eh = riskEvidenceHash(ev)
     if (hid[eh]) { skipped++; continue }
+    if (droppedBefore && ts <= droppedBefore) { skipped++; continue }
     hid[eh] = ts
     const sigs = ev._signals || riskHistSignalsOfEvent(ev)
     for (const [name, info] of Object.entries(sigs)) {
@@ -4878,8 +4882,15 @@ async function riskHistApplyMany(kv, kind, key, id, events, meta) {
   }
   if (!added) return { added: 0, skipped, rec }
   const entries = Object.entries(hid).sort((a, b) => Number(a[1]) - Number(b[1]))
+  let dropped = droppedBefore
   if (entries.length > RISK_EVIDENCE_CAP) {
-    for (const [k] of entries.slice(0, entries.length - RISK_EVIDENCE_CAP)) delete hid[k]
+    for (const [k, t] of entries.slice(0, entries.length - RISK_EVIDENCE_CAP)) {
+      dropped = Math.max(dropped, Number(t) || 0)
+      delete hid[k]
+    }
+    rec.hm = dropped
+  } else if (droppedBefore) {
+    rec.hm = droppedBefore
   }
   // 路径覆盖度：探测/注入/扫描器/4xx 达到一定条数才算“扫描面”，
   // 普通爬取则要求更多不同记录，避免把少量 404 误判成扫描。
