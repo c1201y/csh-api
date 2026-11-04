@@ -4761,32 +4761,51 @@ function riskDerive(rec, signals, meta) {
   return out
 }
 
+function riskIndexItem(kind, id, rec, now) {
+  const compact = {}
+  for (const [name, n] of riskReasons(rec, true)) compact[name] = n
+  const hcompact = {}
+  for (const [name, n] of riskHistReasons(rec, true)) hcompact[name] = n
+  const item = {
+    k: kind,
+    id: String(id).slice(0, 64),
+    s: Number(rec.s) || 0,
+    at: Number(rec.at) || now,
+    h: Number(rec.hits) || 0,
+    r: compact,
+    hs: Number(rec.hs) || 0,
+    hat: Number(rec.hat) || 0,
+    hr: hcompact,
+  }
+  if (kind === 'i') item.ip = String(rec.ip || id).slice(0, 64)
+  return item
+}
+
+function riskIndexMerge(items, entries, now) {
+  for (const { kind, id, rec } of entries) {
+    const item = riskIndexItem(kind, id, rec, now)
+    const at = items.findIndex((x) => x && x.k === kind && x.id === item.id)
+    if (at >= 0) items[at] = item
+    else if (riskCombinedFresh(item, now) >= RISK_LOW) items.push(item)
+  }
+  items.sort((a, b) => riskCombinedFresh(b, now) - riskCombinedFresh(a, now) || (Number(b.at) || 0) - (Number(a.at) || 0))
+  return items.slice(0, RISK_INDEX_CAP)
+}
+
 async function riskIndexPut(kv, kind, id, rec, now) {
   try {
     const items = await riskIndexGet(kv)
-    const compact = {}
-    for (const [name, n] of riskReasons(rec, true)) compact[name] = n
-    const hcompact = {}
-    for (const [name, n] of riskHistReasons(rec, true)) hcompact[name] = n
-    const item = {
-      k: kind,
-      id: String(id).slice(0, 64),
-      s: Number(rec.s) || 0,
-      at: Number(rec.at) || now,
-      h: Number(rec.hits) || 0,
-      r: compact,
-      hs: Number(rec.hs) || 0,
-      hat: Number(rec.hat) || 0,
-      hr: hcompact,
-    }
-    if (kind === 'i') item.ip = String(rec.ip || id).slice(0, 64)
-    const total = riskCombinedFresh(item, now)
-    const at = items.findIndex((x) => x && x.k === kind && x.id === item.id)
-    if (at >= 0) items[at] = item
-    else if (total >= RISK_LOW) items.push(item)
-    else return
-    items.sort((a, b) => riskCombinedFresh(b, now) - riskCombinedFresh(a, now) || (Number(b.at) || 0) - (Number(a.at) || 0))
-    await kvSave(kv, RISK_INDEX_KEY, { at: now, items: items.slice(0, RISK_INDEX_CAP) })
+    const merged = riskIndexMerge(items, [{ kind, id, rec }], now)
+    await kvSave(kv, RISK_INDEX_KEY, { at: now, items: merged })
+  } catch {}
+}
+
+/** 回溯时同一批的索引只写一次，避免每个 IP 都读写一遍索引键。 */
+async function riskIndexPutMany(kv, entries, now) {
+  if (!entries.length) return
+  try {
+    const items = await riskIndexGet(kv)
+    await kvSave(kv, RISK_INDEX_KEY, { at: now, items: riskIndexMerge(items, entries, now) })
   } catch {}
 }
 
@@ -4889,7 +4908,7 @@ async function riskHistApplyMany(kv, kind, key, id, events, meta) {
     if (meta.ip) rec.ip = String(meta.ip).slice(0, 64)
     try {
       await kvSave(kv, storageKey, rec)
-      await riskIndexPut(kv, kind, id, rec, meta.now)
+      if (!meta.noIndex) await riskIndexPut(kv, kind, id, rec, meta.now)
     } catch {}
   }
   return { added, skipped, rec }
@@ -5884,18 +5903,30 @@ async function riskBackfillEvents(kv, body, dryRun) {
   let skipped = 0
   let touched = 0
   let errors = 0
-  for (const [ip, events] of byIp) {
-    // 单个 IP 写失败不应让整批回溯失败，继续处理其它 IP。
-    try {
-      const key = (await sha256Hex(ip)).slice(0, 24)
-      const r = await riskHistApplyMany(kv, 'i', key, ip, events, { now, dryRun, ip })
-      added += r.added
-      skipped += r.skipped
-      if (r.added) touched++
-    } catch {
-      errors++
+  const indexEntries = []
+  // 单批 IP 并行写（索引延后统一写），把一次请求的往返压到可接受的范围内；
+  // 单个 IP 失败不影响整批。
+  const tasks = [...byIp.entries()]
+  let next = 0
+  const worker = async () => {
+    while (next < tasks.length) {
+      const [ip, events] = tasks[next++]
+      try {
+        const key = (await sha256Hex(ip)).slice(0, 24)
+        const r = await riskHistApplyMany(kv, 'i', key, ip, events, { now, dryRun, ip, noIndex: true })
+        added += r.added
+        skipped += r.skipped
+        if (r.added) {
+          touched++
+          if (r.rec) indexEntries.push({ kind: 'i', id: ip, rec: r.rec })
+        }
+      } catch {
+        errors++
+      }
     }
   }
+  await Promise.all(new Array(Math.min(6, tasks.length)).fill(0).map(worker))
+  if (!dryRun) await riskIndexPutMany(kv, indexEntries, now)
 
   if (!dryRun) {
     const marker = (await kvJson(kv, RISK_BACKFILL_KEY)) || { v: 1, state: {}, events: {} }
