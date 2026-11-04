@@ -123,9 +123,33 @@ function check(name, cond, extra) {
   check('license 官方签名放行', official.status !== 403)
   check('license 下发令牌', !!official.headers.get('x-csh-lic'))
 
-  const browser = await submitAs({ 'Sec-Fetch-Mode': 'cors', Origin: 'https://classsoftwarehub.cn' }, strict)
-  check('license 浏览器来源放行', browser.status !== 403)
-  const foreign = await submitAs({ 'Sec-Fetch-Mode': 'cors', Origin: 'https://evil.example.com' }, strict)
+  const BROWSER_HEADERS = {
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Site': 'same-site',
+    'Sec-Fetch-Dest': 'empty',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36',
+  }
+
+  // 严格模式下只带两件套的旧式请求不再放行：curl 补两个头就能过闸的日子结束了
+  const loose = await submitAs({ 'Sec-Fetch-Mode': 'cors', Origin: 'https://classsoftwarehub.cn' }, strict)
+  check('license 两件套不再放行', loose.status === 403, loose.status)
+
+  const browser = await submitAs(
+    { ...BROWSER_HEADERS, Origin: 'https://classsoftwarehub.cn' },
+    strict
+  )
+  check('license 浏览器来源放行', browser.status !== 403, browser.status)
+
+  const scripted = await submitAs(
+    { ...BROWSER_HEADERS, 'User-Agent': 'curl/8.4.0', Origin: 'https://classsoftwarehub.cn' },
+    strict
+  )
+  check('license 脚本 UA 拒绝', scripted.status === 403, scripted.status)
+
+  const foreign = await submitAs(
+    { ...BROWSER_HEADERS, Origin: 'https://evil.example.com' },
+    strict
+  )
   check('license 外站来源拒绝', foreign.status === 403)
 
   const legacy = await submitAs({}, { ...strict, CSH_LIC_LEGACY_UNTIL: '2099-01-01' })
@@ -166,6 +190,63 @@ function check(name, cond, extra) {
     body: JSON.stringify({ code: 'AAAAAAAAAAAAAAAA', device: '0123456789abcdef' }),
   }), { ...licEnv, ...strict }))
   check('license 错误激活码拒绝', badCode.status === 400, badCode.status)
+
+  // 没带设备码时不能签发令牌：空 d 的令牌对所有设备通用
+  const noDevice = await submitAs({ 'X-CSH-Build': buildId, 'X-CSH-Sig': sig }, strict)
+  check('license 无设备码不下发令牌', noDevice.status !== 403 && !noDevice.headers.get('x-csh-lic'), noDevice.status)
+
+  // 一码多机上限：同码第 6 台设备应被拒（默认 5 台）
+  const activateAs = (dev) => mod.onRequest(ctxOf(new Request('http://t/api/license/activate', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ code, device: dev }),
+  }), { ...licEnv, ...strict }))
+  let bound = 0
+  for (let i = 1; i <= 5; i++) {
+    const r = await activateAs(`0123456789abcde${i.toString(16)}`)
+    if (r.status === 200) bound++
+  }
+  const overflow = await activateAs('0123456789abcdf0')
+  const overflowJson = await overflow.clone().json()
+  check('license 一码多机上限', bound === 4 && overflow.status === 409 && overflowJson.code === 'csh_code_exhausted', { bound, status: overflow.status, j: overflowJson })
+}
+
+{
+  // 票据签名密钥缺失时必须整链停摆，不能退化成空密钥签名
+  const noSecret = { ...env, DL_SIGN_SECRET: '' }
+  const res = await mod.onRequest(ctxOf(new Request('http://t/api/dl-ticket', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ key: 'upload/2026/10/test.zip' }),
+  }), noSecret))
+  check('dl-ticket 无签名密钥 503', res.status === 503, res.status)
+}
+
+{
+  // 教室喊话在线登记：设备心跳必须落到注册表，且多台设备互不覆盖
+  const poll = (dev, name) => mod.onRequest(ctxOf(new Request(
+    `http://t/api/announce/poll?deviceId=${dev}&pairCode=123456&name=${encodeURIComponent(name)}`, {}), env))
+  const list = () => mod.onRequest(ctxOf(new Request(
+    'http://t/api/announce/list?pairCode=123456', { headers: { 'X-Purge-Token': 'test-token' } }), env))
+
+  const d1 = 'a1b2c3d4e5f60718'
+  const d2 = 'a1b2c3d4e5f60719'
+  const r1 = await poll(d1, 'pc-1')
+  check('announce 轮询 204', r1.status === 204, r1.status)
+  const r2 = await poll(d2, 'pc-2')
+  check('announce 第二台轮询 204', r2.status === 204, r2.status)
+
+  const l = await list()
+  const lj = await l.json().catch(() => ({}))
+  const ids = new Set(((lj && lj.devices) || []).map((d) => d.id))
+  check('announce 两台都在线', l.status === 200 && ids.has(d1) && ids.has(d2), { status: l.status, ids: [...ids] })
+
+  // 心跳时间应是毫秒时间戳，且落在在线窗口内（判离线是靠这个字段）
+  const row = ((lj && lj.devices) || []).find((d) => d.id === d1) || {}
+  check('announce 心跳为近期时间戳', Number(row.ts) > Date.now() - 300 * 1000 && Number(row.ts) <= Date.now() + 1000, row.ts)
+
+  const r3 = await poll(d1, 'pc-1')
+  check('announce 重复轮询仍 204', r3.status === 204, r3.status)
 }
 
 await Promise.allSettled(waiters)

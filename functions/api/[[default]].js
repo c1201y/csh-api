@@ -58,6 +58,17 @@ async function dlDailyLimit(env, S) {
   return Number(values.dlDailyLimit) >= 0 ? Number(values.dlDailyLimit) : DL_DAILY_LIMIT
 }
 
+/**
+ * 每来源 IP 的下载兜底额度。显式配置优先；没配就按「每设备额度 ×8」推算，
+ * 既能让共用出口 IP 的教室照常下载，又能把「轮换设备码刷额度」限制在可接受范围。
+ */
+function ipDailyCapOf(S, dayLimit) {
+  const explicit = Number(S && S.dlIpDailyCap)
+  if (Number.isFinite(explicit) && explicit > 0) return explicit
+  const per = Number(dayLimit) || 0
+  return per > 0 ? per * 8 : 0
+}
+
 const DL_KEY_PREFIX = /^(?:upload|soft|releases)\//
 
 const RELEASE_PREFIX = 'releases'
@@ -137,6 +148,9 @@ const ANN_FROM_MAX = 20
 const ANN_TTL = 180
 
 const ANN_BIND_TTL = 12 * 3600
+
+/** 在线设备心跳的最小落盘间隔：轮询很频繁，但绑定有效期有 12 小时。 */
+const ANN_TOUCH_MS = 60 * 1000
 
 const ANN_RATE_MS = 10 * 1000
 const ANN_SEND_PER_MIN = 20
@@ -432,6 +446,35 @@ async function registryGet(env, key) {
   return (out && out.file) || null
 }
 
+/**
+ * 批量读登记项。整张表是一个 blob，逐个 key 读等于把同一份数据反复拉取；
+ * 返回 null 表示这次读取本身失败（调用方据此决定是否跳过校验，避免 fail-closed 误伤）。
+ */
+async function registryGetMany(env, keys) {
+  const list = [...new Set((keys || []).filter(Boolean))].slice(0, 200)
+  if (!list.length) return {}
+  const out = await registryOp(env, { op: 'file-gets', keys: list })
+  if (!out || !out.ok || !out.files) return null
+  return out.files
+}
+
+/** 限并发地跑一组异步任务，结果按输入顺序返回。 */
+async function mapLimit(items, limit, worker) {
+  const list = Array.isArray(items) ? items : []
+  const width = Math.max(1, Math.min(Number(limit) || 1, list.length || 1))
+  const out = new Array(list.length)
+  let cursor = 0
+  const run = async () => {
+    while (true) {
+      const i = cursor++
+      if (i >= list.length) return
+      out[i] = await worker(list[i], i)
+    }
+  }
+  await Promise.all(Array.from({ length: width }, run))
+  return out
+}
+
 function registryClaim(env, keys) {
   const list = [...new Set((keys || []).filter(Boolean))]
   if (!list.length) return null
@@ -574,6 +617,15 @@ function pickBool(cfgValue, envValue, fallback) {
 const SETTINGS_KEY = 'cfg:settings'
 const SETTINGS_CACHE_MS = 15 * 1000
 
+// 生效配置在隔离实例内跨请求复用。原先只在单次请求内 memo，而每个请求都带一个
+// 新的 env 对象，等于每次都打一次存储；闸门、票据、喊话全在这条路径上。
+const SETTINGS_ISOLATE_MS = 10 * 1000
+let settingsIsolateCache = null
+
+function settingsInvalidate() {
+  settingsIsolateCache = null
+}
+
 const SETTING_GROUPS = [
   { id: 'download', title: '下载与分发', hint: '下载票据、上传签名与流量配额' },
   { id: 'submit', title: '投稿与审核', hint: '软件投稿的频次与待审上限' },
@@ -596,6 +648,17 @@ const SETTING_FIELDS = [
     unit: '次',
     def: (env) => pickNum(null, env.DL_DAILY_LIMIT, DL_DAILY_LIMIT),
     hint: '同一台设备 24 小时内最多取几次下载票据，0 表示不限。',
+  },
+  {
+    key: 'dlIpDailyCap',
+    group: 'download',
+    label: '每来源 IP 每日下载兜底',
+    type: 'num',
+    min: 0,
+    max: 100000,
+    unit: '次',
+    def: () => 0,
+    hint: '设备码可以换，IP 不好换：这里再记一本按 IP 的总账。0 表示按「每设备额度 ×8」自动推算。',
   },
   {
     key: 'dlTicketMinutes',
@@ -990,6 +1053,25 @@ const SETTING_FIELDS = [
     hint: '没有构建签名的老版本在此时间前不受闸门影响。留空表示不豁免。',
   },
   {
+    key: 'licBrowserStrict',
+    group: 'license',
+    label: '网页端严格判定',
+    type: 'bool',
+    def: (env) => String(env.CSH_LIC_BROWSER_STRICT || 'true').toLowerCase() !== 'false',
+    hint: '要求网页请求同时带齐 Fetch 元数据、来源白名单与正常浏览器 UA。站点被误伤时可临时关闭。',
+  },
+  {
+    key: 'licCodeMaxDevices',
+    group: 'license',
+    label: '单个激活码可绑定设备数',
+    type: 'num',
+    min: 0,
+    max: 100,
+    unit: '台',
+    def: (env) => Number(env.CSH_LIC_CODE_MAX_DEVICES || 5),
+    hint: '同一枚激活码最多换多少台设备的令牌，0 表示不限。重装同机不重复计数。',
+  },
+  {
     key: 'admSessionHours',
     group: 'admin',
     label: '后台会话时长',
@@ -1325,11 +1407,19 @@ async function settingsBundle(env) {
   if (memo && memo.values && now - memo.at < SETTINGS_CACHE_MS) return memo
 
   const defaults = settingsDefaults(env)
-  let stored = null
-  try {
-    const kv = await gateKv()
-    if (kv) stored = await kvJson(kv, SETTINGS_KEY)
-  } catch {}
+  // 只缓「存储里的覆盖项」，不缓合并后的生效值：默认值由 env 推导，
+  // 换一套 env（灰度、测试、多环境）算出来就该不同，缓存合并结果会让它们互相污染。
+  let stored
+  if (settingsIsolateCache && now - settingsIsolateCache.at < SETTINGS_ISOLATE_MS) {
+    stored = settingsIsolateCache.stored
+  } else {
+    stored = null
+    try {
+      const kv = await gateKv()
+      if (kv) stored = await kvJson(kv, SETTINGS_KEY)
+    } catch {}
+    settingsIsolateCache = { at: now, stored }
+  }
   const raw = stored && stored.v && typeof stored.v === 'object' ? stored.v : {}
   const overrides = {}
   const values = Object.assign({}, defaults)
@@ -1380,8 +1470,20 @@ async function submitterIdOf(data) {
   return (await sha256Hex(raw)).slice(0, 16)
 }
 
+/**
+ * 待审计数走 GitHub search 接口，限额只有 30 次/分钟。投稿重试、重复提交都会打同一份查询，
+ * 结果在 1 分钟内不会变，缓一下能省掉大部分调用。失败不缓存，避免把错误状态钉住。
+ */
+const PENDING_CACHE_MS = 60 * 1000
+const PENDING_CACHE_MAX = 500
+const pendingCache = new Map()
+
 async function countPendingIssues(env, sid) {
   if (!sid) return -1
+
+  const cached = pendingCache.get(sid)
+  if (cached && Date.now() - cached.at < PENDING_CACHE_MS) return cached.n
+
   const q = `repo:${env.GITHUB_OWNER}/${env.GITHUB_REPO} is:issue is:open label:待审核 "csh-submitter:${sid}"`
   try {
     const res = await fetch(
@@ -1394,7 +1496,10 @@ async function countPendingIssues(env, sid) {
     }
     const j = await res.json()
     const n = Number(j && j.total_count)
-    return Number.isFinite(n) ? n : -1
+    if (!Number.isFinite(n)) return -1
+    if (pendingCache.size > PENDING_CACHE_MAX) pendingCache.clear()
+    pendingCache.set(sid, { n, at: Date.now() })
+    return n
   } catch (err) {
     console.error('pending search error:', err && err.message)
     return -1
@@ -1854,66 +1959,75 @@ async function handleSubmit(request, env) {
   if (errors.length) return json({ error: errors.join('；') }, 400, request, env)
 
 
-  const sid = await submitterIdOf(data)
+  // sid 由客户端字段派生，删掉 _设备 就能让限额整体失效。缺失时退回可信 IP 摘要，
+  // 让「6 次/24h」与「待审 3 条」对匿名投稿同样生效。
+  const sid =
+    (await submitterIdOf(data)) ||
+    (await submitterIdOf({ fp: `ip:${reqIp(request)}` }))
   const gate = await submitGate(env, data, sid)
   if (!gate.ok) return json({ error: gate.error }, gate.status, request, env)
 
 
 
 
-  const unknown = []
-  for (const k of collectOssKeys(data)) {
-    if (!/^upload\//.test(k)) continue
-    if ((await registryHas(env, k)) === false) unknown.push(k)
+  // 登记表整表存在一个 blob 里，原来每个 key 读一次等于把同一张表反复拉 N 遍。
+  // 一次批量取回，顺带把后面探测要用的 size/origin 也预取好。
+  const referenced = [...new Set(collectOssKeys(data).filter((k) => /^upload\//.test(k)))]
+  const regMap = await registryGetMany(env, referenced)
+
+  if (regMap) {
+    const unknown = referenced.filter((k) => {
+      const f = regMap[k]
+      return !f || f.deleted
+    })
+    if (unknown.length) {
+      return json(
+        {
+          error:
+            '下载项里有本站未登记的文件地址（可能已被自动清理，或不是由本站上传的）。' +
+            '请重新在页面上传一次再提交。',
+          invalid: unknown,
+        },
+        400,
+        request,
+        env
+      )
+    }
   }
-  if (unknown.length) {
-    return json(
-      {
-        error:
-          '下载项里有本站未登记的文件地址（可能已被自动清理，或不是由本站上传的）。' +
-          '请重新在页面上传一次再提交。',
-        invalid: unknown,
-      },
-      400,
-      request,
-      env
-    )
-  }
 
-
-
-
-
-
-
-  const referenced = collectOssKeys(data).filter((k) => /^upload\//.test(k))
+  const gone = []
+  const oversize = []
   if (referenced.length) {
-    const gone = []
-    const oversize = []
-    for (const k of referenced) {
+    // HEAD 探测互相独立，串行会让投稿延迟随下载项数量线性增长；限 4 个并发，
+    // 既压住对中继的瞬时压力，也把总耗时收敛到常数级。
+    const probes = await mapLimit(referenced, 4, async (k) => {
       try {
         const probe = await relayOpen(env, k, 'HEAD')
-        if (!probe.reader) continue
+        if (!probe.reader) return null
         try { probe.reader.releaseLock() } catch {}
         try { probe.socket.close() } catch {}
-        if (probe.status === 404) {
-          gone.push(k)
-          continue
-        }
+        if (probe.status === 404) return { key: k, gone: true }
         if (probe.status >= 200 && probe.status < 300) {
           // PUT 预签名无法在落盘前绑定 Content-Length：提交时用 HEAD 的实际大小
           // 与登记值/上限比对，超限对象立即删除，避免「签 1 字节传 2.5GB」。
           const actual = Number(probe.headers && probe.headers['content-length'])
-          const rec = await registryGet(env, k)
+          const rec = (regMap && regMap[k]) || null
           const declared = rec && Number.isFinite(Number(rec.size)) ? Number(rec.size) : 0
           const limit = rec && String(rec.origin) === ICON_PREFIX ? ICON_SIGN_MAX_BYTES : OSS_MAX_BYTES
           if (Number.isFinite(actual) && actual > 0 && (actual > limit || (declared > 0 && actual > declared))) {
-            oversize.push({ key: k, actual, declared, limit })
+            return { key: k, actual, declared, limit }
           }
         }
+        return null
       } catch (err) {
         console.error('submit probe error:', err && err.message)
+        return null
       }
+    })
+    for (const p of probes) {
+      if (!p) continue
+      if (p.gone) gone.push(p.key)
+      else oversize.push(p)
     }
     if (oversize.length) {
       for (const item of oversize) {
@@ -2087,6 +2201,9 @@ async function handleSubmit(request, env) {
   } catch (err) {
     console.error('claim error:', err && err.message)
   }
+
+  // 刚新增一条待审记录，把待审数缓存作废，避免同一分钟内的连投绕过上限。
+  pendingCache.delete(sid)
 
   return json({
     success: true,
@@ -2630,6 +2747,12 @@ async function handleDlTicket(request, env, ctx) {
   if (!relayReady && !ossReady) {
     return json({ error: '下载服务未配置' }, 503, request, env)
   }
+  // 票据签名密钥是下载链唯一的完整性保证。缺失时 HMAC 会用空密钥，签名可离线复算，
+  // 任何人都能伪造出有效票据直取 OSS —— 宁可整条链路停摆，也不能退化成无签名。
+  if (!String(env.DL_SIGN_SECRET || '').trim()) {
+    console.error('dl-ticket: DL_SIGN_SECRET missing')
+    return json({ error: '下载服务未配置（签名密钥缺失）' }, 503, request, env)
+  }
 
   const key = String(data?.key || '').trim()
   if (!dlKeyOk(key)) return json({ error: '下载地址无效' }, 400, request, env)
@@ -2672,11 +2795,12 @@ async function handleDlTicket(request, env, ctx) {
   )
 
   if (env.DL_GATE) {
+    const dayLimit = await dlDailyLimit(env, S)
     try {
       const id = env.DL_GATE.idFromName(fpHash)
       const res = await env.DL_GATE.get(id).fetch('https://dl-gate/check', {
         method: 'POST',
-        body: JSON.stringify({ limit: await dlDailyLimit(env, S) }),
+        body: JSON.stringify({ limit: dayLimit }),
       })
       const gate = await res.json()
       if (!gate.allowed) {
@@ -2696,11 +2820,43 @@ async function handleDlTicket(request, env, ctx) {
     } catch (err) {
       console.error('dl gate error:', err && err.message)
     }
+
+    // 设备码是客户端自报的，轮换一次就是一个新桶，等于没有每日限额。
+    // 这里再按可信 IP 记一本更宽的账（默认每设备额度 ×8），把「换设备码刷下载」压回去，
+    // 又不会误伤整间教室共用一个出口 IP 的常见场景。
+    if (device) {
+      const ipCap = ipDailyCapOf(S, dayLimit)
+      if (ipCap > 0) {
+        try {
+          const ipHash = (await sha256Hex('ip:' + clientIpOf(request))).slice(0, 16)
+          const res = await env.DL_GATE.get(env.DL_GATE.idFromName('ip:' + ipHash)).fetch(
+            'https://dl-gate/check',
+            { method: 'POST', body: JSON.stringify({ limit: ipCap }) }
+          )
+          const gate = await res.json()
+          if (!gate.allowed) {
+            return json(
+              {
+                error: `这个网络的今日下载次数已达上限（${gate.limit} 次），明天再来吧。`,
+                used: gate.used,
+                limit: gate.limit,
+                remaining: 0,
+                scope: 'ip',
+              },
+              429,
+              request,
+              env
+            )
+          }
+        } catch (err) {
+          console.error('dl ip gate error:', err && err.message)
+        }
+      }
+    }
   }
 
-
-
-  const rec = await registryGet(env, key)
+  // 上面 file-get 已经把登记项读回来了，这里不再重复一次远程往返。
+  const rec = (reg && reg.file) || null
   const size = rec && Number.isFinite(Number(rec.size)) ? Number(rec.size) : 0
 
   const preferRaw = String(data?.prefer || '').trim().toLowerCase()
@@ -2793,6 +2949,9 @@ async function handleDl(request, env) {
   const mode = url.searchParams.get('m') || ''
 
   if (!dlKeyOk(key)) return json({ error: '下载地址无效' }, 400, request, env)
+  if (!String(env.DL_SIGN_SECRET || '').trim()) {
+    return json({ error: '下载服务未配置（签名密钥缺失）' }, 503, request, env)
+  }
   if (!Number.isFinite(exp) || exp * 1000 < Date.now()) {
     return json({ error: '下载链接已过期，请回站点重新点击下载' }, 410, request, env)
   }
@@ -3702,6 +3861,16 @@ async function gateRegistry(kv, body) {
     const files = (await kvJson(kv, KV_FILES)) || {}
     return { ok: true, file: files[String(body.key || '')] || null }
   }
+  if (op === 'file-gets') {
+    const keys = Array.isArray(body.keys) ? body.keys.slice(0, 200) : []
+    const files = (await kvJson(kv, KV_FILES)) || {}
+    const out = {}
+    for (const k of keys) {
+      const key = String(k || '')
+      out[key] = files[key] || null
+    }
+    return { ok: true, files: out }
+  }
   if (op === 'file-del') {
     const files = (await kvJson(kv, KV_FILES)) || {}
     const cur = files[String(body.key || '')]
@@ -3876,12 +4045,14 @@ async function gateAnn(kv, body) {
     const regKey = 'gate:ann:d:' + pairCode
     const reg = (await kvJson(kv, regKey)) || {}
     const cutoff = Date.now() - ANN_BIND_TTL * 1000
+    let cleaned = false
     for (const dev of Object.keys(reg)) {
       const v = reg[dev]
       const t = v && typeof v === 'object' ? v.t : v
-      if (!Number.isFinite(t) || t < cutoff) delete reg[dev]
+      if (!Number.isFinite(t) || t < cutoff) { delete reg[dev]; cleaned = true }
     }
-    await kvSave(kv, regKey, reg)
+    // 只有真的清掉了过期项才回写：整表无条件写会和并发的 ann-poll 心跳互相覆盖
+    if (cleaned) await kvSave(kv, regKey, reg)
     let targets
     if (Array.isArray(body.targets)) {
       targets = [...new Set(body.targets.map(String).filter((t) => reg[t]))]
@@ -3905,16 +4076,34 @@ async function gateAnn(kv, body) {
   }
   if (op === 'ann-poll') {
     const deviceId = String(body.deviceId || '')
+    const name = String(body.name || '').slice(0, 32)
     const regKey = 'gate:ann:d:' + pairCode
-    const reg = (await kvJson(kv, regKey)) || {}
-    // 单个配对码下最多登记这么多台在线设备，防止用随机设备码把注册表撑大
-    if (!reg[deviceId] && Object.keys(reg).length >= pairDeviceMax) {
-      return { ok: false, error: 'pair_full' }
-    }
-    reg[deviceId] = { t: Date.now(), n: String(body.name || '').slice(0, 32) }
-    await kvSave(kv, regKey, reg)
     const msgKey = 'gate:ann:m:' + pairCode
-    const msg = await kvJson(kv, msgKey)
+    // 注册表与待取消息互不依赖：并行读，少一个往返。poll 每台设备几十秒一次，
+    // 单次往返在边缘存储上是数百毫秒，串行读会直接顶到客户端超时。
+    const [regRaw, msg] = await Promise.all([kvJson(kv, regKey), kvJson(kv, msgKey)])
+    const reg = regRaw || {}
+    const prev = reg[deviceId]
+    const now = Date.now()
+    // 空注册表视为新配对码，按来源限量；已有设备的老码不受影响
+    if (!prev && Object.keys(reg).length === 0 && body.ipHash && body.cfg && body.cfg.newPairMax) {
+      const day = new Date(now).toISOString().slice(0, 10)
+      const quotaKey = `ann:pair:${body.ipHash}:${day}`
+      const used = Number((await kvJson(kv, quotaKey))?.n) || 0
+      if (used >= Number(body.cfg.newPairMax)) return { ok: false, error: 'pair_quota' }
+      await kvSave(kv, quotaKey, { n: used + 1, _exp: now + 2 * 86400 * 1000 })
+    }
+    // 轮询是高频行为（每台设备几十秒一次），每次整表回写的成本远高于信息价值：
+    // 绑定有效期是 12 小时，心脏跳动到分钟级足够。只有首次登记、改名、心跳过期才落盘。
+    const stale = !prev || now - (Number(prev.t) || 0) > ANN_TOUCH_MS
+    if (stale || String((prev && prev.n) || '') !== name) {
+      // 单个配对码下最多登记这么多台在线设备，防止用随机设备码把注册表撑大
+      if (!prev && Object.keys(reg).length >= pairDeviceMax) {
+        return { ok: false, error: 'pair_full' }
+      }
+      reg[deviceId] = { t: now, n: name }
+      await kvSave(kv, regKey, reg)
+    }
     if (!alive(msg)) {
       if (msg) { try { await kv.delete(msgKey) } catch {} }
       return { ok: true, msg: null }
@@ -3945,15 +4134,18 @@ async function gateAnn(kv, body) {
     }
     const cutoff = Date.now() - ANN_BIND_TTL * 1000
     const devices = []
+    let cleaned = false
     for (const [dev, v] of Object.entries(reg)) {
       const t = v && typeof v === 'object' ? v.t : v
       if (!Number.isFinite(t) || t < cutoff) {
         delete reg[dev]
+        cleaned = true
         continue
       }
       devices.push({ id: dev, name: v && typeof v === 'object' ? String(v.n || '') : '', ts: t })
     }
-    await kvSave(kv, regKey, reg)
+    // 同上：没清理就不写，避免覆盖并发心跳
+    if (cleaned) await kvSave(kv, regKey, reg)
     devices.sort((a, b) => b.ts - a.ts)
     return { ok: true, devices }
   }
@@ -4103,6 +4295,7 @@ async function announceOp(env, payload) {
         ttlSec: Number(S.annTtlSec) || ANN_TTL,
         rateMs: Number.isFinite(Number(S.annRateSec)) ? Number(S.annRateSec) * 1000 : ANN_RATE_MS,
         pairDeviceMax: Number(S.annPairDeviceMax) || ANN_PAIR_DEVICE_MAX,
+        newPairMax: Math.max(1, Number(S.annNewPairPerIpDay) || ANN_NEW_PAIR_PER_IP_DAY),
       },
     })
     const id = env.DL_GATE.idFromName(ANN_ID)
@@ -4164,29 +4357,18 @@ async function handleAnnouncePoll(request, env) {
     return json({ error: 'bad_request' }, 400, request, env)
   }
 
-  // 新配对码注册表按来源限量；已存在的配对码不受影响（轮询本身是正常高频行为）
-  const kv = await gateKv()
-  const newPairMax = Math.max(1, Number((await settingsOf(env)).annNewPairPerIpDay) || ANN_NEW_PAIR_PER_IP_DAY)
-  if (kv) {
-    try {
-      if (!(await kvJson(kv, 'gate:ann:d:' + pairCode))) {
-        const ipHash = (await sha256Hex(reqIp(request))).slice(0, 24)
-        const day = new Date().toISOString().slice(0, 10)
-        const key = `ann:pair:${ipHash}:${day}`
-        const used = Number((await kvJson(kv, key))?.n) || 0
-        if (used >= newPairMax) {
-          return json({ error: 'pair_quota' }, 429, request, env)
-        }
-        await kvSave(kv, key, { n: used + 1, _exp: Date.now() + 2 * 86400 * 1000 })
-      }
-    } catch {}
-  }
-
-  const out = await announceOp(env, { op: 'ann-poll', deviceId, pairCode, name })
+  // 新配对码按来源限量。这一步原先在这里预读一次注册表来判断「是不是新码」，
+  // 而 ann-poll 内部马上又读同一条记录 —— poll 是高频路径，重复往返直接体现在首字节延迟上，
+  // 因此判断与计数都下沉到 gateAnn，在它已读到注册表之后再做。
+  const ipHash = (await sha256Hex(reqIp(request))).slice(0, 24)
+  const out = await announceOp(env, { op: 'ann-poll', deviceId, pairCode, name, ipHash })
   if (!out) return json({ error: 'internal' }, 500, request, env)
   if (!out.ok) {
     if (out.error === 'pair_full') {
       return json({ error: 'pair_full', message: '这个配对码下的设备数已满。' }, 429, request, env)
+    }
+    if (out.error === 'pair_quota') {
+      return json({ error: 'pair_quota' }, 429, request, env)
     }
     return json({ error: out.error || 'unknown_pair' }, 403, request, env)
   }
@@ -4247,6 +4429,10 @@ const LIC_CODE_LEN = 16
 const LIC_TRY_KEY = 'lic:try:'
 
 const LIC_DEVICE_KEY = 'lic:d:'
+
+/** 单个激活码已绑定的设备集合（存设备码哈希，不存明文）。 */
+const LIC_CODE_USE_KEY = 'lic:cu:'
+const LIC_CODE_USE_TTL_MS = 400 * 24 * 3600 * 1000
 
 const LIC_DENY_BODY = {
   error: '您使用的 ClassSoftwareHub 不是正版，请输入激活码激活。',
@@ -6626,19 +6812,45 @@ async function licVerifyToken(token, device, env) {
     return null
   }
   if (!payload || payload.v !== 1) return null
-  if (payload.d && payload.d !== device) return null
+  // 令牌必须绑定设备：早期实现允许 d 为空，那种令牌对所有设备通用，
+  // 一旦随官方包流出就等于一把万能钥匙。这里一并作废。
+  if (!payload.d) return null
+  if (payload.d !== device) return null
   if (payload.e && payload.e * 1000 <= Date.now()) return null
   return payload
 }
 
 /**
- * 网页端豁免：浏览器发起的请求没有构建签名，靠来源与 fetch 元数据识别。
- * ⚠️ sec-fetch-mode 是浏览器的禁止修改头，普通 HTTP 客户端不会带 —— 提高伪造门槛，不是安全边界。
+ * 网页端豁免：浏览器发起的请求没有构建签名，靠 Fetch 元数据与来源识别。
+ *
+ * <p>这三个头浏览器都禁止页面脚本修改，普通 HTTP 客户端默认一个都不带 —— 提高伪造门槛，
+ * 不是安全边界。判定失守的后果是「闸门对网页开放」，所以另外用来源白名单与脚本 UA 兜底：
+ * 真的脚本客户端即使补齐三个头，UA 一般也还是 curl/python/okhttp 这一族。</p>
+ *
+ * <p>严格模式（licBrowserStrict，默认开）要求四件套齐全；关掉后退回旧的两件判决定，
+ * 用于线上站点万一被误伤时的应急开关，不需要重新部署。</p>
  */
-function licBrowserAllowed(request, env) {
-  if (!request.headers.get('sec-fetch-mode')) return false
+const SCRIPT_UA_RE =
+  /(?:curl|wget|python|httpx|httpie|aiohttp|okhttp|go-http-client|java\/|libwww|node-fetch|undici|axios|powershell|postmanruntime|insomnia|scrapy|guzzle|restsharp)/i
 
-  const raw = request.headers.get('origin') || request.headers.get('referer') || ''
+function licBrowserAllowed(request, env, settings) {
+  const h = request.headers
+
+  const mode = String(h.get('sec-fetch-mode') || '').trim().toLowerCase()
+  if (!mode) return false
+
+  const strict = !settings || settings.licBrowserStrict !== false
+  if (strict) {
+    const site = String(h.get('sec-fetch-site') || '').trim().toLowerCase()
+    if (site !== 'same-origin' && site !== 'same-site' && site !== 'cross-site') return false
+    const dest = String(h.get('sec-fetch-dest') || '').trim().toLowerCase()
+    // 站点只会用 fetch/XHR 调接口，dest 恒为 empty；导航、图片、脚本加载不走接口
+    if (dest && dest !== 'empty') return false
+    const ua = String(h.get('user-agent') || '')
+    if (ua.length < 12 || SCRIPT_UA_RE.test(ua)) return false
+  }
+
+  const raw = h.get('origin') || h.get('referer') || ''
   let host
   try {
     host = new URL(raw).hostname.toLowerCase()
@@ -6700,8 +6912,9 @@ async function licenseGuard(request, env) {
 
   let headers = null
   if (build && await licVerifyBuild(build, signature, env)) {
-    if (env.CSH_LICENSE_SECRET) {
-      // 官方构建只发短期令牌：密钥轮换或构建号作废后，最多一个周期自然失效
+    if (env.CSH_LICENSE_SECRET && device) {
+      // 官方构建只发短期令牌：密钥轮换或构建号作废后，最多一个周期自然失效。
+      // 没有设备码就不发 —— 空 d 的令牌对任意设备有效，等于把签名换成了万能令牌。
       const S = await settingsOf(env)
       const officialDays = Math.max(1, Number(S.licOfficialDays) || 30)
       const issued = await licIssueToken(device, 'official', officialDays, env)
@@ -6713,7 +6926,7 @@ async function licenseGuard(request, env) {
   }
 
   const settings = await settingsOf(env)
-  const exempt = (!build && licLegacyOpen(env, settings)) || licBrowserAllowed(request, env)
+  const exempt = (!build && licLegacyOpen(env, settings)) || licBrowserAllowed(request, env, settings)
   if (exempt) return null
 
   if (!licEnforce(env, settings)) {
@@ -6801,7 +7014,39 @@ async function handleLicenseActivate(request, env) {
     } catch {}
   }
 
-  const licDays = Math.max(1, Number((await settingsOf(env)).licDays) || 365)
+  // 一码多机上限：激活码本身是离线签名，服务端不建表就无法知道它被换过几次。
+  // 这里按「码 → 已绑定设备哈希集合」记一笔，同一台设备重装重复兑换不重复占额度。
+  const S2 = await settingsOf(env)
+  const maxDevices = Math.max(0, Number(S2.licCodeMaxDevices) || 0)
+  if (kv && maxDevices > 0) {
+    try {
+      const codeKey = LIC_CODE_USE_KEY + (await sha256Hex(code)).slice(0, 16)
+      const rec = (await kvJson(kv, codeKey)) || null
+      const bound = rec && Array.isArray(rec.d) ? rec.d.filter((x) => typeof x === 'string') : []
+      const self = (await sha256Hex(device)).slice(0, 16)
+      if (!bound.includes(self)) {
+        if (bound.length >= maxDevices) {
+          return json(
+            {
+              error: `这个激活码已绑定 ${bound.length} 台设备（上限 ${maxDevices} 台）。换机请把设备码 ${device} 发给开发者申请解绑。`,
+              code: 'csh_code_exhausted',
+              bound: bound.length,
+              limit: maxDevices,
+            },
+            409,
+            request,
+            env
+          )
+        }
+        bound.push(self)
+        await kvSave(kv, codeKey, { d: bound, at: Date.now(), _exp: Date.now() + LIC_CODE_USE_TTL_MS })
+      }
+    } catch (err) {
+      console.error('code use check error:', err && err.message)
+    }
+  }
+
+  const licDays = Math.max(1, Number(S2.licDays) || 365)
   const issued = await licIssueToken(device, code.slice(-4), licDays, env)
 
   const deviceRec = {
@@ -8748,19 +8993,28 @@ async function kvListKeys(kv, prefix) {
   return []
 }
 
-/** 在线窗口：客户端轮询间隔最慢 120 秒，留一个周期余量。 */
-const ADM_ONLINE_WINDOW_MS = 180 * 1000
+/**
+ * 在线窗口。客户端默认 30 秒一轮，连续失败会退避到 120 秒；
+ * 心跳本身按 ANN_TOUCH_MS 节流落盘，所以实际可见的最近心跳会再晚 60 秒。
+ * 取 300 秒 = 退避上限 + 节流 + 一个周期余量，避免把「网络抖动但还活着」的设备判成离线。
+ */
+const ADM_ONLINE_WINDOW_MS = 300 * 1000
 
 /** 在线设备 = 教室喊话轮询（ann-poll）心跳仍在窗口内的设备，按配对码分组。 */
 async function admOnlineDevices(kv) {
   const keys = await kvListKeys(kv, 'gate:ann:d:')
   const now = Date.now()
+  const pairs = keys
+    .map((key) => ({ key, pair: key.slice('gate:ann:d:'.length) }))
+    .filter((it) => /^\d{6}$/.test(it.pair))
+  // 多间教室各自一个配对码：逐个 await 会把延迟叠成「配对码数 × 单次往返」，并行读
+  const regs = await Promise.all(
+    pairs.map((it) => kvJson(kv, it.key).catch(() => null))
+  )
   const out = []
-  for (const key of keys) {
-    const pair = key.slice('gate:ann:d:'.length)
-    if (!/^\d{6}$/.test(pair)) continue
-    const reg = await kvJson(kv, key)
-    if (!reg || typeof reg !== 'object') continue
+  regs.forEach((reg, i) => {
+    if (!reg || typeof reg !== 'object') return
+    const pair = pairs[i].pair
     for (const [dev, v] of Object.entries(reg)) {
       const ts = Number(v && typeof v === 'object' ? v.t : v)
       if (!Number.isFinite(ts) || now - ts > ADM_ONLINE_WINDOW_MS) continue
@@ -8771,7 +9025,7 @@ async function admOnlineDevices(kv) {
         ts,
       })
     }
-  }
+  })
   out.sort((a, b) => b.ts - a.ts)
   return out
 }
@@ -8987,6 +9241,7 @@ async function handleAdminSettingsSave(request, env) {
   }
 
   await kvSave(kv, SETTINGS_KEY, { v: next, at: Date.now(), by: admUser(env) })
+  settingsInvalidate()
   await admAudit(env, 'settings', { changes: changes.slice(0, 24) })
   console.log(`admin: ${(sess && sess.user) || 'service'} settings changed=${changes.length}`)
   return admJson({ ok: true, changed: changes.length, changes })
@@ -9263,6 +9518,39 @@ async function routeRequest(request, env, ctx) {
     return json({ error: 'Not Found' }, 404, request, env)
 }
 
+/**
+ * 状态页每 30 秒轮询一次，而其中「列举整个桶」与「GitHub 速率探测」都是外网开销。
+ * 这两项结果在分钟级内不会变，缓存 45 秒即可把轮询成本摊薄一半以上。
+ */
+const STATUS_PROBE_MS = 45 * 1000
+let statusProbeCache = null
+
+async function statusProbes(env) {
+  const now = Date.now()
+  if (statusProbeCache && now - statusProbeCache.at < STATUS_PROBE_MS) return statusProbeCache.data
+
+  const data = { oss: false, ossFiles: null, ossObjects: 0, ossProbeMs: 0, githubApi: false }
+  try {
+    const t0 = Date.now()
+    const l = await relayListDetailed(env, '')
+    data.oss = l !== null
+    data.ossProbeMs = Date.now() - t0
+    data.ossObjects = l ? l.objects.length : 0
+    data.ossFiles = l ? l.objects.length : null
+  } catch (err) {
+    console.error('status oss probe error:', err && err.message)
+  }
+  try {
+    const r = await fetch('https://api.github.com/rate_limit', {
+      headers: { 'User-Agent': 'csh-status' },
+    })
+    data.githubApi = r.ok
+  } catch {}
+
+  statusProbeCache = { at: now, data }
+  return data
+}
+
 async function handleStatus(request, env) {
   const started = Date.now()
   const kv = await gateKv()
@@ -9328,24 +9616,12 @@ async function handleStatus(request, env) {
       need: [].concat(missingOss, env.SIGN_API_KEY ? [] : ['SIGN_API_KEY'], gateOk ? [] : ['状态存储']),
     },
   ]
-  try {
-    const t0 = Date.now()
-    const l = await relayListDetailed(env, '')
-    out.services.oss = l !== null
-    out.ossProbeMs = Date.now() - t0
-    out.ossObjectsProbed = l ? l.objects.length : 0
-    out.ossFiles = l ? l.objects.length : null
-  } catch (err) {
-    out.services.oss = false
-  }
-  try {
-    const r = await fetch('https://api.github.com/rate_limit', {
-      headers: { 'User-Agent': 'csh-status' },
-    })
-    out.services.githubApi = r.ok
-  } catch (err) {
-    out.services.githubApi = false
-  }
+  const probes = await statusProbes(env)
+  out.services.oss = probes.oss
+  out.ossProbeMs = probes.ossProbeMs
+  out.ossObjectsProbed = probes.ossObjects
+  out.ossFiles = probes.ossFiles
+  out.services.githubApi = probes.githubApi
   try {
     const s = await registryOp(env, { op: 'stats' })
     if (s && s.ok) out.stats = { files: s.files, icons: s.icons, pending: s.pending, month: s.month, relay: s.relay, direct: s.direct }
