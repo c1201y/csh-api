@@ -4909,8 +4909,10 @@ const RISK_TRUST_PREFIX = 'lic:risk:trust:'
 const RISK_TRUST_INDEX_KEY = 'lic:risk:trust:idx'
 const RISK_TRUST_CAP = 300
 // 这些规则信号本身不足以判死刑，但足以佐证模型的高置信判断。
+// 注意：脚本 UA（curl/wget/python 等）和缺少 UA 都不在此列——命令行客户端与 SDK
+// 本来就可能这样发请求，只能作为低权重观测，不能用来佐证封禁。
 const RISK_AUTOBAN_STRONG = [
-  'probe_path', 'sensitive_query', 'scanner_ua', 'headless_ua', 'script_ua', 'bad_method',
+  'probe_path', 'sensitive_query', 'scanner_ua', 'headless_ua', 'bad_method',
   'bad_device_id', 'dl_probe', 'mirror_path', 'mirror_repo_probe', 'dl_range_abuse',
   'header_abuse', 'missing_device',
 ]
@@ -5046,7 +5048,6 @@ const RISK_WEIGHTS = {
   mirror_repo_probe: 12,
   combo: 10,
   repeat_offender: 10,
-  empty_ua: 10,
   script_ua: 10,
   dl_hotlink: 8,
   ssh_accepted: 8,
@@ -5059,6 +5060,39 @@ const RISK_WEIGHTS = {
   ml_anomaly: 10,
   ml_high: 18,
   ml_repeat: 12,
+}
+
+// 单类信号的累计上限。权重只表示“命中一次”的分量，重复命中不能无限叠加：
+// 命令行/HTTP 客户端天然可能不带 UA，若按次累加，几十个正常请求就能把一个设备堆成高
+// 风险。所有上限都低于 RISK_HIGH，单一信号再高频也无法单独定性，必须多类证据叠加。
+const RISK_SIGNAL_CAP = {
+  script_ua: 20, bot_ua: 16, err4xx: 20, burst: 20,
+  rate_limited: 25, oss_list: 12, ml_anomaly: 20, ml_repeat: 24,
+  missing_device: 16, header_abuse: 30, headless_ua: 30, dl_hotlink: 32,
+  crawl_sweep: 30, multi_probe: 30, combo: 20, repeat_offender: 20,
+  oss_burst: 30, oss_list_abuse: 40, dl_range_abuse: 40,
+  dl_probe: 40, mirror_path: 40, mirror_repo_probe: 40,
+  probe_path: 45, sensitive_query: 40, scanner_ua: 40, bad_device_id: 40,
+  bad_method: 24, banned_hit: 40, ssh_brute: 45, auth_brute: 45,
+  oss_auth_fail: 40, oss_delete: 40, dl_sign_fail: 40,
+  ssh_invalid_user: 40, ssh_root_attempt: 40, ssh_sudo_fail: 40, ssh_accepted: 40,
+  site_drop: 40, path_sweep: 40,
+}
+const RISK_SIGNAL_CAP_DEFAULT = 40
+
+function riskSignalCap(name) {
+  const v = RISK_SIGNAL_CAP[name]
+  return v === undefined ? RISK_SIGNAL_CAP_DEFAULT : v
+}
+
+/** 一组信号的理论分上限；旧记录里已移除的信号（如 empty_ua）不再计分。 */
+function riskScoreCap(reasons) {
+  let sum = 0
+  for (const name of Object.keys(reasons || {})) {
+    if (!RISK_WEIGHTS[name]) continue
+    sum += riskSignalCap(name)
+  }
+  return Math.min(100, sum)
 }
 
 const RISK_LABELS = {
@@ -5077,7 +5111,6 @@ const RISK_LABELS = {
   headless_ua: '无头浏览器 UA',
   combo: '多类信号组合',
   repeat_offender: '历史风险重现',
-  empty_ua: '缺少 User-Agent',
   script_ua: '脚本/命令行 UA',
   missing_device: '敏感接口缺少设备码',
   bot_ua: '爬虫/采集 UA',
@@ -5154,7 +5187,8 @@ function riskDecisionOf(score, evidence, paths, cfg) {
 function riskFreshScore(rec, now = Date.now()) {
   const at = Number(rec && rec.at) || now
   const score = Number(rec && rec.s) || 0
-  return Math.max(0, Math.round(score * Math.pow(0.5, Math.max(0, now - at) / RISK_HALF_MS)))
+  const decayed = Math.max(0, Math.round(score * Math.pow(0.5, Math.max(0, now - at) / RISK_HALF_MS)))
+  return Math.min(decayed, riskScoreCap(rec && rec.r))
 }
 
 function riskReasons(rec, compact) {
@@ -5195,10 +5229,14 @@ function riskPathSignals(path, search) {
   return out
 }
 
-/** UA 分类：扫描器 > 无头浏览器 > 脚本客户端 > 采集爬虫 > 空 UA。 */
+/**
+ * UA 分类：扫描器 > 无头浏览器 > 脚本客户端 > 采集爬虫。
+ * 空 UA 不作为风险信号：命令行客户端、HTTP SDK、健康检查天然可以不带 UA，
+ * 扫描行为由 probe_path / scanner_ua / 4xx 等真正的攻击特征负责识别。
+ */
 function riskUaSignal(ua) {
   const text = String(ua || '')
-  if (!text) return { empty_ua: 1 }
+  if (!text) return {}
   if (RISK_SCANNER_UA_RE.test(text)) return { scanner_ua: text.slice(0, 60) }
   if (RISK_HEADLESS_UA_RE.test(text)) return { headless_ua: text.slice(0, 60) }
   if (RISK_SCRIPT_UA_RE.test(text)) return { script_ua: text.slice(0, 60) }
@@ -5968,7 +6006,8 @@ function riskHistFresh(rec, now = Date.now()) {
   const at = Number(rec && rec.hat) || 0
   if (!at) return 0
   const score = Number(rec && rec.hs) || 0
-  return Math.max(0, Math.round(score * Math.pow(0.5, Math.max(0, now - at) / RISK_HIST_HALF_MS)))
+  const decayed = Math.max(0, Math.round(score * Math.pow(0.5, Math.max(0, now - at) / RISK_HIST_HALF_MS)))
+  return Math.min(decayed, riskScoreCap(rec && rec.hb))
 }
 
 /** 实时分与历史分取较大值：两者都是“同一对象可疑程度”的估计，取 max 避免重复计分。 */
@@ -6103,7 +6142,7 @@ async function riskApply(kv, kind, key, id, signals, meta) {
     rec.r[name] = r
   }
   if (!add && !rec.s) return rec
-  rec.s = Math.min(100, Math.round((Number(rec.s) || 0) + add))
+  rec.s = Math.min(riskScoreCap(rec.r), Math.min(100, Math.round((Number(rec.s) || 0) + add)))
   rec.at = meta.now
   rec.hits = Math.min(99999, (Number(rec.hits) || 0) + 1)
   if (meta.ip) rec.ip = String(meta.ip).slice(0, 64)
@@ -6567,9 +6606,11 @@ function riskLiveVerdict(env, request, url, model, p, signals, repeat, cfg) {
       signals: strong.concat(['ml_high']),
     }
   }
+  // 模型高置信重复也必须有一类真正的规则证据；否则 CLI 正常遍历多个接口
+  // （无 UA、路径各异）会被模型波动单独判成封禁。
   const minHits = Math.max(1, Number(cfg.minHits) || 3)
   const minPaths = Math.max(2, Number(cfg.minPaths) || 2)
-  if (repeat && repeat.n >= minHits && repeat.paths >= minPaths) {
+  if (strong.length >= 1 && repeat && repeat.n >= minHits && repeat.paths >= minPaths) {
     return {
       ip,
       reason: `ml_repeat ${repeat.n}/${repeat.paths}`,

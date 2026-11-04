@@ -137,6 +137,52 @@ log('关闭下载面封禁后不动作', offDl.status === 200 && offDl.data.acti
 const bansOff = await jsonOf(await admin('/api/admin/ip-bans'))
 log('分面开关反映到策略快照', bansOff.status === 200 && !!(bansOff.data.cfg.surfaces) && bansOff.data.cfg.surfaces.download.on === false)
 
+// ── 9. 无 UA / 单一弱信号不能把设备堆成高风险 ─────────────────────
+const cliDev = 'c11a2b3c4d5e6f70'
+store.set('lic:d:' + cliDev, JSON.stringify({ at: Date.now(), first: Date.now() }))
+await onRequest({
+  request: new Request('https://api.test/api/status', {
+    headers: { 'x-csh-did': cliDev, 'cf-connecting-ip': '198.18.9.9' },
+  }),
+  env,
+  waitUntil(p) { pending.push(p) },
+})
+await flush()
+const cliRecRaw = store.get('lic:risk:d:' + cliDev)
+const cliRec = cliRecRaw ? JSON.parse(cliRecRaw) : null
+log('无 UA 的命令行请求不产生风险信号', !cliRec || !cliRec.r || !cliRec.r.empty_ua,
+  cliRec ? `reasons=${JSON.stringify(cliRec.r)}` : '未写入风险记录')
+
+const now = Date.now()
+const legacy = '5cc4d1a3ab98db19'
+const scriptOnly = 'f00dbabe12345678'
+store.set('lic:risk:d:' + legacy, JSON.stringify({
+  s: 99, at: now, r: { empty_ua: { n: 88 }, err4xx: { n: 1 } }, hits: 88, ip: 'unknown', _exp: now + 86400000,
+}))
+store.set('lic:risk:d:' + scriptOnly, JSON.stringify({
+  s: 100, at: now, r: { script_ua: { n: 90 } }, hits: 90, ip: 'unknown', _exp: now + 86400000,
+}))
+store.set('lic:risk:index', JSON.stringify({
+  at: now,
+  items: [
+    { k: 'd', id: legacy, ip: 'unknown', s: 99, at: now, h: 88, r: { empty_ua: 88, err4xx: 1 }, hs: 0, hat: 0, hr: {} },
+    { k: 'd', id: scriptOnly, ip: 'unknown', s: 100, at: now, h: 90, r: { script_ua: 90 }, hs: 0, hat: 0, hr: {} },
+  ],
+}))
+const legacyList = await jsonOf(await admin('/api/admin/risk?kind=d'))
+const legacyRow = (legacyList.data.items || []).find((x) => x.id === legacy)
+const scriptRow = (legacyList.data.items || []).find((x) => x.id === scriptOnly)
+log('旧的无 UA 记录被压回低风险且不再展示该原因', !!legacyRow && legacyRow.s <= 20 && legacyRow.level === 'low' &&
+  !(legacyRow.reasons || []).some((r) => r.key === 'empty_ua'),
+  legacyRow && `s=${legacyRow.s} level=${legacyRow.level} reasons=${JSON.stringify(legacyRow.reasons.map((r) => r.key))}`)
+log('单一弱信号重复 90 次也达不到高风险', !!scriptRow && scriptRow.s <= 20 && scriptRow.level !== 'high',
+  scriptRow && `s=${scriptRow.s} level=${scriptRow.level}`)
+const legacyDetail = await jsonOf(await admin('/api/admin/device-events?device=' + legacy))
+log('设备详情不再把无 UA 当风险原因', legacyDetail.status === 200 &&
+  Number(legacyDetail.data.risk && legacyDetail.data.risk.s) <= 20 &&
+  !((legacyDetail.data.risk && legacyDetail.data.risk.reasons) || []).some((r) => r.key === 'empty_ua'),
+  `s=${legacyDetail.data.risk && legacyDetail.data.risk.s} level=${legacyDetail.data.risk && legacyDetail.data.risk.level}`)
+
 await flush()
 console.log(failed ? `\n${failed} 项失败` : '\n全部通过')
 process.exitCode = failed ? 1 : 0
