@@ -100,13 +100,22 @@ log('OSS 鉴权失败触发封禁', oss.status === 200 && oss.data.actions.lengt
 
 // ── 6. 全站代理扫描 + 设备码联动 ───────────────────────────────────
 const device = 'a1b2c3d4e5f60718'
+const victim = 'b2c3d4e5f6071829'
 store.set('lic:d:' + device, JSON.stringify({ at: Date.now(), first: Date.now() }))
+store.set('lic:risk:d:' + device, JSON.stringify({
+  s: 60, at: Date.now(), ip: '198.18.1.6', r: { probe_path: { n: 10 } }, hits: 10, _exp: Date.now() + 86400000,
+}))
+store.set('lic:d:' + victim, JSON.stringify({ at: Date.now(), first: Date.now() }))
+store.set('lic:risk:d:' + victim, JSON.stringify({
+  s: 20, at: Date.now(), ip: '203.0.113.9', r: { err4xx: { n: 1 } }, hits: 1, _exp: Date.now() + 86400000,
+}))
 const siteEv = evs('198.18.1.6', 10, {
   status: 444,
   path: '/.env',
   ua: 'sqlmap/1.7.2#stable (https://sqlmap.org)',
   device,
 })
+siteEv.push({ ...siteEv[0], id: 'victim-spoof-1', device: victim })
 const site = await report('site', siteEv)
 const devBan = store.has('lic:ban:' + device) ? JSON.parse(store.get('lic:ban:' + device)) : null
 const siteRec = store.has(ipKey('198.18.1.6')) ? JSON.parse(store.get(ipKey('198.18.1.6'))) : null
@@ -114,6 +123,7 @@ log('全站代理扫描触发封禁', site.status === 200 && site.data.actions.l
   `actions=${JSON.stringify(site.data.actions)}`)
 log('封禁联动已登记设备码', !!devBan && !!siteRec && devBan.until === siteRec.until,
   devBan && `until=${devBan.until} reason=${devBan.reason}`)
+log('伪造设备码不联动封禁', !store.has('lic:ban:' + victim))
 
 const bans = await jsonOf(await admin('/api/admin/ip-bans'))
 const siteRow = (bans.data.rows || []).find((r) => r.ip === '198.18.1.6')
@@ -190,6 +200,15 @@ log('设备详情不再展示 unknown 来源 IP', legacyDetail.status === 200 &&
 const site4xx = await report('site', evs('198.18.1.10', 20, { status: 403, path: '/assets/app.js', tag: 's4' }))
 log('全站代理连续 403 不封禁', site4xx.status === 200 && site4xx.data.actions.length === 0 && !store.has(ipKey('198.18.1.10')),
   `actions=${JSON.stringify(site4xx.data.actions)} tiers=${(site4xx.data.tiers || []).length}`)
+
+const headless = await report('site', evs('198.18.1.12', 15, {
+  status: 200,
+  path: '/normal/page',
+  ua: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 HeadlessChrome/130.0.0.0 Safari/537.36',
+  tag: 'hl',
+}))
+log('无头浏览器正常访问不封禁', headless.status === 200 && headless.data.actions.length === 0 && !store.has(ipKey('198.18.1.12')),
+  `actions=${JSON.stringify(headless.data.actions)} tiers=${(headless.data.tiers || []).length}`)
 
 const rangeMany = Array.from({ length: 20 }, (_, i) => ({
   id: `range-many-${i}`,

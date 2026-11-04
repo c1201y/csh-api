@@ -8848,7 +8848,8 @@ function riskServerHitCount(src, sig, n) {
   if (src === 'download') return has('dl_sign_fail', 'dl_probe', 'dl_hotlink') ? n : 0
   if (src === 'mirror') return has('mirror_path', 'mirror_repo_probe') ? n : 0
   // 401/403 在授权过期、站点维护时也会成批出现，不能单独触发封禁；只保留明确攻击特征。
-  if (src === 'site') return has('site_drop', 'probe_path', 'sensitive_query', 'scanner_ua', 'headless_ua') ? n : 0
+  // 无头浏览器 UA 也可能来自正常自动化/巡检，同样只累计分数，由多类证据决定动作。
+  if (src === 'site') return has('site_drop', 'probe_path', 'sensitive_query', 'scanner_ua') ? n : 0
   return 0
 }
 
@@ -8857,6 +8858,14 @@ async function riskDeviceBanApply(kv, env, device, opts) {
   if (!kv || !deviceIdOk(device)) return null
   const known = await kvJson(kv, LIC_DEVICE_KEY + device)
   if (!known || !alive(known)) return null
+  // 设备码不是密钥，任何人都能放进请求头。只有该设备确实在同一来源 IP 出现过，
+  // 才联动封禁；否则伪造别人的设备码就能让无辜设备被连坐。
+  const ip = String((opts && opts.ip) || '').trim()
+  if (ip) {
+    const risk = await kvJson(kv, RISK_DEVICE_PREFIX + device)
+    const seen = risk && String(risk.ip || '')
+    if (!seen || seen === 'unknown' || seen !== ip) return null
+  }
   const until = Math.max(0, Number(opts && opts.until) || 0)
   const reason = String((opts && opts.reason) || '').slice(0, 80)
   await kvSave(kv, ADM_BAN_KEY + device, { at: Date.now(), until, reason, by: 'risk-auto' })
@@ -8979,7 +8988,7 @@ async function handleAdminRiskReport(request, env) {
           })
           if (cfg.deviceLink) {
             for (const device of devices) {
-              const linked = await riskDeviceBanApply(kv, env, device, { until: rec.until, reason: `linked:${rec.reason}` })
+              const linked = await riskDeviceBanApply(kv, env, device, { ip, until: rec.until, reason: `linked:${rec.reason}` })
               if (linked) {
                 const hit = actions[actions.length - 1]
                 hit.devices = (hit.devices || []).concat(device.slice(-8))
@@ -9394,7 +9403,7 @@ async function workerFetch(request, env, ctx) {
           // 已登记设备随 IP 一起封禁；设备闸门在许可判定前生效，无法换 IP 绕过。
           if (riskCfg.deviceLink) {
             const dev = deviceIdOf(request)
-            if (dev) await riskDeviceBanApply(kv, env, dev, { until: ban.until, reason: `linked:${verdict.reason}` }).catch(() => {})
+            if (dev) await riskDeviceBanApply(kv, env, dev, { ip: verdict.ip, until: ban.until, reason: `linked:${verdict.reason}` }).catch(() => {})
           }
           // 高置信自动封禁同时作为正样本入反馈集，供后续自学习使用（去重，不会刷容量）。
           if (mlTokens.length) {
