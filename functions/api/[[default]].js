@@ -1119,6 +1119,58 @@ const SETTING_FIELDS = [
     def: (env) => Math.round(riskEnvNum(env, 'CSH_RISK_SSH_WINDOW_MS', 15 * 60000, 60000, 86400000) / 60000),
     hint: '只统计最近这段时间内的 SSH 失败。',
   },
+  {
+    key: 'riskBanMinHits',
+    group: 'risk',
+    label: '重复命中封禁阈值',
+    type: 'num',
+    min: 1,
+    max: 20,
+    unit: '次',
+    def: (env) => riskEnvNum(env, 'CSH_RISK_BAN_HITS', 3, 1, 20),
+    hint: '滑动窗口内同一 IP 高置信命中达到该次数才自动封禁；调高更保守。',
+  },
+  {
+    key: 'riskBanMinPaths',
+    group: 'risk',
+    label: '重复命中路径数',
+    type: 'num',
+    min: 2,
+    max: 10,
+    unit: '条',
+    def: (env) => riskEnvNum(env, 'CSH_RISK_BAN_PATHS', 2, 2, 10),
+    hint: '与上面的次数同时满足才会触发重复命中封禁，避免单接口抖动误封。',
+  },
+  {
+    key: 'riskTrustHours',
+    group: 'risk',
+    label: '误报解封信任时长',
+    type: 'num',
+    min: 0,
+    max: 168,
+    unit: '小时',
+    def: (env) => riskEnvNum(env, 'CSH_RISK_TRUST_HOURS', 24, 0, 168),
+    hint: '手动解封并标记误报后，该 IP 在此期间不会被自动封禁；0 表示关闭。',
+  },
+  {
+    key: 'riskLearnOn',
+    group: 'risk',
+    label: '自学习',
+    type: 'bool',
+    def: (env) => riskEnvFlag(env, 'CSH_RISK_LEARN', true),
+    hint: '用人工标注与高置信自动样本做增量更新，带锚点守卫与版本回滚。',
+  },
+  {
+    key: 'riskLearnMin',
+    group: 'risk',
+    label: '自动学习最少新增标注',
+    type: 'num',
+    min: 5,
+    max: 500,
+    unit: '条',
+    def: (env) => riskEnvNum(env, 'CSH_RISK_LEARN_MIN', 20, 5, 500),
+    hint: '新增标注达到该数量后，下次巡检触发一次自动学习；手动学习不受限制。',
+  },
 ]
 
 /**
@@ -4595,6 +4647,10 @@ const RISK_IP_BAN_INDEX_CAP = 300
 const RISK_IP_BAN_RETAIN_MS = 7 * 86400000
 const RISK_ML_HIT_WINDOW_MS = 10 * 60 * 1000
 const RISK_ML_HIT_CAP = 40
+// 误报信任名单：管理员解封并标记误报后短期不参与自动封禁，用于压低误报。
+const RISK_TRUST_PREFIX = 'lic:risk:trust:'
+const RISK_TRUST_INDEX_KEY = 'lic:risk:trust:idx'
+const RISK_TRUST_CAP = 300
 // 这些规则信号本身不足以判死刑，但足以佐证模型的高置信判断。
 const RISK_AUTOBAN_STRONG = [
   'probe_path', 'sensitive_query', 'scanner_ua', 'headless_ua', 'script_ua', 'bad_method',
@@ -4611,7 +4667,10 @@ function riskEnvFlag(env, name, fallback) {
 }
 
 function riskEnvNum(env, name, fallback, min, max) {
-  const n = Number((env && env[name]) ?? '')
+  const raw = env && env[name]
+  // 未配置或空字符串必须走 fallback；Number('') === 0 会把所有缺省值压到下限。
+  if (raw === undefined || raw === null || String(raw).trim() === '') return fallback
+  const n = Number(raw)
   if (!Number.isFinite(n)) return fallback
   return Math.max(min, Math.min(max, n))
 }
@@ -4638,6 +4697,15 @@ function riskAutoBanCfg(env, S) {
       .map((s) => s.trim())
       .filter(Boolean),
   }
+  const clamp = (n, lo, hi, fb) => {
+    const v = Number(n)
+    return Number.isFinite(v) ? Math.max(lo, Math.min(hi, v)) : fb
+  }
+  cfg.minHits = clamp(pick('riskBanMinHits', riskEnvNum(env, 'CSH_RISK_BAN_HITS', 3, 1, 20)), 1, 20, 3)
+  cfg.minPaths = clamp(pick('riskBanMinPaths', riskEnvNum(env, 'CSH_RISK_BAN_PATHS', 2, 2, 10)), 2, 10, 2)
+  cfg.trustHours = clamp(pick('riskTrustHours', riskEnvNum(env, 'CSH_RISK_TRUST_HOURS', 24, 0, 168)), 0, 168, 24)
+  cfg.learnOn = pick('riskLearnOn', riskEnvFlag(env, 'CSH_RISK_LEARN', true)) !== false
+  cfg.learnMin = clamp(pick('riskLearnMin', riskEnvNum(env, 'CSH_RISK_LEARN_MIN', 20, 5, 500)), 5, 500, 20)
   riskMlRuntimeOn = !!cfg.mlOn
   return cfg
 }
@@ -5015,6 +5083,14 @@ function riskHistSignalsOfEvent(ev) {
 // 模型存在 KV（lic:risk:model），运行时只读、按 60 秒缓存；模型缺失或损坏时规则引擎照常工作。
 // 权重刻意压得比规则信号低：单靠模型不足以判高风险，只作为叠加证据。
 const RISK_MODEL_KEY = 'lic:risk:model'
+const RISK_MODEL_PREV_KEY = 'lic:risk:model:prev'
+const RISK_LEARN_KEY = 'lic:risk:model:train'
+const RISK_LEARN_LOCK_KEY = 'lic:risk:learn:lock'
+const RISK_FB_META_KEY = 'lic:risk:fb:meta'
+const RISK_FB_PREFIX = 'lic:risk:fb:c:'
+const RISK_FB_CHUNKS = 6
+const RISK_FB_CHUNK_CAP = 200
+const RISK_FB_TOKEN_MAX = 96
 const RISK_ML_FEATURE = 'risk-request-v2'
 const RISK_ML_DIM_MAX = 4096
 const RISK_ML_CACHE_MS = 60 * 1000
@@ -5337,6 +5413,7 @@ function riskMlCompile(raw) {
   const high = Math.min(0.99, Math.max(threshold, Number.isFinite(highRaw) && highRaw > 0 ? highRaw : threshold + 0.15))
   return {
     v: 1,
+    mv: Math.max(1, Math.floor(Number(raw.mv) || 1)),
     feature: RISK_ML_FEATURE,
     dim,
     bias,
@@ -5844,6 +5921,92 @@ function riskIpHash(ip) {
   return task
 }
 
+/** 管理员标记误报并解封后，该 IP 在指定时长内不参与自动封禁。 */
+async function riskIpTrusted(kv, ip, now) {
+  if (!kv) return false
+  const hash = await riskIpHash(ip)
+  if (!hash) return false
+  try {
+    const rec = await kvJson(kv, RISK_TRUST_PREFIX + hash)
+    return Number(rec && rec.until) > now
+  } catch {
+    return false
+  }
+}
+
+async function riskIpTrustSet(kv, ip, hours, by, reason) {
+  if (!kv) return null
+  const text = String(ip || '').trim().slice(0, 64)
+  const span = Math.max(0, Math.min(168, Number(hours) || 0))
+  if (!text || text === 'unknown' || span <= 0) return null
+  const hash = await riskIpHash(text)
+  if (!hash) return null
+  const now = Date.now()
+  const rec = {
+    ip: text,
+    at: now,
+    until: now + span * 3600000,
+    hours: span,
+    by: String(by || 'admin').slice(0, 32),
+    reason: String(reason || '').slice(0, 80),
+  }
+  rec._exp = rec.until + 86400000
+  await kvSave(kv, RISK_TRUST_PREFIX + hash, rec)
+  await riskIpTrustIndexPut(kv, hash, rec)
+  return rec
+}
+
+async function riskIpTrustIndexPut(kv, hash, rec) {
+  try {
+    const idx = await kvJson(kv, RISK_TRUST_INDEX_KEY)
+    const items = Array.isArray(idx && idx.items) ? idx.items : []
+    const item = { ip: rec.ip, at: rec.at, until: rec.until, by: rec.by, reason: rec.reason, h: hash }
+    const at = items.findIndex((x) => x && (x.h === hash || x.ip === rec.ip))
+    if (at >= 0) items[at] = item
+    else items.unshift(item)
+    const now = Date.now()
+    const live = (x) => Number(x.until) > now
+    items.sort((a, b) => (live(b) - live(a)) || (Number(b.at) || 0) - (Number(a.at) || 0))
+    const kept = items.slice(0, RISK_TRUST_CAP)
+    for (const x of items.slice(RISK_TRUST_CAP).slice(0, 20)) {
+      if (x && x.h && !live(x)) {
+        try { await kv.delete(RISK_TRUST_PREFIX + x.h) } catch {}
+      }
+    }
+    await kvSave(kv, RISK_TRUST_INDEX_KEY, { at: now, items: kept })
+  } catch {}
+}
+
+async function riskIpTrustList(kv, now) {
+  if (!kv) return []
+  try {
+    const idx = await kvJson(kv, RISK_TRUST_INDEX_KEY)
+    const items = Array.isArray(idx && idx.items) ? idx.items : []
+    return items.filter((x) => x && Number(x.until) > now)
+  } catch {
+    return []
+  }
+}
+
+async function riskIpTrustClear(kv, ip) {
+  if (!kv) return false
+  const text = String(ip || '').trim()
+  if (!text) return false
+  const hash = await riskIpHash(text)
+  if (!hash) return false
+  let had = false
+  try {
+    had = !!(await kvJson(kv, RISK_TRUST_PREFIX + hash))
+    await kv.delete(RISK_TRUST_PREFIX + hash)
+  } catch {}
+  try {
+    const idx = await kvJson(kv, RISK_TRUST_INDEX_KEY)
+    const items = Array.isArray(idx && idx.items) ? idx.items.filter((x) => x && x.h !== hash && x.ip !== text) : []
+    await kvSave(kv, RISK_TRUST_INDEX_KEY, { at: Date.now(), items })
+  } catch {}
+  return had
+}
+
 /** 记录同一 IP 的高置信命中；路径数用于区分“单次误报”和“持续探测”。 */
 function riskMlNote(ip, path, now) {
   const key = String(ip || '')
@@ -5918,6 +6081,11 @@ async function riskIpBanApply(kv, env, ip, opts) {
   const cfg = (opts && opts.cfg) || riskAutoBanCfg(env)
   if (riskIpAllowlisted(env, text, cfg.allow)) return { skipped: 'allow', ip: text }
   const now = Date.now()
+  const manual = opts && opts.manual === true
+  // 管理员标记误报并解封过的 IP 进入短期信任，避免同一来源被反复自动封禁。
+  if (!manual && Number(cfg.trustHours) > 0 && await riskIpTrusted(kv, text, now)) {
+    return { skipped: 'trust', ip: text }
+  }
   const hash = await riskIpHash(text)
   if (!hash) return null
   const prev = await kvJson(kv, RISK_IP_BAN_PREFIX + hash)
@@ -5925,7 +6093,6 @@ async function riskIpBanApply(kv, env, ip, opts) {
   if (prev && now - (Number(prev.at) || 0) < RISK_IP_BAN_RETAIN_MS) {
     lv = Math.min(3, (Number(prev.lv) || 0) + 1)
   }
-  const manual = opts && opts.manual === true
   const fixed = Math.max(0, Number(opts && opts.fixedMin) || 0)
   const minutes = manual ? Math.max(0, Number(opts.minutes) || 0)
     : fixed > 0 ? Math.min(1440, Math.round(fixed))
@@ -6045,7 +6212,9 @@ function riskLiveVerdict(env, request, url, model, p, signals, repeat, cfg) {
       signals: strong.concat(['ml_high']),
     }
   }
-  if (repeat && repeat.n >= 3 && repeat.paths >= 2) {
+  const minHits = Math.max(1, Number(cfg.minHits) || 3)
+  const minPaths = Math.max(2, Number(cfg.minPaths) || 2)
+  if (repeat && repeat.n >= minHits && repeat.paths >= minPaths) {
     return {
       ip,
       reason: `ml_repeat ${repeat.n}/${repeat.paths}`,
@@ -6788,6 +6957,7 @@ async function handleAdminRiskModel(request, env) {
     const meta = model
       ? {
           loaded: true,
+          mv: model.mv,
           feature: model.feature,
           dim: model.dim,
           weights: model.nonzero,
@@ -6800,6 +6970,19 @@ async function handleAdminRiskModel(request, env) {
           cachedAt: riskMlCache.at,
         }
       : { loaded: false, cachedAt: riskMlCache.at, failedAt: riskMlCache.failedAt }
+    let prev = null
+    let feedback = null
+    let train = null
+    try {
+      const p = await kvJson(kv, RISK_MODEL_PREV_KEY)
+      if (p) prev = { mv: Math.max(1, Math.floor(Number(p.mv) || 1)), createdAt: String(p.createdAt || '') }
+    } catch {}
+    try {
+      const m = await riskFeedbackMeta(kv)
+      feedback = { total: m.total, pos: m.pos, neg: m.neg }
+      train = (await kvJson(kv, RISK_LEARN_KEY)) || null
+      if (train) train = { at: train.at, n: train.n, seq: train.seq, mv: train.mv, auto: !!train.auto }
+    } catch {}
     // full=1 供观测台同步本地评分副本（约 70KB），元数据接口保持轻量。
     let raw = null
     if (full && model) {
@@ -6808,7 +6991,9 @@ async function handleAdminRiskModel(request, env) {
         if (stored && typeof stored === 'object') raw = stored
       } catch {}
     }
-    return admJson(raw ? { ok: true, model: meta, raw } : { ok: true, model: meta })
+    return admJson(raw
+      ? { ok: true, model: meta, prev, feedback, train, raw }
+      : { ok: true, model: meta, prev, feedback, train })
   }
 
   let body
@@ -6818,6 +7003,21 @@ async function handleAdminRiskModel(request, env) {
     return admJson({ error: '请求格式错误' }, 400)
   }
   body = body && typeof body === 'object' ? body : {}
+
+  if (body.rollback === true) {
+    const r = await riskModelRollback(kv, env)
+    return admJson(r, r.ok ? 200 : 400)
+  }
+
+  if (body.learn === true) {
+    const r = await riskLearnRun(kv, env, {
+      force: body.force === true,
+      dryRun: body.dryRun === true,
+      lr: body.lr,
+      by: (sess && sess.user) || 'service',
+    })
+    return admJson(r, r.ok ? 200 : 400)
+  }
 
   if (body.delete === true) {
     if (typeof kv.delete === 'function') await kv.delete(RISK_MODEL_KEY)
@@ -6845,6 +7045,7 @@ async function handleAdminRiskModel(request, env) {
   for (let i = 0; i < model.dim; i++) if (model.weights[i]) weights.push([i, model.weights[i]])
   await kvSave(kv, RISK_MODEL_KEY, {
     v: 1,
+    mv: model.mv,
     feature: RISK_ML_FEATURE,
     dim: model.dim,
     bias: model.bias,
@@ -6900,6 +7101,539 @@ async function handleAdminRiskExplain(request, env) {
     http: String(input.http || '').slice(0, 8),
   }
   return admJson({ ok: true, ...riskMlExplain(model, event) })
+}
+
+// ---------------------------------------------------------------------------
+// 反馈标注与增量自学习
+// 样本分块存放在 KV 环形区（6 × 200），只保留最近 1200 条，避免无限增长。
+// 学习只在当前模型上做小步 SGD，并用锚点请求做守卫；失败不落盘，可随时回滚。
+// ---------------------------------------------------------------------------
+
+function riskFeedbackTokens(tokens) {
+  const out = []
+  if (!Array.isArray(tokens)) return out
+  for (const t of tokens.slice(0, RISK_FB_TOKEN_MAX)) {
+    const s = String(t || '').trim().slice(0, 80)
+    if (s) out.push(s)
+  }
+  return out
+}
+
+async function riskFeedbackMeta(kv) {
+  try {
+    const meta = await kvJson(kv, RISK_FB_META_KEY)
+    if (meta && typeof meta === 'object') {
+      return {
+        w: Math.max(0, Math.min(RISK_FB_CHUNKS - 1, Number(meta.w) || 0)),
+        total: Math.max(0, Number(meta.total) || 0),
+        pos: Math.max(0, Number(meta.pos) || 0),
+        neg: Math.max(0, Number(meta.neg) || 0),
+        at: Number(meta.at) || 0,
+      }
+    }
+  } catch {}
+  return { w: 0, total: 0, pos: 0, neg: 0, at: 0 }
+}
+
+async function riskFeedbackChunks(kv) {
+  const rows = await Promise.all(
+    Array.from({ length: RISK_FB_CHUNKS }, (_, i) =>
+      kvJson(kv, RISK_FB_PREFIX + i).catch(() => null)
+    )
+  )
+  return rows.map((c) => (Array.isArray(c && c.items) ? c.items : []))
+}
+
+async function riskFeedbackAdd(kv, env, input) {
+  if (!kv || !input) return null
+  const ip = validIpText(input.ip)
+  const label = input.label === 0 || input.label === false ? 0 : 1
+  const tokens = riskFeedbackTokens(input.tokens)
+  if (!ip || !tokens.length) return null
+  const method = String(input.method || 'GET').toUpperCase().slice(0, 16)
+  const path = String(input.path || '/').slice(0, 512)
+  const service = String(input.service || input.svc || '').slice(0, 16)
+  const id = riskFnv(`${ip}|${method}|${path}|${label}`)
+  const meta = await riskFeedbackMeta(kv)
+  const chunks = await riskFeedbackChunks(kv)
+  // 同一 IP/方法/路径/标签只保留一份；自动标注不会因为重复命中而刷满容量。
+  for (const items of chunks) {
+    if (items.some((x) => x && x.id === id)) return { duplicate: true, id }
+  }
+  const score = Number(input.score)
+  const sample = {
+    id,
+    ts: Date.now(),
+    label,
+    p: Number.isFinite(score) ? Math.max(0, Math.min(1, Math.round(score * 1e4) / 1e4)) : null,
+    ip,
+    m: method,
+    path,
+    svc: service,
+    src: String(input.src || 'manual').slice(0, 12),
+    t: tokens,
+  }
+  let idx = meta.w
+  let items = chunks[idx] || []
+  if (items.length >= RISK_FB_CHUNK_CAP) {
+    idx = (idx + 1) % RISK_FB_CHUNKS
+    items = []
+  }
+  items.push(sample)
+  await kvSave(kv, RISK_FB_PREFIX + idx, { at: Date.now(), items })
+  await kvSave(kv, RISK_FB_META_KEY, {
+    w: idx,
+    total: meta.total + 1,
+    pos: meta.pos + (label ? 1 : 0),
+    neg: meta.neg + (label ? 0 : 1),
+    at: Date.now(),
+  })
+  return sample
+}
+
+/** 最近样本，按时间倒序；同 IP/方法/路径只保留最新一条（后标注覆盖先前判断）。 */
+async function riskFeedbackList(kv, limit) {
+  const chunks = await riskFeedbackChunks(kv)
+  const all = []
+  for (const items of chunks) {
+    for (const x of items) {
+      if (x && x.id && typeof x.ts === 'number') all.push(x)
+    }
+  }
+  all.sort((a, b) => b.ts - a.ts)
+  const newest = []
+  const seen = new Set()
+  for (const x of all) {
+    const key = `${x.ip}|${x.m || ''}|${x.path || ''}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    newest.push(x)
+  }
+  const n = Math.max(1, Math.min(RISK_FB_CHUNKS * RISK_FB_CHUNK_CAP, Number(limit) || 50))
+  return { stored: all.length, total: newest.length, items: newest.slice(0, n) }
+}
+
+async function riskFeedbackClear(kv) {
+  let removed = 0
+  try {
+    const meta = await riskFeedbackMeta(kv)
+    removed = meta.total
+    for (let i = 0; i < RISK_FB_CHUNKS; i++) {
+      try { await kv.delete(RISK_FB_PREFIX + i) } catch {}
+    }
+    try { await kv.delete(RISK_FB_META_KEY) } catch {}
+  } catch {}
+  return removed
+}
+
+function riskMlSigmoid(z) {
+  return z >= 0 ? 1 / (1 + Math.exp(-z)) : Math.exp(z) / (1 + Math.exp(z))
+}
+
+function riskLearnEval(model, samples) {
+  let correct = 0
+  let pos = 0
+  let neg = 0
+  let tp = 0
+  let tn = 0
+  for (const s of samples) {
+    const { z } = riskMlSparseScore(model, s.t || [])
+    const pred = riskMlSigmoid(z) >= model.threshold ? 1 : 0
+    if (pred === s.label) correct++
+    if (s.label) { pos++; if (pred) tp++ } else { neg++; if (!pred) tn++ }
+  }
+  const n = samples.length || 1
+  return {
+    n: samples.length,
+    acc: Math.round((correct / n) * 1e4) / 1e4,
+    pos, tp,
+    neg, tn,
+  }
+}
+
+/** 锚点评分：正常请求不该被推高，典型攻击不该被压低；用于相对基线的守卫。 */
+function riskLearnAnchorScores(model) {
+  const benign = [
+    { service: 'site', method: 'GET', path: '/', query: '', headers: { 'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36', accept: 'text/html,application/xhtml+xml' }, host: 'classsoftwarehub.cn', http: '2' },
+    { service: 'site', method: 'GET', path: '/assets/app.js', query: '', headers: { 'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Safari/605.1.15', accept: 'application/javascript' }, host: 'classsoftwarehub.cn', http: '2' },
+    { service: 'site', method: 'POST', path: '/api/license/activate', query: '', headers: { 'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/126.0 Safari/537.36', 'content-type': 'application/json' }, host: 'api.classsoftwarehub.cn', http: '2' },
+  ]
+  const attack = [
+    { service: 'site', method: 'GET', path: '/.env', query: '', headers: { 'user-agent': 'sqlmap/1.7.2#stable' }, host: 'classsoftwarehub.cn', http: '1.1' },
+    { service: 'site', method: 'GET', path: '/wp-login.php', query: '', headers: { 'user-agent': 'Mozilla/5.0 (compatible; Nmap Scripting Engine; https://nmap.org/book/nse.html)' }, host: 'classsoftwarehub.cn', http: '1.1' },
+    { service: 'site', method: 'GET', path: '/api/admin/settings', query: '', headers: { 'user-agent': 'python-requests/2.31' }, host: 'api.classsoftwarehub.cn', http: '1.1' },
+  ]
+  const scores = (list) => list.map((ev) => {
+    const { z } = riskMlSparseScore(model, riskMlTokens(ev))
+    return Math.round(riskMlSigmoid(z) * 1e4) / 1e4
+  })
+  const b = scores(benign)
+  const a = scores(attack)
+  return {
+    benign: b,
+    attack: a,
+    benignMax: Math.max(...b),
+    attackMin: Math.min(...a),
+    threshold: model.threshold,
+  }
+}
+
+async function riskLearnRun(kv, env, opts) {
+  opts = opts || {}
+  if (!kv) return { ok: false, error: '状态存储不可用' }
+  const cfg = riskAutoBanCfg(env, await settingsOf(env))
+  const force = opts.force === true
+  const dryRun = opts.dryRun === true
+  const by = String(opts.by || 'service').slice(0, 32)
+  const model = await riskMlModel()
+  if (!model) return { ok: false, error: '模型未加载' }
+
+  const list = await riskFeedbackList(kv, RISK_FB_CHUNKS * RISK_FB_CHUNK_CAP)
+  const meta = await riskFeedbackMeta(kv)
+  if (!force && list.items.length < cfg.learnMin) {
+    return { ok: true, skipped: 'few', samples: list.items.length, min: cfg.learnMin, pending: list.items.length }
+  }
+  if (!list.items.length) return { ok: true, skipped: 'empty', samples: 0 }
+
+  const now = Date.now()
+  try {
+    const lock = await kvJson(kv, RISK_LEARN_LOCK_KEY)
+    if (lock && now - (Number(lock.at) || 0) < 5 * 60000 && !(force && now - (Number(lock.at) || 0) > 30000)) {
+      return { ok: true, skipped: 'busy', retryAt: (Number(lock.at) || 0) + 5 * 60000 }
+    }
+    await kvSave(kv, RISK_LEARN_LOCK_KEY, { at: now, by })
+  } catch {}
+
+  const learnCfg = riskAutoBanCfg(env, await settingsOf(env))
+  const samples = list.items.slice(0, 600)
+  const lr = Math.max(0.05, Math.min(2, Number(opts.lr) || 0.5))
+  // 全批量平均梯度：一次学习只推一步，方向是全部样本的平均方向。
+  // 相比逐条 SGD，公共 token（svc:site、m:GET）不会被最后几条样本带偏，锚点更稳。
+  const grad = new Float32Array(model.dim)
+  let gbias = 0
+  let used = 0
+  for (const s of samples) {
+    if (!s || !Array.isArray(s.t) || !s.t.length) continue
+    const counts = riskMlCounts(s.t, model.dim)
+    let norm2 = 0
+    for (const c of counts.values()) norm2 += c * c
+    const norm = Math.sqrt(norm2) || 1
+    let z = model.bias
+    for (const [i, c] of counts) z += model.weights[i] * (c / norm)
+    const p = riskMlSigmoid(z)
+    const y = s.label ? 1 : 0
+    let g = p - y
+    // 已正确且非常自信的样本只贡献很小梯度，避免个别样本被反复放大。
+    if ((y === 1 && p > 0.97) || (y === 0 && p < 0.03)) g *= 0.2
+    for (const [i, c] of counts) grad[i] += g * (c / norm)
+    gbias += g
+    used++
+  }
+
+  const weights0 = new Float32Array(model.weights)
+  const build = (factor) => {
+    const weights = new Float32Array(weights0)
+    let bias = model.bias
+    if (used > 0) {
+      const scale = (-lr * factor) / used
+      for (let i = 0; i < model.dim; i++) {
+        if (!grad[i]) continue
+        const d = Math.max(-0.15, Math.min(0.15, grad[i] * scale))
+        // 只做增量修正，不重设绝对上限：原模型权重可能有 ±30 以上的强特征，不能被压回 8。
+        weights[i] = Math.max(-100, Math.min(100, weights[i] + d))
+      }
+      bias = Math.max(-100, Math.min(100, bias + Math.max(-0.05, Math.min(0.05, gbias * scale))))
+    }
+    let nonzero = 0
+    for (let i = 0; i < weights.length; i++) if (weights[i]) nonzero++
+    return { weights, bias, nonzero }
+  }
+
+  if (!used) {
+    try { await kv.delete(RISK_LEARN_LOCK_KEY) } catch {}
+    return { ok: false, error: '没有可用样本', samples: 0 }
+  }
+  const before = riskLearnEval(model, samples)
+  const baseAnchors = riskLearnAnchorScores(model)
+  // 锚点用学习前后相对比较：学习不能把正常请求推高、也不能把典型攻击压低。
+  // 若一步跨太大，依次减半重试（最多 4 档），仍不达标才拒绝，兼顾学习效果与安全。
+  let chosen = null
+  let last = null
+  for (const factor of [1, 0.5, 0.25, 0.1]) {
+    const built = build(factor)
+    if (!built.nonzero) break
+    const candidate = { ...model, ...built }
+    const after = riskLearnEval(candidate, samples)
+    const next = riskLearnAnchorScores(candidate)
+    const anchors = {
+      ok: next.benignMax <= baseAnchors.benignMax + 0.01 &&
+        next.attackMin >= baseAnchors.attackMin - 0.01,
+      base: { benignMax: baseAnchors.benignMax, attackMin: baseAnchors.attackMin },
+      next: { benignMax: next.benignMax, attackMin: next.attackMin },
+      threshold: model.threshold,
+    }
+    last = { candidate, after, anchors, factor }
+    if (anchors.ok && after.acc >= before.acc - 0.02) {
+      chosen = last
+      break
+    }
+  }
+  if (!chosen) {
+    try { await kv.delete(RISK_LEARN_LOCK_KEY) } catch {}
+    const detail = last ? { anchors: last.anchors, before, after: last.after } : {}
+    return { ok: false, error: '锚点守卫或反馈准确率未通过，已拒绝', ...detail, samples: used }
+  }
+  const weights = chosen.candidate.weights
+  const bias = chosen.candidate.bias
+  const after = chosen.after
+  const anchors = chosen.anchors
+  const result = {
+    ok: true,
+    samples: used,
+    lr,
+    usedLr: Math.round(lr * chosen.factor * 1e4) / 1e4,
+    step: chosen.factor,
+    before,
+    after,
+    anchors,
+    mv: (Number(model.mv) || 1) + (dryRun ? 0 : 1),
+  }
+  if (dryRun) {
+    try { await kv.delete(RISK_LEARN_LOCK_KEY) } catch {}
+    result.dryRun = true
+    result.learnCfg = { learnOn: learnCfg.learnOn, learnMin: learnCfg.learnMin }
+    return result
+  }
+
+  const weightsOut = []
+  for (let i = 0; i < model.dim; i++) if (weights[i]) weightsOut.push([i, Math.round(weights[i] * 1e6) / 1e6])
+  const pos = samples.filter((s) => s.label).length
+  const raw = {
+    v: 1,
+    mv: (Number(model.mv) || 1) + 1,
+    feature: RISK_ML_FEATURE,
+    dim: model.dim,
+    bias: Math.round(bias * 1e6) / 1e6,
+    threshold: model.threshold,
+    high: model.high,
+    weights: weightsOut,
+    createdAt: model.createdAt || '',
+    samples: { ...(model.samples || {}), learn: { at: now, n: used, pos, neg: used - pos } },
+    metrics: { ...(model.metrics || {}), learn: { at: now, before, after, anchors } },
+  }
+  let prevRaw = null
+  try { prevRaw = await kvJson(kv, RISK_MODEL_KEY) } catch {}
+  if (prevRaw) await kvSave(kv, RISK_MODEL_PREV_KEY, prevRaw)
+  await kvSave(kv, RISK_MODEL_KEY, raw)
+  await kvSave(kv, RISK_LEARN_KEY, {
+    at: now,
+    seq: meta.total,
+    n: used,
+    pos,
+    neg: used - pos,
+    lr,
+    by,
+    auto: opts.auto === true,
+    mv: raw.mv,
+  })
+  try { await kv.delete(RISK_LEARN_LOCK_KEY) } catch {}
+  riskMlCache = { at: Date.now(), failedAt: 0, model: riskMlCompile(raw) }
+  await admAudit(env, 'risk-model-learn', {
+    mv: raw.mv, n: used, pos, neg: used - pos, acc: after.acc, auto: opts.auto === true,
+  })
+  console.log(`admin: risk model learned mv=${raw.mv} n=${used} acc=${after.acc}`)
+  return result
+}
+
+async function riskLearnAuto(kv, env) {
+  if (!kv) return { ok: false }
+  const cfg = riskAutoBanCfg(env, await settingsOf(env))
+  if (!cfg.learnOn) return { ok: true, skipped: 'off' }
+  const meta = await riskFeedbackMeta(kv)
+  const rec = (await kvJson(kv, RISK_LEARN_KEY)) || {}
+  let seq = Math.max(0, Number(rec.seq) || 0)
+  if (meta.total < seq) seq = 0
+  if (meta.total - seq < cfg.learnMin) {
+    return { ok: true, skipped: 'few', pending: Math.max(0, meta.total - seq), min: cfg.learnMin }
+  }
+  return riskLearnRun(kv, env, { auto: true, by: 'auto' })
+}
+
+/** POST /api/admin/risk/model/rollback —— 回滚到上一次自学习前的模型。 */
+async function riskModelRollback(kv, env) {
+  const prev = await kvJson(kv, RISK_MODEL_PREV_KEY)
+  if (!prev) return { ok: false, error: '没有可回滚的模型版本' }
+  const current = await kvJson(kv, RISK_MODEL_KEY)
+  const prevModel = riskMlCompile(prev)
+  if (!prevModel) return { ok: false, error: '上一版本模型已损坏' }
+  if (current) await kvSave(kv, RISK_MODEL_PREV_KEY, current)
+  else {
+    try { await kv.delete(RISK_MODEL_PREV_KEY) } catch {}
+  }
+  await kvSave(kv, RISK_MODEL_KEY, prev)
+  riskMlCache = { at: Date.now(), failedAt: 0, model: prevModel }
+  await admAudit(env, 'risk-model-rollback', { mv: prevModel.mv })
+  return { ok: true, mv: prevModel.mv, createdAt: prevModel.createdAt }
+}
+
+/** POST /api/admin/risk/model/learn { force?, dryRun?, auto? } */
+async function handleAdminRiskLearn(request, env) {
+  const sess = await admSession(request, env)
+  const svc = admServiceOk(request, env)
+  if (!sess && !svc) return admJson({ error: '未登录' }, 401)
+  if (!svc) {
+    const originFail = admSameOriginOrFail(request)
+    if (originFail) return originFail
+  }
+  const kv = await gateKv()
+  if (!kv) return admJson({ error: '状态存储不可用' }, 503)
+  let body
+  try { body = await request.json() } catch { body = {} }
+  body = body && typeof body === 'object' ? body : {}
+  const r = body.auto === true
+    ? await riskLearnAuto(kv, env)
+    : await riskLearnRun(kv, env, {
+        force: body.force === true,
+        dryRun: body.dryRun === true,
+        lr: body.lr,
+        by: (sess && sess.user) || 'service',
+      })
+  return admJson(r, r.ok ? 200 : 400)
+}
+
+/** POST /api/admin/risk/model/rollback */
+async function handleAdminRiskRollback(request, env) {
+  const sess = await admSession(request, env)
+  const svc = admServiceOk(request, env)
+  if (!sess && !svc) return admJson({ error: '未登录' }, 401)
+  if (!svc) {
+    const originFail = admSameOriginOrFail(request)
+    if (originFail) return originFail
+  }
+  const kv = await gateKv()
+  if (!kv) return admJson({ error: '状态存储不可用' }, 503)
+  const r = await riskModelRollback(kv, env)
+  return admJson(r, r.ok ? 200 : 400)
+}
+
+/** GET/POST /api/admin/risk/feedback —— 查看、添加、清空人工/自动标注。 */
+async function handleAdminRiskFeedback(request, env) {
+  const sess = await admSession(request, env)
+  const svc = admServiceOk(request, env)
+  if (!sess && !svc) return admJson({ error: '未登录' }, 401)
+  if (!svc) {
+    const originFail = admSameOriginOrFail(request)
+    if (originFail) return originFail
+  }
+  const kv = await gateKv()
+  if (!kv) return admJson({ error: '状态存储不可用' }, 503)
+
+  if (request.method === 'GET') {
+    const url = new URL(request.url)
+    const limit = Math.max(1, Math.min(200, Number(url.searchParams.get('limit')) || 50))
+    const list = await riskFeedbackList(kv, limit)
+    const meta = await riskFeedbackMeta(kv)
+    const train = (await kvJson(kv, RISK_LEARN_KEY)) || null
+    const activePos = list.items.filter((x) => x.label).length
+    return admJson({
+      ok: true,
+      stored: list.stored,
+      total: list.total,
+      pos: activePos,
+      neg: list.items.length - activePos,
+      lifetime: { total: meta.total, pos: meta.pos, neg: meta.neg },
+      train: train && { at: train.at, n: train.n, seq: train.seq, mv: train.mv, auto: !!train.auto },
+      items: list.items,
+    })
+  }
+
+  let body
+  try { body = await request.json() } catch { return admJson({ error: '请求格式错误' }, 400) }
+  body = body && typeof body === 'object' ? body : {}
+  const by = (sess && sess.user) || 'service'
+
+  if (body.clear === true) {
+    const removed = await riskFeedbackClear(kv)
+    await admAudit(env, 'risk-feedback-clear', { removed })
+    return admJson({ ok: true, removed })
+  }
+
+  const label = body.label === 0 || body.label === false ? 0 : 1
+  const rec = await riskFeedbackAdd(kv, env, {
+    ip: body.ip,
+    path: body.path,
+    method: body.method,
+    service: body.service || body.svc,
+    label,
+    score: body.score,
+    tokens: body.tokens,
+    src: body.src || 'manual',
+  })
+  if (!rec) return admJson({ error: '缺少 IP 或特征 token' }, 400)
+  const duplicate = !!rec.duplicate
+  const ip = duplicate ? validIpText(body.ip) : rec.ip
+
+  // 即使样本重复也执行误报处置：同一 IP 再次被封后，管理员仍可一键解封并刷新信任。
+  const cfg = riskAutoBanCfg(env, await settingsOf(env))
+  let unbanned = false
+  let trustUntil = 0
+  if (label === 0) {
+    unbanned = await riskIpBanClear(kv, env, ip, by)
+    if (body.trust !== false && Number(cfg.trustHours) > 0) {
+      const t = await riskIpTrustSet(kv, ip, cfg.trustHours, by, '误报标注')
+      trustUntil = (t && t.until) || 0
+    }
+  } else if (body.untrust === true) {
+    await riskIpTrustClear(kv, ip)
+  }
+  await admAudit(env, 'risk-feedback', {
+    ip, label, path: String(body.path || '').slice(0, 512), duplicate, unbanned, trustUntil,
+  })
+  return admJson({
+    ok: true,
+    duplicate,
+    item: duplicate ? { ip, label } : {
+      id: rec.id, ip: rec.ip, label: rec.label, path: rec.path, m: rec.m, ts: rec.ts,
+    },
+    unbanned,
+    trustUntil,
+    trustHours: Number(cfg.trustHours) || 0,
+  })
+}
+
+/** GET/POST /api/admin/ip-trust —— 误报信任名单。 */
+async function handleAdminIpTrust(request, env) {
+  const sess = await admSession(request, env)
+  const svc = admServiceOk(request, env)
+  if (!sess && !svc) return admJson({ error: '未登录' }, 401)
+  if (!svc) {
+    const originFail = admSameOriginOrFail(request)
+    if (originFail) return originFail
+  }
+  const kv = await gateKv()
+  if (!kv) return admJson({ error: '状态存储不可用' }, 503)
+  const now = Date.now()
+  if (request.method === 'GET') {
+    const cfg = riskAutoBanCfg(env, await settingsOf(env))
+    const items = await riskIpTrustList(kv, now)
+    items.sort((a, b) => (Number(b.at) || 0) - (Number(a.at) || 0))
+    return admJson({ ok: true, total: items.length, hours: cfg.trustHours, items })
+  }
+  let body
+  try { body = await request.json() } catch { return admJson({ error: '请求格式错误' }, 400) }
+  const ip = validIpText(body && body.ip)
+  if (!ip) return admJson({ error: 'IP 格式不正确' }, 400)
+  if (body && body.clear === true) {
+    const had = await riskIpTrustClear(kv, ip)
+    await admAudit(env, 'ip-trust-clear', { ip })
+    return admJson({ ok: true, ip, removed: had })
+  }
+  const cfg = riskAutoBanCfg(env, await settingsOf(env))
+  const hours = Math.max(1, Math.min(168, Number(body && body.hours) || cfg.trustHours))
+  const rec = await riskIpTrustSet(kv, ip, hours, (sess && sess.user) || 'service', cleanText(body && body.reason, 80))
+  if (!rec) return admJson({ error: '信任时长无效' }, 400)
+  await admAudit(env, 'ip-trust', { ip, until: rec.until })
+  return admJson({ ok: true, ip, until: rec.until, hours })
 }
 
 /** GET /api/admin/device-events?device= —— 单设备信誉详情：事件、封禁、当日报数。 */
@@ -7551,7 +8285,12 @@ async function handleAdminIpBans(request, env) {
     active: rows.filter((x) => x.active).length,
     cfg: (() => {
       const c = riskAutoBanCfg(env, S)
-      return { on: c.on, mlOn: c.mlOn, mlAct: c.mlAct, baseMin: c.baseMin, maxMin: c.maxMin, sshOn: c.sshOn, sshHits: c.sshHits, sshMin: c.sshMin, sshWindowMs: c.sshWindowMs, allow: c.allow.length }
+      return {
+        on: c.on, mlOn: c.mlOn, mlAct: c.mlAct, baseMin: c.baseMin, maxMin: c.maxMin,
+        sshOn: c.sshOn, sshHits: c.sshHits, sshMin: c.sshMin, sshWindowMs: c.sshWindowMs,
+        allow: c.allow.length, minHits: c.minHits, minPaths: c.minPaths,
+        trustHours: c.trustHours, learnOn: c.learnOn, learnMin: c.learnMin,
+      }
     })(),
     rows,
   })
@@ -7579,7 +8318,7 @@ async function handleAdminIpBan(request, env) {
   return admJson({ ok: true, ip, until: rec.until })
 }
 
-/** POST /api/admin/ip-unban { ip } */
+/** POST /api/admin/ip-unban { ip, trust?, hours? } */
 async function handleAdminIpUnban(request, env) {
   const sess = await admSession(request, env)
   if (!sess && !admServiceOk(request, env)) return admJson({ error: '未登录' }, 401)
@@ -7590,8 +8329,17 @@ async function handleAdminIpUnban(request, env) {
   if (!ip) return admJson({ error: 'IP 格式不正确' }, 400)
   const kv = await gateKv()
   if (!kv) return admJson({ error: '状态存储不可用' }, 503)
-  const had = await riskIpBanClear(kv, env, ip, (sess && sess.user) || 'service')
-  return admJson({ ok: true, ip, removed: had })
+  const by = (sess && sess.user) || 'service'
+  const had = await riskIpBanClear(kv, env, ip, by)
+  let trustUntil = 0
+  const trust = body && body.trust === true
+  if (trust) {
+    const cfg = riskAutoBanCfg(env, await settingsOf(env))
+    const hours = Math.max(1, Math.min(168, Number(body && body.hours) || cfg.trustHours))
+    const t = await riskIpTrustSet(kv, ip, hours, by, cleanText(body && body.reason, 80) || '误报解封')
+    trustUntil = (t && t.until) || 0
+  }
+  return admJson({ ok: true, ip, removed: had, trustUntil })
 }
 
 /**
@@ -8003,6 +8751,7 @@ async function workerFetch(request, env, ctx) {
     let mlScore = 0
     let mlSignals = {}
     let mlRepeat = null
+    let mlTokens = []
     if (isClientApi && riskCfg.mlOn) {
       try {
         mlModel = await riskMlModel()
@@ -8010,6 +8759,7 @@ async function workerFetch(request, env, ctx) {
           const assessed = riskMlAssess(mlModel, riskMlRequestEvent(request, url))
           mlScore = assessed.p
           mlSignals = assessed.signals
+          mlTokens = assessed.tokens || []
           if (mlScore >= mlModel.high) {
             mlRepeat = riskMlNote(reqIp(request), url.pathname, Date.now())
           }
@@ -8061,6 +8811,19 @@ async function workerFetch(request, env, ctx) {
         })
         if (ban && !ban.skipped) {
           riskInfo.ip_banned = `${ban.reason}:${Number(ban.until) || 0}`
+          // 高置信自动封禁同时作为正样本入反馈集，供后续自学习使用（去重，不会刷容量）。
+          if (mlTokens.length) {
+            ctx.waitUntil(riskFeedbackAdd(kv, env, {
+              ip: verdict.ip,
+              path: url.pathname,
+              method: request.method,
+              service: riskSurfaceOf(url.pathname),
+              label: 1,
+              score: mlScore,
+              tokens: mlTokens,
+              src: 'auto',
+            }).catch(() => {}))
+          }
           recordRisk()
           return riskIpBanResponse(ban, request, env)
         }
@@ -8125,6 +8888,18 @@ async function routeRequest(request, env, ctx) {
       }
       if (url.pathname === '/api/admin/risk/model' && (request.method === 'GET' || request.method === 'POST')) {
         return handleAdminRiskModel(request, env)
+      }
+      if (url.pathname === '/api/admin/risk/model/learn' && request.method === 'POST') {
+        return handleAdminRiskLearn(request, env)
+      }
+      if (url.pathname === '/api/admin/risk/model/rollback' && request.method === 'POST') {
+        return handleAdminRiskRollback(request, env)
+      }
+      if (url.pathname === '/api/admin/risk/feedback' && (request.method === 'GET' || request.method === 'POST')) {
+        return handleAdminRiskFeedback(request, env)
+      }
+      if (url.pathname === '/api/admin/ip-trust' && (request.method === 'GET' || request.method === 'POST')) {
+        return handleAdminIpTrust(request, env)
       }
       if (url.pathname === '/api/admin/risk/explain' && request.method === 'POST') {
         return handleAdminRiskExplain(request, env)
