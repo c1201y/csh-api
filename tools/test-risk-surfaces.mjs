@@ -182,6 +182,29 @@ log('设备详情不再把无 UA 当风险原因', legacyDetail.status === 200 &
   Number(legacyDetail.data.risk && legacyDetail.data.risk.s) <= 20 &&
   !((legacyDetail.data.risk && legacyDetail.data.risk.reasons) || []).some((r) => r.key === 'empty_ua'),
   `s=${legacyDetail.data.risk && legacyDetail.data.risk.s} level=${legacyDetail.data.risk && legacyDetail.data.risk.level}`)
+log('设备详情不再展示 unknown 来源 IP', legacyDetail.status === 200 &&
+  String(legacyDetail.data.risk && legacyDetail.data.risk.ip) === '' && !legacyDetail.data.ipRisk,
+  `ip=${JSON.stringify(legacyDetail.data.risk && legacyDetail.data.risk.ip)}`)
+
+// ── 10. 单一 4xx / 多范围请求都不能单独触发封禁 ─────────────────────
+const site4xx = await report('site', evs('198.18.1.10', 20, { status: 403, path: '/assets/app.js', tag: 's4' }))
+log('全站代理连续 403 不封禁', site4xx.status === 200 && site4xx.data.actions.length === 0 && !store.has(ipKey('198.18.1.10')),
+  `actions=${JSON.stringify(site4xx.data.actions)} tiers=${(site4xx.data.tiers || []).length}`)
+
+const rangeMany = Array.from({ length: 20 }, (_, i) => ({
+  id: `range-many-${i}`,
+  ts: Date.now() - i * 400,
+  ip: '198.18.1.11',
+  method: 'GET',
+  status: 206,
+  path: '/owner/repo/releases/download/v1.0/app.exe',
+  ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/130.0.0.0',
+  op: 'range-many',
+}))
+const rm = await report('download', rangeMany)
+log('多范围下载请求不封禁', rm.status === 200 && rm.data.actions.length === 0 && !store.has(ipKey('198.18.1.11')),
+  `actions=${JSON.stringify(rm.data.actions)} tiers=${(rm.data.tiers || []).length}`)
+
 
 await flush()
 console.log(failed ? `\n${failed} 项失败` : '\n全部通过')

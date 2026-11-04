@@ -4913,8 +4913,9 @@ const RISK_TRUST_CAP = 300
 // 本来就可能这样发请求，只能作为低权重观测，不能用来佐证封禁。
 const RISK_AUTOBAN_STRONG = [
   'probe_path', 'sensitive_query', 'scanner_ua', 'headless_ua', 'bad_method',
-  'bad_device_id', 'dl_probe', 'mirror_path', 'mirror_repo_probe', 'dl_range_abuse',
+  'bad_device_id', 'dl_probe', 'mirror_path', 'mirror_repo_probe',
   'header_abuse', 'missing_device',
+  // dl_range_abuse 不在此列：多线程下载器可能一次请求多段 Range，只能作为累计分数。
 ]
 
 function riskEnvFlag(env, name, fallback) {
@@ -6145,7 +6146,8 @@ async function riskApply(kv, kind, key, id, signals, meta) {
   rec.s = Math.min(riskScoreCap(rec.r), Math.min(100, Math.round((Number(rec.s) || 0) + add)))
   rec.at = meta.now
   rec.hits = Math.min(99999, (Number(rec.hits) || 0) + 1)
-  if (meta.ip) rec.ip = String(meta.ip).slice(0, 64)
+  if (meta.ip && meta.ip !== 'unknown') rec.ip = String(meta.ip).slice(0, 64)
+  else if (rec.ip === 'unknown') delete rec.ip
   rec._exp = meta.now + RISK_TTL_MS
   try {
     await kvSave(kv, storageKey, rec)
@@ -6227,7 +6229,8 @@ async function riskHistApplyMany(kv, kind, key, id, events, meta) {
   rec.hat = newest
   if (!meta.dryRun) {
     rec._exp = Math.max(Number(rec._exp) || 0, meta.now + RISK_TTL_MS)
-    if (meta.ip) rec.ip = String(meta.ip).slice(0, 64)
+    if (meta.ip && meta.ip !== 'unknown') rec.ip = String(meta.ip).slice(0, 64)
+    else if (rec.ip === 'unknown') delete rec.ip
     try {
       await kvSave(kv, storageKey, rec)
       if (!meta.noIndex) await riskIndexPut(kv, kind, id, rec, meta.now)
@@ -6248,7 +6251,7 @@ function riskSummary(rec, now = Date.now()) {
     ls: live,
     at: Number(rec.at) || 0,
     hits: Number(rec.hits) || 0,
-    ip: String(rec.ip || ''),
+    ip: rec.ip && rec.ip !== 'unknown' ? String(rec.ip) : '',
     hs: hist,
     hat: Number(rec.hat) || 0,
     reasons: riskReasons(rec, false),
@@ -8841,9 +8844,11 @@ function riskServerHitCount(src, sig, n) {
   const has = (...keys) => keys.some((k) => sig && sig[k])
   if (src === 'ssh') return has('ssh_brute', 'ssh_invalid_user', 'ssh_root_attempt', 'ssh_sudo_fail') ? n : 0
   if (src === 'oss') return has('oss_auth_fail', 'oss_list_abuse', 'oss_delete') ? n : 0
-  if (src === 'download') return has('dl_sign_fail', 'dl_probe', 'dl_range_abuse', 'dl_hotlink') ? n : 0
+  // 多范围请求可能是下载器的分段策略，不计入硬命中，只按异常 Range 累计分数。
+  if (src === 'download') return has('dl_sign_fail', 'dl_probe', 'dl_hotlink') ? n : 0
   if (src === 'mirror') return has('mirror_path', 'mirror_repo_probe') ? n : 0
-  if (src === 'site') return has('site_drop', 'probe_path', 'sensitive_query', 'scanner_ua', 'headless_ua', 'err4xx') ? n : 0
+  // 401/403 在授权过期、站点维护时也会成批出现，不能单独触发封禁；只保留明确攻击特征。
+  if (src === 'site') return has('site_drop', 'probe_path', 'sensitive_query', 'scanner_ua', 'headless_ua') ? n : 0
   return 0
 }
 
