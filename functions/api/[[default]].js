@@ -5883,12 +5883,18 @@ async function riskBackfillEvents(kv, body, dryRun) {
   let added = 0
   let skipped = 0
   let touched = 0
+  let errors = 0
   for (const [ip, events] of byIp) {
-    const key = (await sha256Hex(ip)).slice(0, 24)
-    const r = await riskHistApplyMany(kv, 'i', key, ip, events, { now, dryRun, ip })
-    added += r.added
-    skipped += r.skipped
-    if (r.added) touched++
+    // 单个 IP 写失败不应让整批回溯失败，继续处理其它 IP。
+    try {
+      const key = (await sha256Hex(ip)).slice(0, 24)
+      const r = await riskHistApplyMany(kv, 'i', key, ip, events, { now, dryRun, ip })
+      added += r.added
+      skipped += r.skipped
+      if (r.added) touched++
+    } catch {
+      errors++
+    }
   }
 
   if (!dryRun) {
@@ -5915,6 +5921,7 @@ async function riskBackfillEvents(kv, body, dryRun) {
       ips: byIp.size,
       added,
       skipped,
+      errors,
       summary: await riskBackfillStatus(kv),
     },
   }
