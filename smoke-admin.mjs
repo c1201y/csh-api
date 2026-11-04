@@ -228,6 +228,197 @@ log('空内容被拒绝', shoutEmpty.status === 400)
 const onlineNoAuth = await jsonOf(await call('/api/admin/online'))
 log('未登录看不到在线设备', onlineNoAuth.status === 401)
 
+// ── 恶意请求初步识别（多因子累计风险分） ──────────────────────────────
+const bearer = { authorization: 'Bearer ' + svcToken }
+const uaBrowser = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+const uaScan = 'sqlmap/1.7.2#stable (https://sqlmap.org)'
+const probeIp = '203.0.113.50'
+
+const riskNoAuth = await jsonOf(await call('/api/admin/risk'))
+log('风险清单需要鉴权', riskNoAuth.status === 401)
+
+// 1) 正常请求不应该产生任何风险记录
+const normal = await call('/api/announce/poll?deviceId=e0e0e0e0e0e0e0e0&pairCode=700001', {
+  headers: { 'x-forwarded-for': '192.0.2.77', 'user-agent': uaBrowser },
+})
+await flush()
+let riskList = await jsonOf(await call('/api/admin/risk?kind=i', { headers: bearer }))
+log('正常请求不进入风险清单', normal.status === 204 && !(riskList.data.items || []).some((x) => x.ip === '192.0.2.77'))
+
+// 2) 只有“探测路径”一个维度 → 中风险，够不上高风险
+const probe1 = await call('/api/.env', { headers: { 'x-forwarded-for': probeIp, 'user-agent': uaBrowser } })
+await flush()
+riskList = await jsonOf(await call('/api/admin/risk?kind=i', { headers: bearer }))
+const oneShot = (riskList.data.items || []).find((x) => x.ip === probeIp)
+log('单一信号只判中风险', probe1.status === 404 && !!oneShot && oneShot.level === 'medium', oneShot && 's=' + oneShot.s)
+log('单一信号不会直接定为高风险', !!oneShot && oneShot.s < 60)
+
+// 3) 探测路径 + 扫描器 UA 叠加 → 高风险
+await call('/api/.env', { headers: { 'x-forwarded-for': probeIp, 'user-agent': uaScan } })
+await flush()
+riskList = await jsonOf(await call('/api/admin/risk?kind=i', { headers: bearer }))
+const multi = (riskList.data.items || []).find((x) => x.ip === probeIp)
+log('多因子叠加升级为高风险', !!multi && multi.level === 'high' && multi.reasons.length >= 2,
+  multi && multi.reasons.map((r) => r.key).join('+'))
+
+// 4) 已登记设备同样累计，并在设备列表里带出风险等级
+const riskDev = '1a2b3c4d5e6f7081'
+await store.set('lic:d:' + riskDev, JSON.stringify({
+  at: Date.now() - 7 * 3600e3, first: Date.now() - 30 * 86400e3, tail: '', serial: 0,
+  _exp: Date.now() + 400 * 86400e3,
+}))
+await call('/api/.env?from=dev', {
+  headers: { 'x-csh-did': riskDev, 'x-forwarded-for': '203.0.113.60', 'user-agent': uaScan },
+})
+await flush()
+
+const devList = await jsonOf(await call('/api/admin/devices', { headers: bearer }))
+const riskRow = (devList.data.devices || []).find((d) => d.d === riskDev)
+log('设备列表带出风险等级', !!riskRow && riskRow.risk?.level === 'high' && riskRow.risk.s >= 60,
+  riskRow && 's=' + riskRow.risk?.s)
+
+const evDetail = await jsonOf(await call('/api/admin/device-events?device=' + riskDev, { headers: bearer }))
+log('设备详情含风险原因与来源 IP', evDetail.status === 200 && evDetail.data.risk?.level === 'high' &&
+  evDetail.data.risk.reasons.length >= 2 && !!evDetail.data.ipRisk, evDetail.data.risk?.reasons?.map((r) => r.key).join('+'))
+
+const riskAll = await jsonOf(await call('/api/admin/risk', { headers: bearer }))
+log('风险清单同时含设备与 IP 维度', riskAll.status === 200 &&
+  riskAll.data.items.some((x) => x.kind === 'd' && x.id === riskDev) &&
+  riskAll.data.items.some((x) => x.kind === 'i'))
+
+// 5) 只识别不处置：高风险设备仍可正常调用业务接口
+const stillOk = await jsonOf(await call('/api/announce/poll?deviceId=' + riskDev + '&pairCode=700002', {
+  headers: { 'x-csh-did': riskDev },
+}))
+log('高风险不会自动封禁', stillOk.status === 204, 'status=' + stillOk.status)
+
+// 6) 上下文推导：短时间内扫过多个不同路径 → 多路径探测/扫描
+const sweepIp = '203.0.113.71'
+for (let i = 0; i < 9; i++) {
+  await call(`/api/probe-${i}-${Math.random().toString(36).slice(2, 6)}`, {
+    headers: { 'x-forwarded-for': sweepIp, 'user-agent': uaBrowser },
+  })
+}
+await flush()
+riskList = await jsonOf(await call('/api/admin/risk?kind=i', { headers: bearer }))
+const sweepRow = (riskList.data.items || []).find((x) => x.ip === sweepIp)
+log('多路径扫描被识别', !!sweepRow && sweepRow.reasons.some((r) => r.key === 'path_sweep'),
+  sweepRow && sweepRow.reasons.map((r) => r.key).join('+'))
+
+// 7) 注入风格参数独立计分
+const injIp = '203.0.113.72'
+await call("/api/files?q=1%27%20union%20select%20password%20from%20users", {
+  headers: { 'x-forwarded-for': injIp, 'user-agent': uaBrowser },
+})
+await flush()
+riskList = await jsonOf(await call('/api/admin/risk?kind=i', { headers: bearer }))
+const injRow = (riskList.data.items || []).find((x) => x.ip === injIp)
+log('注入风格参数被识别', !!injRow && injRow.reasons.some((r) => r.key === 'sensitive_query'),
+  injRow && injRow.reasons.map((r) => r.key).join('+'))
+
+// 8) 后台登录连续失败 → 登录爆破信号（后台路径默认不观测，这里强制计入）
+const bruteIp = '203.0.113.73'
+for (let i = 0; i < 3; i++) {
+  await call('/api/admin/login', {
+    method: 'POST',
+    headers: { 'x-forwarded-for': bruteIp },
+    body: { user: 'admin', pass: 'wrong-' + i },
+  })
+}
+riskList = await jsonOf(await call('/api/admin/risk?kind=i', { headers: bearer }))
+const bruteRow = (riskList.data.items || []).find((x) => x.ip === bruteIp)
+log('后台登录连续失败计入风险', !!bruteRow && bruteRow.reasons.some((r) => r.key === 'auth_brute'),
+  bruteRow && bruteRow.reasons.map((r) => r.key).join('+'))
+
+// ── 历史回溯 ──────────────────────────────────────────────────────────
+const histIp = '198.51.100.88'
+const nowMs = Date.now()
+const histEvents = [
+  { id: 'h1', ts: nowMs - 3600e3, ip: histIp, path: '/.env', ua: uaScan, method: 'GET', status: 404 },
+  { id: 'h2', ts: nowMs - 3000e3, ip: histIp, path: '/wp-login.php', ua: uaScan, method: 'POST', status: 404 },
+  { id: 'h3', ts: nowMs - 2400e3, ip: histIp, path: '/../../etc/passwd', ua: '', method: 'GET', status: 400 },
+]
+
+const bfNoAuth = await jsonOf(await call('/api/admin/risk/backfill'))
+log('历史回溯需要鉴权', bfNoAuth.status === 401)
+
+const statusBefore = await jsonOf(await call('/api/admin/risk/backfill', { headers: bearer }))
+const bfDry = await jsonOf(await call('/api/admin/risk/backfill', {
+  method: 'POST', headers: bearer, body: { source: 'events', events: histEvents, dryRun: true },
+}))
+const statusAfterDry = await jsonOf(await call('/api/admin/risk/backfill', { headers: bearer }))
+log('dryRun 不入账', bfDry.status === 200 && bfDry.data.added === 3 &&
+  statusAfterDry.data.hist === statusBefore.data.hist, `hist=${statusAfterDry.data.hist}`)
+
+const bf1 = await jsonOf(await call('/api/admin/risk/backfill', {
+  method: 'POST', headers: bearer, body: { source: 'events', events: histEvents },
+}))
+log('历史可疑请求入账', bf1.status === 200 && bf1.data.added === 3, `added=${bf1.data.added}`)
+
+const bf2 = await jsonOf(await call('/api/admin/risk/backfill', {
+  method: 'POST', headers: bearer, body: { source: 'events', events: histEvents },
+}))
+log('重复回溯不重复计分', bf2.status === 200 && bf2.data.added === 0 && bf2.data.skipped === 3,
+  `added=${bf2.data.added} skipped=${bf2.data.skipped}`)
+
+let histList = await jsonOf(await call('/api/admin/risk?kind=i', { headers: bearer }))
+const histRow = (histList.data.items || []).find((x) => x.ip === histIp)
+log('历史证据进入风险清单', !!histRow && histRow.hs > 0 && (histRow.histReasons || []).length >= 2,
+  histRow && `s=${histRow.s} hs=${histRow.hs} ${histRow.histReasons.map((r) => r.key).join('+')}`)
+const histScore1 = histRow && histRow.s
+
+// 再次 GET 不应改变历史分
+histList = await jsonOf(await call('/api/admin/risk?kind=i', { headers: bearer }))
+const histRowAgain = (histList.data.items || []).find((x) => x.ip === histIp)
+log('重复读取历史分稳定', !!histRowAgain && histRowAgain.s === histScore1)
+
+// 历史 + 实时：取较大值，并标记“历史风险重现”
+await call('/api/.env', { headers: { 'x-forwarded-for': histIp, 'user-agent': uaBrowser } })
+await flush()
+histList = await jsonOf(await call('/api/admin/risk?kind=i', { headers: bearer }))
+const mixed = (histList.data.items || []).find((x) => x.ip === histIp)
+log('历史与实时取较大值不叠加', !!mixed && mixed.s <= 100 && mixed.s >= histScore1 &&
+  mixed.reasons.some((r) => r.key === 'repeat_offender'),
+  mixed && `s=${mixed.s} ${mixed.reasons.map((r) => r.key).join('+')}`)
+
+// 9) state 源：设备事件日志与封禁记录回溯
+const histDev = 'abcdef1234567890'
+await store.set('lic:d:' + histDev, JSON.stringify({
+  at: Date.now() - 86400e3, first: Date.now() - 30 * 86400e3, tail: '', serial: 0,
+  _exp: Date.now() + 400 * 86400e3,
+}))
+await store.set('lic:ev:' + histDev, JSON.stringify({
+  at: Date.now() - 3600e3,
+  k: 'rate_limited',
+  events: [
+    { ts: Date.now() - 7200e3, kind: 'rate_limited', path: '/api/dl-ticket', scope: 'minute', used: 60, limit: 60 },
+    { ts: Date.now() - 7100e3, kind: 'banned', path: '/api/oss-sign' },
+    { ts: Date.now() - 7000e3, kind: 'request', path: '/.git/config' },
+  ],
+}))
+const stateRun = await jsonOf(await call('/api/admin/risk/backfill', {
+  method: 'POST', headers: bearer, body: { source: 'state', cursor: 0 },
+}))
+log('设备事件历史回溯', stateRun.status === 200 && stateRun.data.added >= 3, `added=${stateRun.data.added}`)
+
+const devHist = await jsonOf(await call('/api/admin/device-events?device=' + histDev, { headers: bearer }))
+log('设备历史证据可见', devHist.status === 200 && devHist.data.risk?.hs > 0 &&
+  (devHist.data.risk.histReasons || []).length >= 2,
+  devHist.data.risk && `hs=${devHist.data.risk.hs} ${devHist.data.risk.histReasons.map((r) => r.key).join('+')}`)
+
+const stateAgain = await jsonOf(await call('/api/admin/risk/backfill', {
+  method: 'POST', headers: bearer, body: { source: 'state', cursor: 0 },
+}))
+log('设备事件重复回溯不叠加', stateAgain.status === 200 && stateAgain.data.added === 0,
+  `added=${stateAgain.data.added} skipped=${stateAgain.data.skipped}`)
+
+// 10) 重置历史分
+const resetRun = await jsonOf(await call('/api/admin/risk/backfill', {
+  method: 'POST', headers: bearer, body: { reset: true, source: 'events' },
+}))
+log('可重置历史分', resetRun.status === 200 && resetRun.data.reset === true && resetRun.data.summary.hist === 0,
+  'hist=' + resetRun.data.summary.hist)
+
 // ── 安全回归 ──────────────────────────────────────────────────────────
 // 1) 伪造 XFF 首段不能绕过登录锁定：限流取可信头 / XFF 末段
 for (let i = 0; i < 10; i++) {

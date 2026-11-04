@@ -4434,14 +4434,521 @@ async function repCheck(kv, device, tier, pathname) {
   rec.mn += 1
   await kvSave(kv, key, rec)
   await repLogEvent(kv, device, { kind: 'request', path: pathname })
-  return { ok: true, used: rec.n, limit: tier.perDay }
+  // 还没超限、但已逼近分钟上限：交给风险引擎作为“短时突发”的一个信号，
+  // 不在这里直接拒绝——单看瞬时频率容易误伤正常批量操作。
+  const burst = rec.mn >= Math.max(3, Math.ceil(tier.perMin * 0.75))
+  return { ok: true, used: rec.n, limit: tier.perDay, burst }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// 恶意请求初步识别（多因子累计风险分）
+//
+// 原则：
+//   1. 只识别、不自动封禁；最终动作由运维在观测台确认；
+//   2. 没有单一信号能把分数推到“高风险”——单项权重上限 35，高风险阈值 60，
+//      必须多个维度同时命中（例如探测路径 + 扫描器 UA）才会升高；
+//   3. 分数按 30 分钟半衰期衰减，短时扫描会累积，正常使用会自然回落；
+//   4. 只在命中信号时写存储，并按 30 秒/键节流；正常请求不产生额外 KV 开销。
+// ══════════════════════════════════════════════════════════════════════
+
+const RISK_DEVICE_PREFIX = 'lic:risk:d:'
+const RISK_IP_PREFIX = 'lic:risk:i:'
+const RISK_INDEX_KEY = 'lic:risk:index'
+const RISK_INDEX_CAP = 300
+const RISK_TTL_MS = 7 * 86400000
+const RISK_HALF_MS = 30 * 60 * 1000
+const RISK_WRITE_GAP_MS = 30 * 1000
+const RISK_HIGH = 60
+const RISK_MEDIUM = 35
+const RISK_LOW = 15
+
+// 历史证据：回溯扫描只处理“风险引擎上线前”的存量记录，用更长的半衰期（3 天）
+// 让旧证据逐步淡出，而不是一上来就按 30 分钟衰减归零。
+const RISK_HIST_HALF_MS = 3 * 86400000
+const RISK_EVIDENCE_CAP = 400
+const RISK_PATH_WINDOW_MS = 15 * 60 * 1000
+const RISK_PATH_CAP = 60
+const RISK_COMBO_GAP_MS = 15 * 60 * 1000
+const RISK_BACKFILL_KEY = 'lic:risk:backfill'
+
+// 单信号权重刻意都低于 RISK_HIGH，避免“一个指标就判死刑”。
+const RISK_WEIGHTS = {
+  probe_path: 35,
+  banned_hit: 30,
+  scanner_ua: 25,
+  rate_limited: 25,
+  auth_brute: 25,
+  sensitive_query: 22,
+  bad_device_id: 20,
+  bad_method: 20,
+  path_sweep: 20,
+  crawl_sweep: 15,
+  header_abuse: 15,
+  burst: 12,
+  multi_probe: 12,
+  headless_ua: 12,
+  combo: 10,
+  repeat_offender: 10,
+  empty_ua: 10,
+  script_ua: 10,
+  missing_device: 8,
+  bot_ua: 8,
+  err4xx: 8,
+}
+
+const RISK_LABELS = {
+  probe_path: '探测敏感路径',
+  banned_hit: '封禁后继续请求',
+  scanner_ua: '扫描器特征 UA',
+  rate_limited: '触发设备限流',
+  sensitive_query: '注入/越权参数',
+  bad_device_id: '伪造/非法设备码',
+  bad_method: '异常请求方法',
+  path_sweep: '多路径扫描',
+  crawl_sweep: '多路径爬取',
+  header_abuse: '请求头异常',
+  burst: '短时高频突发',
+  multi_probe: '多路径探测',
+  headless_ua: '无头浏览器 UA',
+  combo: '多类信号组合',
+  repeat_offender: '历史风险重现',
+  empty_ua: '缺少 User-Agent',
+  script_ua: '脚本/命令行 UA',
+  missing_device: '敏感接口缺少设备码',
+  bot_ua: '爬虫/采集 UA',
+  err4xx: '连续 4xx 错误',
+  auth_brute: '后台登录爆破',
+}
+
+// 由引擎根据上下文推导，不接受请求特征直接注入。
+const RISK_DERIVED = new Set(['multi_probe', 'path_sweep', 'combo', 'repeat_offender'])
+
+const RISK_PROBE_RE = /(?:^|\/)(?:\.env|\.git|\.svn|\.hg|\.aws|\.ssh|wp-admin|wp-login|wp-content|phpmyadmin|xmlrpc\.php|cgi-bin|actuator|solr|console|boaform|hnap1|vendor\/phpunit|server-status|docker\.sock)(?:\/|$|\.)|(?:^|\/)\.\.(?:\/|$)|%2e%2e|etc\/passwd|proc\/self\/environ/i
+const RISK_INJECT_RE = /(?:union(?:\s|\+|%20)+(?:all(?:\s|\+|%20)+)?select\b|information_schema|sleep\s*\(|benchmark\s*\(|<script|onerror\s*=|javascript:|\bselect\b.+\bfrom\b|\bdrop\s+table\b|\bor\s+1\s*=\s*1\b)/i
+const RISK_SCANNER_UA_RE = /(sqlmap|nikto|nmap|masscan|zgrab|nuclei|acunetix|nessus|dirbuster|gobuster|wfuzz|ffuf|hydra|wpscan|joomscan|whatweb|pocsuite|xray|goby)/i
+const RISK_HEADLESS_UA_RE = /(headlesschrome|phantomjs|puppeteer|playwright|selenium|scrapy)/i
+const RISK_SCRIPT_UA_RE = /(curl\/|wget\/|python-requests|python-urllib|go-http-client|java\/|okhttp|libwww|httpclient|axios\/|node-fetch)/i
+const RISK_BOT_UA_RE = /(semrushbot|ahrefsbot|mj12bot|petalbot|bytespider|dotbot|blexbot|serpstatbot)/i
+const RISK_DEVICE_REQUIRED = new Set(['/api/dl-ticket', '/api/oss-sign', '/api/mirror-sign', '/api/license/activate'])
+
+function riskLevelOf(score) {
+  const s = Number(score) || 0
+  if (s >= RISK_HIGH) return 'high'
+  if (s >= RISK_MEDIUM) return 'medium'
+  if (s >= RISK_LOW) return 'low'
+  return ''
+}
+
+function riskFreshScore(rec, now = Date.now()) {
+  const at = Number(rec && rec.at) || now
+  const score = Number(rec && rec.s) || 0
+  return Math.max(0, Math.round(score * Math.pow(0.5, Math.max(0, now - at) / RISK_HALF_MS)))
+}
+
+function riskReasons(rec, compact) {
+  const out = []
+  for (const [name, r] of Object.entries((rec && rec.r) || {})) {
+    if (!RISK_WEIGHTS[name]) continue
+    const item = { key: name, label: RISK_LABELS[name] || name, n: Math.max(1, Number(r && r.n) || 1), w: Number(RISK_WEIGHTS[name]) || 0 }
+    if (!compact && r && r.last) item.last = Number(r.last) || 0
+    if (!compact && r && r.ex) item.ex = String(r.ex).slice(0, 80)
+    out.push(item)
+  }
+  out.sort((a, b) => b.w - a.w || b.n - a.n)
+  return compact ? out.map((x) => [x.key, x.n]) : out
+}
+
+/** 索引里只存 {信号: 次数}，展示时按权重表还原成带标签的列表。 */
+function riskReasonsFromCompact(map) {
+  const out = []
+  for (const [name, n] of Object.entries(map || {})) {
+    const w = Number(RISK_WEIGHTS[name]) || 0
+    if (!w) continue
+    out.push({ key: name, label: RISK_LABELS[name] || name, n: Math.max(1, Number(n) || 1), w })
+  }
+  out.sort((a, b) => b.w - a.w || b.n - a.n)
+  return out
+}
+
+/** 路径/查询参数特征：探测路径与注入风格参数是两类独立证据。 */
+function riskPathSignals(path, search) {
+  const out = {}
+  let decoded = String(path || '')
+  try { decoded = decodeURIComponent(decoded) } catch {}
+  decoded = decoded.slice(0, 200)
+  if (RISK_PROBE_RE.test(decoded)) out.probe_path = decoded.slice(0, 80)
+  let query = String(search || '').slice(0, 300)
+  try { query = decodeURIComponent(query) } catch {}
+  if (RISK_INJECT_RE.test(decoded + '?' + query)) out.sensitive_query = `${decoded}?${query}`.slice(0, 80)
+  return out
+}
+
+/** UA 分类：扫描器 > 无头浏览器 > 脚本客户端 > 采集爬虫 > 空 UA。 */
+function riskUaSignal(ua) {
+  const text = String(ua || '')
+  if (!text) return { empty_ua: 1 }
+  if (RISK_SCANNER_UA_RE.test(text)) return { scanner_ua: text.slice(0, 60) }
+  if (RISK_HEADLESS_UA_RE.test(text)) return { headless_ua: text.slice(0, 60) }
+  if (RISK_SCRIPT_UA_RE.test(text)) return { script_ua: text.slice(0, 60) }
+  if (RISK_BOT_UA_RE.test(text)) return { bot_ua: text.slice(0, 60) }
+  return {}
+}
+
+function riskMethodSignal(method) {
+  const m = String(method || 'GET').toUpperCase()
+  return ['GET', 'HEAD', 'POST', 'OPTIONS'].includes(m) ? {} : { bad_method: m }
+}
+
+/** 只读取请求本身的特征，不产生存储写入。 */
+function riskSignalsOf(request, url) {
+  const out = { ...riskPathSignals(url.pathname, url.search), ...riskUaSignal(request.headers.get('user-agent')) }
+  Object.assign(out, riskMethodSignal(request.method))
+
+  let headerCount = 0
+  let huge = 0
+  try {
+    for (const [, value] of request.headers) {
+      headerCount++
+      if (String(value).length > 4096) huge++
+    }
+  } catch {}
+  if (headerCount > 64 || huge) out.header_abuse = `h${headerCount}/v${huge}`
+
+  const rawDid = String(request.headers.get('x-csh-did') || request.headers.get('x-csh-device') || '').trim()
+  if (rawDid && !deviceIdOk(rawDid)) out.bad_device_id = rawDid.slice(0, 40)
+  if (!deviceIdOk(rawDid) && RISK_DEVICE_REQUIRED.has(url.pathname)) out.missing_device = 1
+  return out
+}
+
+/** 历史日志只有字段没有 Request 对象，用同一套规则还原信号。 */
+function riskHistSignalsOfEvent(ev) {
+  const out = { ...riskPathSignals(ev.path, ev.query), ...riskUaSignal(ev.ua) }
+  Object.assign(out, riskMethodSignal(ev.method))
+  const status = Number(ev.status) || 0
+  if ([401, 403, 404, 405].includes(status)) out.err4xx = status
+  return out
+}
+
+// 同一键、同一组信号在 30 秒内只写一次；出现新信号（例如先探测、后扫描器）立即补写。
+// 另外在内存里跟踪 15 分钟内的不同路径：扫描器会在几秒内扫过大量路径，
+// 达到 3 / 8 个时强制补写一次，让“多路径探测 / 多路径扫描”能及时体现，
+// 同时其余重复请求仍被节流，不会把 404 洪水放大成写风暴。
+const riskSeen = new Map()
+function riskAllowWrite(key, signals, now, path) {
+  const names = Object.keys(signals).sort().join(',')
+  let entry = riskSeen.get(key)
+  if (!entry || now - entry.at > 10 * 60 * 1000) {
+    entry = { at: 0, names: '', paths: new Map() }
+    riskSeen.set(key, entry)
+  }
+  const track = path && (signals.probe_path || signals.sensitive_query || signals.err4xx)
+  let sweep = 0
+  if (track) {
+    for (const [h, ts] of entry.paths) if (now - ts > RISK_PATH_WINDOW_MS) entry.paths.delete(h)
+    entry.paths.set(riskFnv(path), now)
+    const n = entry.paths.size
+    if (n === 3 || n === 8) sweep = n
+  }
+  const allow = !!sweep || !entry.at || now - entry.at >= RISK_WRITE_GAP_MS || entry.names !== names
+  if (allow) {
+    entry.at = now
+    entry.names = names
+  }
+  if (riskSeen.size > 2000) {
+    for (const [k, v] of riskSeen) if (now - v.at > 10 * 60 * 1000) riskSeen.delete(k)
+  }
+  return { allow, sweep }
+}
+
+async function riskIndexGet(kv) {
+  const rec = await kvJson(kv, RISK_INDEX_KEY)
+  return Array.isArray(rec && rec.items) ? rec.items : []
+}
+
+/** 稳定的 32 位散列，只用于内部键（路径/证据去重），不参与安全判定。 */
+function riskFnv(text) {
+  let h = 0x811c9dc5
+  const s = String(text || '')
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i)
+    h = Math.imul(h, 0x01000193) >>> 0
+  }
+  return h.toString(36)
+}
+
+function riskEvidenceHash(ev) {
+  return riskFnv(`${ev.id || ''}|${ev.ts || ''}|${ev.ip || ''}|${ev.path || ''}|${ev.ua || ''}|${ev.status || ''}`)
+}
+
+/** 历史分：单个信号随重复次数缓慢加成（最多 1.5 倍），多类信号自然叠加，封顶 100。 */
+function riskHistScore(hb) {
+  let sum = 0
+  for (const [name, r] of Object.entries(hb || {})) {
+    const w = Number(RISK_WEIGHTS[name]) || 0
+    if (!w) continue
+    const n = Math.max(1, Number(r && r.n) || 1)
+    sum += Math.round(w * Math.min(1.5, 1 + 0.05 * Math.log2(n)))
+  }
+  return Math.min(100, sum)
+}
+
+/** 历史分按“最新证据时间”锚定、3 天半衰期折算，旧证据逐步淡出。 */
+function riskHistFresh(rec, now = Date.now()) {
+  const at = Number(rec && rec.hat) || 0
+  if (!at) return 0
+  const score = Number(rec && rec.hs) || 0
+  return Math.max(0, Math.round(score * Math.pow(0.5, Math.max(0, now - at) / RISK_HIST_HALF_MS)))
+}
+
+/** 实时分与历史分取较大值：两者都是“同一对象可疑程度”的估计，取 max 避免重复计分。 */
+function riskCombinedFresh(rec, now = Date.now()) {
+  return Math.max(riskFreshScore(rec, now), riskHistFresh(rec, now))
+}
+
+function riskHistReasons(rec, compact) {
+  const out = []
+  for (const [name, r] of Object.entries((rec && rec.hb) || {})) {
+    if (!RISK_WEIGHTS[name]) continue
+    const item = { key: name, label: RISK_LABELS[name] || name, n: Math.max(1, Number(r && r.n) || 1), w: Number(RISK_WEIGHTS[name]) || 0 }
+    if (!compact && r && r.last) item.last = Number(r.last) || 0
+    if (!compact && r && r.ex) item.ex = String(r.ex).slice(0, 80)
+    out.push(item)
+  }
+  out.sort((a, b) => b.w - a.w || b.n - a.n)
+  return compact ? out.map((x) => [x.key, x.n]) : out
+}
+
+/**
+ * 上下文推导信号：单看一条请求看不出来的“扫描面”。
+ *   multi_probe   15 分钟内命中 ≥3 个不同路径
+ *   path_sweep    15 分钟内命中 ≥8 个不同路径
+ *   combo         同一窗口内 ≥4 类信号（每 15 分钟最多记一次）
+ *   repeat_offender 历史证据仍有效时再次命中
+ */
+function riskDerive(rec, signals, meta) {
+  const out = {}
+  const now = meta.now
+  const path = String(meta.path || '')
+  if (path && (signals.probe_path || signals.sensitive_query || signals.err4xx)) {
+    const map = rec.p && typeof rec.p === 'object' ? rec.p : {}
+    for (const [k, v] of Object.entries(map)) if (now - Number(v) > RISK_PATH_WINDOW_MS) delete map[k]
+    map[riskFnv(path)] = now
+    const keys = Object.keys(map)
+    if (keys.length > RISK_PATH_CAP) {
+      keys.sort((a, b) => Number(map[a]) - Number(map[b]))
+      for (const k of keys.slice(0, keys.length - RISK_PATH_CAP)) delete map[k]
+    }
+    rec.p = map
+    const n = Math.max(Math.min(keys.length, RISK_PATH_CAP), Number(meta.sweep) || 0)
+    if (n >= 3) out.multi_probe = `${n} 个不同路径`
+    if (n >= 8) out.path_sweep = `${n} 个不同路径`
+  }
+
+  const recent = new Set(Object.keys(signals))
+  for (const [name, r] of Object.entries(rec.r || {})) {
+    if (RISK_DERIVED.has(name)) continue
+    if (now - Number(r && r.last) <= RISK_COMBO_GAP_MS) recent.add(name)
+  }
+  if (recent.size >= 4 && now - (Number(rec.cbt) || 0) > RISK_COMBO_GAP_MS) {
+    out.combo = `${recent.size} 类信号`
+    rec.cbt = now
+  }
+
+  if (riskHistFresh(rec, now) >= RISK_LOW && now - (Number(rec.rpt) || 0) > RISK_COMBO_GAP_MS) {
+    out.repeat_offender = `历史 ${riskHistFresh(rec, now)} 分`
+    rec.rpt = now
+  }
+  return out
+}
+
+async function riskIndexPut(kv, kind, id, rec, now) {
+  try {
+    const items = await riskIndexGet(kv)
+    const compact = {}
+    for (const [name, n] of riskReasons(rec, true)) compact[name] = n
+    const hcompact = {}
+    for (const [name, n] of riskHistReasons(rec, true)) hcompact[name] = n
+    const item = {
+      k: kind,
+      id: String(id).slice(0, 64),
+      s: Number(rec.s) || 0,
+      at: Number(rec.at) || now,
+      h: Number(rec.hits) || 0,
+      r: compact,
+      hs: Number(rec.hs) || 0,
+      hat: Number(rec.hat) || 0,
+      hr: hcompact,
+    }
+    if (kind === 'i') item.ip = String(rec.ip || id).slice(0, 64)
+    const total = riskCombinedFresh(item, now)
+    const at = items.findIndex((x) => x && x.k === kind && x.id === item.id)
+    if (at >= 0) items[at] = item
+    else if (total >= RISK_LOW) items.push(item)
+    else return
+    items.sort((a, b) => riskCombinedFresh(b, now) - riskCombinedFresh(a, now) || (Number(b.at) || 0) - (Number(a.at) || 0))
+    await kvSave(kv, RISK_INDEX_KEY, { at: now, items: items.slice(0, RISK_INDEX_CAP) })
+  } catch {}
+}
+
+async function riskApply(kv, kind, key, id, signals, meta) {
+  const gate = riskAllowWrite(kind + ':' + key, signals, meta.now, meta.path)
+  if (!gate.allow) return null
+  if (gate.sweep) meta.sweep = gate.sweep
+  const storageKey = (kind === 'd' ? RISK_DEVICE_PREFIX : RISK_IP_PREFIX) + key
+  let rec = await kvJson(kv, storageKey)
+  if (!rec || !alive(rec)) rec = { s: 0, at: meta.now, r: {}, hits: 0 }
+  rec.s = riskFreshScore(rec, meta.now)
+  const derived = riskDerive(rec, signals, meta)
+  let add = 0
+  for (const [name, info] of Object.entries({ ...signals, ...derived })) {
+    if (RISK_DERIVED.has(name) && !(name in derived)) continue
+    const w = Number(RISK_WEIGHTS[name]) || 0
+    if (!w) continue
+    add += w
+    const r = rec.r[name] || { n: 0 }
+    r.n = Math.min(999, (Number(r.n) || 0) + 1)
+    r.w = w
+    r.last = meta.now
+    if (typeof info === 'string' && info) r.ex = String(info).slice(0, 80)
+    rec.r[name] = r
+  }
+  if (!add && !rec.s) return rec
+  rec.s = Math.min(100, Math.round((Number(rec.s) || 0) + add))
+  rec.at = meta.now
+  rec.hits = Math.min(99999, (Number(rec.hits) || 0) + 1)
+  if (meta.ip) rec.ip = String(meta.ip).slice(0, 64)
+  rec._exp = meta.now + RISK_TTL_MS
+  try {
+    await kvSave(kv, storageKey, rec)
+    await riskIndexPut(kv, kind, id, rec, meta.now)
+  } catch {}
+  return rec
+}
+
+/**
+ * 历史证据批量入账：同一批事件读一次、写一次；证据哈希去重，重复执行不会叠加。
+ * 历史分每次都由 hb 计数重算（而不是在原分上累加），因此天然幂等。
+ */
+async function riskHistApplyMany(kv, kind, key, id, events, meta) {
+  if (!Array.isArray(events) || !events.length) return { added: 0, skipped: 0 }
+  const storageKey = (kind === 'd' ? RISK_DEVICE_PREFIX : RISK_IP_PREFIX) + key
+  let rec = await kvJson(kv, storageKey)
+  if (!rec || !alive(rec)) rec = { s: 0, at: meta.now, r: {}, hits: 0 }
+  const hid = rec.hid && typeof rec.hid === 'object' ? rec.hid : {}
+  const hb = rec.hb && typeof rec.hb === 'object' ? rec.hb : {}
+  let added = 0
+  let skipped = 0
+  let newest = Number(rec.hat) || 0
+  for (const ev of events) {
+    const ts = Number(ev.ts) || meta.now
+    const eh = riskEvidenceHash(ev)
+    if (hid[eh]) { skipped++; continue }
+    hid[eh] = ts
+    const sigs = ev._signals || riskHistSignalsOfEvent(ev)
+    for (const [name, info] of Object.entries(sigs)) {
+      if (!RISK_WEIGHTS[name]) continue
+      const e = hb[name] || { n: 0, first: ts, last: ts }
+      e.n = Math.min(999, (Number(e.n) || 0) + 1)
+      e.first = Math.min(Number(e.first) || ts, ts)
+      e.last = Math.max(Number(e.last) || 0, ts)
+      if (typeof info === 'string' && info) e.ex = String(info).slice(0, 80)
+      hb[name] = e
+      newest = Math.max(newest, ts)
+    }
+    added++
+  }
+  if (!added) return { added: 0, skipped, rec }
+  const entries = Object.entries(hid).sort((a, b) => Number(a[1]) - Number(b[1]))
+  if (entries.length > RISK_EVIDENCE_CAP) {
+    for (const [k] of entries.slice(0, entries.length - RISK_EVIDENCE_CAP)) delete hid[k]
+  }
+  // 路径覆盖度：探测/注入/扫描器/4xx 达到一定条数才算“扫描面”，
+  // 普通爬取则要求更多不同记录，避免把少量 404 误判成扫描。
+  const distinct = Object.keys(hid).length
+  const strong =
+    (Number(hb.probe_path && hb.probe_path.n) || 0) > 0 ||
+    (Number(hb.sensitive_query && hb.sensitive_query.n) || 0) > 0 ||
+    (Number(hb.scanner_ua && hb.scanner_ua.n) || 0) > 0
+  const firstProbe = Math.min(
+    Number(hb.probe_path && hb.probe_path.first) || newest,
+    Number(hb.sensitive_query && hb.sensitive_query.first) || newest,
+    Number(hb.err4xx && hb.err4xx.first) || newest,
+  )
+  if (strong && distinct >= 3) hb.multi_probe = { n: distinct, first: firstProbe, last: newest, ex: `${distinct} 条可疑记录` }
+  else delete hb.multi_probe
+  if (strong && distinct >= 8) hb.path_sweep = { n: distinct, first: firstProbe, last: newest, ex: `${distinct} 条可疑记录` }
+  else delete hb.path_sweep
+  if (!strong && distinct >= 20) hb.crawl_sweep = { n: distinct, first: firstProbe, last: newest, ex: `${distinct} 条记录` }
+  else delete hb.crawl_sweep
+  rec.hid = hid
+  rec.hb = hb
+  rec.hs = riskHistScore(hb)
+  rec.hat = newest
+  if (!meta.dryRun) {
+    rec._exp = Math.max(Number(rec._exp) || 0, meta.now + RISK_TTL_MS)
+    if (meta.ip) rec.ip = String(meta.ip).slice(0, 64)
+    try {
+      await kvSave(kv, storageKey, rec)
+      await riskIndexPut(kv, kind, id, rec, meta.now)
+    } catch {}
+  }
+  return { added, skipped, rec }
+}
+
+/** 后台展示用摘要：分数按半衰期折算到此刻，等级随分数实时变化，不额外写存储。 */
+function riskSummary(rec, now = Date.now()) {
+  if (!rec || typeof rec !== 'object') return null
+  const live = riskFreshScore(rec, now)
+  const hist = riskHistFresh(rec, now)
+  const s = Math.max(live, hist)
+  return {
+    s,
+    level: riskLevelOf(s),
+    ls: live,
+    at: Number(rec.at) || 0,
+    hits: Number(rec.hits) || 0,
+    ip: String(rec.ip || ''),
+    hs: hist,
+    hat: Number(rec.hat) || 0,
+    reasons: riskReasons(rec, false),
+    histReasons: riskHistReasons(rec, false),
+  }
+}
+
+/**
+ * 记录一次风险信号。signals 传 null 表示现场计算请求特征；传 {} 表示只记 extra。
+ * 未登记的设备码不建风险记录（否则随机 16 进制 ID 可以无限撑大存储），只记 IP 维度。
+ * force=true 时允许记录后台路径（仅用于登录爆破这类必须观测的异常）。
+ */
+async function riskObserve(request, env, signals, extra, force) {
+  try {
+    const url = new URL(request.url)
+    if (!force && url.pathname.startsWith('/api/admin/')) return
+    const base = signals === null || signals === undefined ? riskSignalsOf(request, url) : signals
+    const all = { ...base, ...(extra || {}) }
+    if (!Object.keys(all).length) return
+    const kv = await gateKv()
+    if (!kv) return
+    const now = Date.now()
+    const ip = reqIp(request)
+    const meta = { now, ip, path: url.pathname.slice(0, 200) }
+    const device = deviceIdOf(request)
+    if (device) {
+      const known = await kvJson(kv, LIC_DEVICE_KEY + device)
+      if (known && alive(known)) await riskApply(kv, 'd', device, device, all, meta)
+    }
+    if (ip && ip !== 'unknown') {
+      const key = (await sha256Hex(ip)).slice(0, 24)
+      await riskApply(kv, 'i', key, ip, all, meta)
+    }
+  } catch {}
 }
 
 /**
  * 设备信誉闸门：返回 null = 放行；返回 Response = 直接回绝（封禁与超限都是 429）。
  * 无设备码的请求不在这里处理，仍由各接口自己的 IP/配额逻辑兜底。
  */
-async function deviceGuard(request, env) {
+async function deviceGuard(request, env, info) {
   const url = new URL(request.url)
   if (!url.pathname.startsWith('/api/') || url.pathname.startsWith('/api/admin/')) return null
   const device = deviceIdOf(request)
@@ -4453,6 +4960,7 @@ async function deviceGuard(request, env) {
   const ban = await licBanInfo(kv, device)
   if (ban) {
     await repLogEvent(kv, device, { kind: 'banned', path: url.pathname })
+    if (info) info.banned_hit = 1
     return json(
       { error: licBanMessage(ban), code: 'csh_device_banned', until: Number(ban.until) || 0 },
       429,
@@ -4466,7 +4974,11 @@ async function deviceGuard(request, env) {
   if (!tier) return null
 
   const r = await repCheck(kv, device, tier, url.pathname)
-  if (r.ok) return null
+  if (r.ok) {
+    // 逼近分钟上限只是“观测信号”，不在这里拒绝——单一频率指标不足以定性。
+    if (r.burst && info) info.burst = `${url.pathname}:${r.used}/${r.limit}`
+    return null
+  }
 
   await repLogEvent(kv, device, {
     kind: 'rate_limited',
@@ -4475,6 +4987,7 @@ async function deviceGuard(request, env) {
     used: r.used,
     limit: r.limit,
   })
+  if (info) info.rate_limited = `${url.pathname}:${r.scope}:${r.used}/${r.limit}`
   return json(
     {
       error:
@@ -4931,6 +5444,8 @@ async function handleAdminLogin(request, env) {
       try {
         await kvSave(kv, failKey, { n, _exp: Date.now() + failWindowMs })
       } catch {}
+      // 后台登录连续失败是典型的爆破信号；第 3 次起计入风险分（30 秒节流）。
+      if (n >= 3) await riskObserve(request, env, {}, { auth_brute: '/api/admin/login' }, true)
     }
     console.warn(`admin: login failed from ${reqIp(request)}`)
     return admJson({ error: '账号或密码不正确。' }, 401)
@@ -5075,7 +5590,72 @@ async function handleAdminDevices(request, env) {
   const backfilled = await licBackfillDevices(kv)
 
   const devices = await admIndex(kv, ADM_DEV_INDEX_KEY)
-  return admJson({ ok: true, devices, backfilled })
+
+  // 风险分只从索引里读一次，避免每台设备一次 KV 读；分数折算到此刻再给前端。
+  const now = Date.now()
+  const riskByDevice = new Map()
+  for (const it of await riskIndexGet(kv)) {
+    if (it && it.k === 'd' && it.id) riskByDevice.set(String(it.id), it)
+  }
+  const rows = devices.map((d) => {
+    const item = riskByDevice.get(String((d && d.d) || ''))
+    if (!item) return d
+    const s = riskCombinedFresh(item, now)
+    return {
+      ...d,
+      risk: {
+        s,
+        level: riskLevelOf(s),
+        ls: riskFreshScore(item, now),
+        at: Number(item.at) || 0,
+        hits: Number(item.h) || 0,
+        hs: riskHistFresh(item, now),
+        hat: Number(item.hat) || 0,
+        reasons: riskReasonsFromCompact(item.r),
+        histReasons: riskReasonsFromCompact(item.hr),
+      },
+    }
+  })
+  return admJson({ ok: true, devices: rows, backfilled, riskAt: now })
+}
+
+/** GET /api/admin/risk?kind=d|i —— 风险清单（设备 / IP），按当前折算分数排序。 */
+async function handleAdminRisk(request, env) {
+  const sess = await admSession(request, env)
+  if (!sess && !admServiceOk(request, env)) return admJson({ error: '未登录' }, 401)
+
+  const kv = await gateKv()
+  if (!kv) return admJson({ error: '状态存储不可用' }, 503)
+
+  const kind = String(new URL(request.url).searchParams.get('kind') || '').trim()
+  const now = Date.now()
+  const counts = { high: 0, medium: 0, low: 0 }
+  const items = []
+  for (const it of await riskIndexGet(kv)) {
+    if (!it || !it.id) continue
+    if (kind && it.k !== kind) continue
+    const hs = riskHistFresh(it, now)
+    const s = riskCombinedFresh(it, now)
+    const level = riskLevelOf(s)
+    if (!level) continue
+    counts[level]++
+    items.push({
+      kind: it.k,
+      id: String(it.id),
+      ip: String(it.ip || ''),
+      s,
+      level,
+      ls: riskFreshScore(it, now),
+      at: Number(it.at) || 0,
+      hits: Number(it.h) || 0,
+      hs,
+      hat: Number(it.hat) || 0,
+      reasons: riskReasonsFromCompact(it.r),
+      histReasons: riskReasonsFromCompact(it.hr),
+    })
+  }
+  items.sort((a, b) => b.s - a.s || b.at - a.at)
+  return admJson({ ok: true, now, counts, items: items.slice(0, RISK_INDEX_CAP) })
 }
 
 /** GET /api/admin/device-events?device= —— 单设备信誉详情：事件、封禁、当日报数。 */
@@ -5094,14 +5674,287 @@ async function handleAdminDeviceEvents(request, env) {
   const touch = await kvJson(kv, LIC_DEVICE_KEY + device)
   const usage = (await kvJson(kv, 'lic:rep:' + device + ':' + gateDay())) || null
 
+  // 风险详情：设备维度 + 该设备最近来源 IP 的维度（两者独立累计，便于判断是否单机 vs 整段 IP）。
+  const riskRec = await kvJson(kv, RISK_DEVICE_PREFIX + device)
+  const risk = riskSummary(riskRec)
+  let ipRisk = null
+  const recIp = riskRec && String(riskRec.ip || '')
+  if (recIp && recIp !== 'unknown') {
+    ipRisk = riskSummary(await kvJson(kv, RISK_IP_PREFIX + (await sha256Hex(recIp)).slice(0, 24)))
+  }
+
   return admJson({
     ok: true,
     device,
     ban: ban || null,
     touch: touch || null,
     usage: usage ? { day: usage.day, dayCount: usage.n, minuteCount: usage.mn } : null,
+    risk,
+    ipRisk,
     events: Array.isArray(ev && ev.events) ? ev.events : [],
   })
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// 历史回溯：风险引擎上线前没有计分，用存量记录与观测台日志补一次基线。
+//
+//   1. source=state  扫描 csh-api 自己的设备事件（lic:ev:）与封禁记录（lic:ban:）；
+//   2. source=events 接收观测台从 Nginx 日志整理出的可疑请求（ip/ts/path/ua/status）；
+//   3. 每条证据只入账一次（哈希去重），历史分由计数重算，重复执行不叠加；
+//   4. 结果与实时分分开存放（hs/hat），展示时取两者较大值，避免重复计分。
+// ══════════════════════════════════════════════════════════════════════
+
+/** 历史回溯概览：已入账的历史证据与命中情况。 */
+async function riskBackfillStatus(kv) {
+  const marker = await kvJson(kv, RISK_BACKFILL_KEY)
+  const now = Date.now()
+  const items = await riskIndexGet(kv)
+  let hist = 0
+  let histHigh = 0
+  let last = 0
+  for (const it of items) {
+    if (!it) continue
+    const hs = riskHistFresh(it, now)
+    if (hs > 0) hist++
+    if (hs >= RISK_HIGH) histHigh++
+    last = Math.max(last, Number(it.hat) || 0)
+  }
+  return { marker: marker || null, hist, histHigh, lastHistAt: last, now }
+}
+
+/** 清空历史分（保留实时分与事件记录），用于纠正一次错误导入后重跑。 */
+async function riskBackfillReset(kv) {
+  const now = Date.now()
+  const items = await riskIndexGet(kv)
+  const kept = []
+  for (const it of items) {
+    if (!it || !it.id) continue
+    const storageKey = (it.k === 'd' ? RISK_DEVICE_PREFIX : RISK_IP_PREFIX) + it.id
+    const rec = await kvJson(kv, storageKey)
+    if (rec) {
+      delete rec.hs
+      delete rec.hat
+      delete rec.hb
+      delete rec.hid
+      delete rec.rpt
+      try { await kvSave(kv, storageKey, rec) } catch {}
+    }
+    if (riskFreshScore(it, now) >= RISK_LOW) {
+      delete it.hs
+      delete it.hat
+      delete it.hr
+      kept.push(it)
+    }
+  }
+  try { await kvSave(kv, RISK_INDEX_KEY, { at: now, items: kept.slice(0, RISK_INDEX_CAP) }) } catch {}
+  try { await kvSave(kv, RISK_BACKFILL_KEY, { v: 1, at: now, resetAt: now, state: {}, events: {} }) } catch {}
+  return { reset: true, kept: kept.length }
+}
+
+/** 把设备事件日志翻译成一条历史证据；只保留能说明问题的类型。 */
+function riskHistEventOfDeviceEvent(device, e) {
+  if (!e || typeof e !== 'object') return null
+  const ts = Number(e.ts) || 0
+  if (!ts) return null
+  const path = String(e.path || '').slice(0, 200)
+  const id = `${device}:${ts}:${e.kind || ''}:${path}`
+  if (e.kind === 'rate_limited') return { id, ts, path, ua: '', method: 'POST', status: 429, _signals: { rate_limited: path } }
+  if (e.kind === 'banned') return { id, ts, path, ua: '', method: 'GET', status: 429, _signals: { banned_hit: path } }
+  if (e.kind === 'request') {
+    const sig = riskPathSignals(path, '')
+    return Object.keys(sig).length ? { id, ts, path, ua: '', method: 'GET', status: 0, _signals: sig } : null
+  }
+  return null
+}
+
+async function riskBackfillState(kv, body, dryRun) {
+  if (!kv || typeof kv.list !== 'function') return { status: 501, data: { error: '当前存储不支持前缀扫描' } }
+  const marker = (await kvJson(kv, RISK_BACKFILL_KEY)) || { v: 1, state: {}, events: {} }
+  const limit = Math.max(1, Math.min(300, Number(body.limit) || 80))
+  const cursor = Math.max(0, Number(body.cursor) || Number(marker.state && marker.state.cursor) || 0)
+  let keys = []
+  let banKeys = []
+  try {
+    keys = (await kv.list(REP_EVENT_PREFIX)).map(String).filter((k) => k.startsWith(REP_EVENT_PREFIX))
+  } catch {
+    return { status: 502, data: { error: '扫描设备事件失败' } }
+  }
+  try { banKeys = (await kv.list(ADM_BAN_KEY)).map(String).filter((k) => k.startsWith(ADM_BAN_KEY)) } catch {}
+  const all = keys.concat(banKeys)
+  const end = Math.min(all.length, cursor + limit)
+  const now = Date.now()
+  let processed = 0
+  let added = 0
+  let skipped = 0
+
+  for (const key of all.slice(cursor, end)) {
+    if (key.startsWith(REP_EVENT_PREFIX)) {
+      const device = key.slice(REP_EVENT_PREFIX.length)
+      if (!device) continue
+      const rec = await kvJson(kv, key)
+      const events = Array.isArray(rec && rec.events) ? rec.events : []
+      const list = events.map((e) => riskHistEventOfDeviceEvent(device, e)).filter(Boolean)
+      if (!list.length) continue
+      processed += list.length
+      const r = await riskHistApplyMany(kv, 'd', device, device, list, { now, dryRun, ip: (rec && rec.ip) || '' })
+      added += r.added
+      skipped += r.skipped
+    } else {
+      const device = key.slice(ADM_BAN_KEY.length)
+      const rec = await kvJson(kv, key)
+      const ts = Number(rec && rec.at) || 0
+      if (!device || !ts) continue
+      const ev = {
+        id: `ban:${device}:${ts}`,
+        ts,
+        path: '/api/admin/ban',
+        ua: '',
+        method: 'POST',
+        status: 0,
+        _signals: { banned_hit: rec.reason ? String(rec.reason).slice(0, 80) : '封禁记录' },
+      }
+      processed++
+      const r = await riskHistApplyMany(kv, 'd', device, device, [ev], { now, dryRun })
+      added += r.added
+      skipped += r.skipped
+    }
+  }
+
+  const done = end >= all.length
+  if (!dryRun) {
+    marker.v = 1
+    marker.at = now
+    const prev = marker.state || {}
+    marker.state = {
+      cursor: done ? 0 : end,
+      done,
+      total: all.length,
+      processed: (Number(prev.processed) || 0) + processed,
+      added: (Number(prev.added) || 0) + added,
+      skipped: (Number(prev.skipped) || 0) + skipped,
+      at: now,
+    }
+    try { await kvSave(kv, RISK_BACKFILL_KEY, marker) } catch {}
+  }
+  return {
+    status: 200,
+    data: {
+      ok: true,
+      source: 'state',
+      dryRun,
+      cursor,
+      nextCursor: done ? 0 : end,
+      total: all.length,
+      processed,
+      added,
+      skipped,
+      done,
+      summary: await riskBackfillStatus(kv),
+    },
+  }
+}
+
+async function riskBackfillEvents(kv, body, dryRun) {
+  const list = Array.isArray(body.events) ? body.events.slice(0, 3000) : []
+  if (!list.length) return { status: 400, data: { error: '缺少 events' } }
+  const now = Date.now()
+  const byIp = new Map()
+  let ignored = 0
+  for (const raw of list) {
+    if (!raw || typeof raw !== 'object') { ignored++; continue }
+    const ip = String(raw.ip || '').trim().slice(0, 64)
+    if (!ip || ip === 'unknown') { ignored++; continue }
+    const ts = Number(raw.ts) || 0
+    if (!ts || ts > now + 60000) { ignored++; continue }
+    const ev = {
+      id: String(raw.id || '').slice(0, 80),
+      ts,
+      ip,
+      path: String(raw.path || raw.uri || '').slice(0, 500),
+      query: String(raw.query || '').slice(0, 200),
+      ua: String(raw.ua || '').slice(0, 300),
+      method: String(raw.method || 'GET').slice(0, 8),
+      status: Number(raw.status) || 0,
+    }
+    if (!byIp.has(ip)) byIp.set(ip, [])
+    byIp.get(ip).push(ev)
+  }
+
+  let added = 0
+  let skipped = 0
+  let touched = 0
+  for (const [ip, events] of byIp) {
+    const key = (await sha256Hex(ip)).slice(0, 24)
+    const r = await riskHistApplyMany(kv, 'i', key, ip, events, { now, dryRun, ip })
+    added += r.added
+    skipped += r.skipped
+    if (r.added) touched++
+  }
+
+  if (!dryRun) {
+    const marker = (await kvJson(kv, RISK_BACKFILL_KEY)) || { v: 1, state: {}, events: {} }
+    marker.v = 1
+    marker.at = now
+    const prev = marker.events || {}
+    marker.events = {
+      imported: (Number(prev.imported) || 0) + added,
+      skipped: (Number(prev.skipped) || 0) + skipped,
+      ipsTouched: (Number(prev.ipsTouched) || 0) + touched,
+      lastAt: now,
+    }
+    try { await kvSave(kv, RISK_BACKFILL_KEY, marker) } catch {}
+  }
+  return {
+    status: 200,
+    data: {
+      ok: true,
+      source: 'events',
+      dryRun,
+      processed: list.length,
+      ignored,
+      ips: byIp.size,
+      added,
+      skipped,
+      summary: await riskBackfillStatus(kv),
+    },
+  }
+}
+
+/** GET /api/admin/risk/backfill 概览；POST 执行一批（state 扫描或 events 导入）。 */
+async function handleAdminRiskBackfill(request, env) {
+  const sess = await admSession(request, env)
+  if (!sess && !admServiceOk(request, env)) return admJson({ error: '未登录' }, 401)
+
+  const kv = await gateKv()
+  if (!kv) return admJson({ error: '状态存储不可用' }, 503)
+
+  if (request.method === 'GET') {
+    return admJson({ ok: true, ...(await riskBackfillStatus(kv)) })
+  }
+
+  let body = {}
+  try {
+    body = (await request.json()) || {}
+  } catch {
+    return admJson({ error: '请求格式错误' }, 400)
+  }
+  const dryRun = body.dryRun === true
+  const reset = body.reset === true
+  const source = body.source === 'events' ? 'events' : 'state'
+  let out = {}
+  if (reset) {
+    if (dryRun) out = { reset: false }
+    else {
+      const cleared = await riskBackfillReset(kv)
+      out = { reset: true, resetKept: cleared.kept }
+    }
+  }
+  // 只重置、不导入时直接返回，不必再要求 events。
+  if (reset && source === 'events' && !Array.isArray(body.events)) {
+    return admJson({ ok: true, ...out, source, summary: await riskBackfillStatus(kv) })
+  }
+  const r = source === 'events' ? await riskBackfillEvents(kv, body, dryRun) : await riskBackfillState(kv, body, dryRun)
+  return admJson({ ...(r.data || {}), ...out }, r.status)
 }
 
 /**
@@ -5511,22 +6364,42 @@ async function workerFetch(request, env, ctx) {
 
     const url = new URL(request.url)
 
-    // 设备信誉先于许可判定：封禁/超限统一回 429（许可闸门对被封禁设备回 403）。
-    // 激活接口同样要过这一关：封禁优先，且激活尝试按设备限速（REP_TIER_BASE 里有这一档）。
-    const rep = await deviceGuard(request, env)
-    if (rep) return rep
-
     if (url.pathname === LIC_ACTIVATE_PATH) return handleLicenseActivate(request, env)
 
+    const isClientApi = url.pathname.startsWith('/api/') && !url.pathname.startsWith('/api/admin/')
+
     // 凡带设备码的客户端请求都登记一笔（激活接口自己会记，这里跳过）；异步写，不阻塞响应
-    if (url.pathname.startsWith('/api/') && !url.pathname.startsWith('/api/admin/')) {
+    if (isClientApi) {
       ctx.waitUntil(licTouchDevice(env, request).catch(() => {}))
     }
 
+    // 请求特征先算一遍（纯内存）；闸门结果和响应状态也并进同一批信号，
+    // 每个请求最多写一次风险存储，避免同一键并发读改写互相覆盖。
+    const preRisk = isClientApi ? riskSignalsOf(request, url) : {}
+    const riskInfo = {}
+    const recordRisk = () => {
+      if (Object.keys(preRisk).length || Object.keys(riskInfo).length) {
+        ctx.waitUntil(riskObserve(request, env, preRisk, riskInfo))
+      }
+    }
+
+    // 设备信誉先于许可判定：封禁/超限统一回 429（许可闸门对被封禁设备回 403）。
+    const rep = await deviceGuard(request, env, riskInfo)
+    if (rep) {
+      recordRisk()
+      return rep
+    }
     const gate = await licenseGuard(request, env)
     if (gate && gate.deny) return gate.deny
 
     const response = await routeRequest(request, env, ctx)
+
+    // 反复撞 4xx（猜路径/猜参数）也算一个低权重信号，必须与其它因子叠加才升级。
+    if (isClientApi && response && [401, 403, 404, 405].includes(response.status)) {
+      riskInfo.err4xx = response.status
+    }
+    recordRisk()
+
     if (!gate || !gate.headers) return response
 
     try {
@@ -5559,6 +6432,10 @@ async function routeRequest(request, env, ctx) {
       if (url.pathname === '/api/admin/ban' && request.method === 'POST') return handleAdminBan(request, env)
       if (url.pathname === '/api/admin/unban' && request.method === 'POST') return handleAdminUnban(request, env)
       if (url.pathname === '/api/admin/online' && request.method === 'GET') return handleAdminOnline(request, env)
+      if (url.pathname === '/api/admin/risk' && request.method === 'GET') return handleAdminRisk(request, env)
+      if (url.pathname === '/api/admin/risk/backfill' && (request.method === 'GET' || request.method === 'POST')) {
+        return handleAdminRiskBackfill(request, env)
+      }
       if (url.pathname === '/api/admin/shout' && request.method === 'POST') return handleAdminShout(request, env)
       if (url.pathname === '/api/admin/settings') {
         if (request.method === 'GET') return handleAdminSettingsGet(request, env)
