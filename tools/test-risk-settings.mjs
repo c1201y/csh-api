@@ -103,10 +103,12 @@ const got0 = await jsonOf(await admin('/api/admin/settings'))
 const riskGroup = got0.status === 200 ? (got0.data.groups || []).find((g) => g.id === 'risk') : null
 const keys = riskGroup ? riskGroup.fields.map((f) => f.key) : []
 log('服务令牌可读参数', got0.status === 200 && got0.data.ok === true, `status=${got0.status}`)
-log('风险分组含全部字段', keys.length === 15 &&
+log('风险分组含全部字段', keys.length === 23 &&
   ['riskMlOn', 'riskAutoBan', 'riskMlAct', 'riskBanBaseMin', 'riskBanMaxMin', 'riskAllowIps',
     'riskSshBan', 'riskSshHits', 'riskSshBanMin', 'riskSshWindowMin',
-    'riskBanMinHits', 'riskBanMinPaths', 'riskTrustHours', 'riskLearnOn', 'riskLearnMin'].every((k) => keys.includes(k)),
+    'riskBanMinHits', 'riskBanMinPaths', 'riskTrustHours', 'riskLearnOn', 'riskLearnMin',
+    'riskActionLine', 'riskThrottleLine', 'riskMinEvidence',
+    'riskOssBan', 'riskDlBan', 'riskMirrorBan', 'riskSiteBan', 'riskDeviceLink'].every((k) => keys.includes(k)),
   keys.join(','))
 const fieldOf = (bundle, key) => bundle.groups.find((g) => g.id === 'risk').fields.find((f) => f.key === key)
 log('出厂值来自环境变量', got0.status === 200 &&

