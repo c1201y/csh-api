@@ -6372,7 +6372,8 @@ async function crawlerVerified(ip, ua, kv, cache) {
   const engine = crawlerEngineOfUa(ua)
   if (!engine) return ''
   if (crawlerStaticEngine(ip, ua)) return engine
-  if (cache && cache.has(ip)) return cache.get(ip)
+  const cacheKey = `${ip}|${engine}`
+  if (cache && cache.has(cacheKey)) return cache.get(cacheKey)
   let out = ''
   try {
     if (kv) {
@@ -6381,7 +6382,7 @@ async function crawlerVerified(ip, ua, kv, cache) {
       if (rec && rec.engine === engine && alive(rec)) out = engine
     }
   } catch {}
-  if (cache) cache.set(ip, out)
+  if (cache) cache.set(cacheKey, out)
   return out
 }
 
