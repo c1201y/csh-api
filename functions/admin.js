@@ -195,19 +195,20 @@ tr:last-child td{border-bottom:none}
 
     <section class="card">
       <div class="card-head">
-        <h2>已激活设备</h2>
+        <h2>设备（含未激活）</h2>
         <div class="tools">
           <input id="devFilter" class="search" placeholder="搜设备码"/>
           <button id="reloadDevices" class="ghost sm">刷新</button>
         </div>
       </div>
+      <p class="hint">列出所有上报过设备码的客户端，包含尚未激活的机器（它们同样会出现在在线列表里）。「在线」指最近 5 分钟内有任意接口请求，与是否开启教室喊话无关。</p>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>设备码</th><th>最近激活</th><th>码尾号</th><th>构建</th><th>状态</th><th></th></tr></thead>
+          <thead><tr><th>设备码</th><th>最近活动</th><th>在线</th><th>码尾号</th><th>构建</th><th>状态</th><th></th></tr></thead>
           <tbody id="devBody"></tbody>
         </table>
       </div>
-      <p id="devEmpty" class="empty hidden">还没有设备激活。</p>
+      <p id="devEmpty" class="empty hidden">还没有设备上报过。</p>
     </section>
 
     <section class="card">
@@ -218,10 +219,10 @@ tr:last-child td{border-bottom:none}
           <button id="reloadOnline" class="ghost sm">刷新</button>
         </div>
       </div>
-      <p class="hint">只列出正在运行「教室喊话」轮询的客户端（3 分钟内有心跳）。喊话会以全屏窗口出现在对方屏幕上，并按设定时长停留。</p>
+      <p class="hint">列出最近 5 分钟内有请求的客户端，与是否开启教室喊话无关。只有开启了「教室喊话」的设备能收到消息；其余设备仅显示为在线。喊话会以全屏窗口出现在对方屏幕上，并按设定时长停留。</p>
       <div class="table-wrap">
         <table>
-          <thead><tr><th style="width:36px"><input id="onlineAll" class="online-check" type="checkbox"/></th><th>设备码</th><th>名称</th><th>配对码</th><th>最近心跳</th></tr></thead>
+          <thead><tr><th style="width:36px"><input id="onlineAll" class="online-check" type="checkbox"/></th><th>设备码</th><th>名称</th><th>配对码</th><th>喊话</th><th>最近心跳</th></tr></thead>
           <tbody id="onlineBody"></tbody>
         </table>
       </div>
@@ -586,6 +587,17 @@ function renderDevices() {
     }
     tr.appendChild(tdTime);
 
+    // 在线 = 最近 5 分钟内有任意接口请求（见服务端 ONLINE_KEY），与是否开启教室喊话无关
+    var tdOnline = el('td', 'nowrap');
+    if (d.online) {
+      tdOnline.appendChild(el('span', 'badge b-ok', '在线'));
+      if (d.seen) tdOnline.appendChild(el('div', 'dim', agoText(d.seen)));
+    } else {
+      tdOnline.appendChild(el('span', 'badge b-idle', '离线'));
+      if (d.seen) tdOnline.appendChild(el('div', 'dim', agoText(d.seen)));
+    }
+    tr.appendChild(tdOnline);
+
     tr.appendChild(el('td', 'mono', d.tail || '—'));
     tr.appendChild(el('td', 'dim nowrap', d.build || '—'));
 
@@ -683,6 +695,13 @@ function renderOnline() {
 
     tr.appendChild(el('td', '', d.name || '—'));
     tr.appendChild(el('td', 'mono', d.pair || '—'));
+
+    var tdVia = el('td');
+    tdVia.appendChild(d.via === 'announce'
+      ? el('span', 'badge b-ok', '可喊话')
+      : el('span', 'badge b-idle', '仅在线'));
+    tr.appendChild(tdVia);
+
     tr.appendChild(el('td', 'dim nowrap', agoText(d.ts)));
     body.appendChild(tr);
   });
@@ -722,7 +741,10 @@ async function sendShout() {
     });
     if (!r.ok) { toast(r.error || '发送失败'); return; }
     var failed = (r.failed || []).length;
-    toast('已送达 ' + (r.delivered || 0) + ' 台' + (failed ? '，' + failed + ' 组失败' : ''));
+    var skipped = Number(r.unreachable) || 0;
+    toast('已送达 ' + (r.delivered || 0) + ' 台'
+      + (failed ? '，' + failed + ' 组失败' : '')
+      + (skipped ? '，' + skipped + ' 台未开启教室喊话已跳过' : ''));
     loadOnline();
   } finally {
     btn.disabled = false;

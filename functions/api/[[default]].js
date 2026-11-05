@@ -4467,6 +4467,9 @@ const ADM_CODE_INDEX_KEY = 'lic:c:idx'
 
 const ADM_DEV_INDEX_KEY = 'lic:dev:idx'
 
+/** 设备索引容量。与激活码索引分开：设备数随机器规模增长，激活码数随签发量增长。 */
+const ADM_DEV_INDEX_CAP = 500
+
 const ADM_BAN_KEY = 'lic:ban:'
 
 const ADM_FAIL_KEY = 'adm:fail:'
@@ -4630,7 +4633,9 @@ async function admIndex(kv, key) {
 }
 
 async function admIndexSave(kv, key, list) {
-  await kvSave(kv, key, list.slice(0, ADM_INDEX_CAP))
+  // 设备索引单独放宽：一间机房动辄上百台，按激活码的 200 条会把早进来的设备挤掉。
+  const cap = key === ADM_DEV_INDEX_KEY ? ADM_DEV_INDEX_CAP : ADM_INDEX_CAP
+  await kvSave(kv, key, list.slice(0, cap))
 }
 
 /** 激活码本体：16 位 Crockford base32，展示时按 4 位分组并加 CSH- 前缀。 */
@@ -4714,6 +4719,56 @@ async function licRecordActivation(kv, info) {
  */
 const LIC_TOUCH_TTL_MS = 6 * 3600 * 1000
 
+/**
+ * 在线登记。
+ *
+ * 早先「在线」只认教室喊话的轮询心跳，导致两类设备永远不出现：
+ * 没在设置里打开定期轮询的（出厂默认关），以及只想用主界面、不碰喊话的。
+ * 现在改为：凡带设备码的接口请求都算一次在线心跳，与喊话是否开启无关。
+ *
+ * 档案表 lic:d:<device> 仍按 6 小时节流（写的是首次出现、构建号这类低频信息）；
+ * 在线状态单独存一张小表，按 60 秒节流，二者解耦。
+ */
+const ONLINE_KEY = 'dev:live'
+
+/** 在线窗口：心跳 60 秒一次，窗口取 5 倍，容忍连续几次丢包或写冲突。 */
+const ONLINE_WINDOW_MS = 300 * 1000
+
+/** 在线心跳最小落盘间隔。 */
+const ONLINE_TOUCH_MS = 60 * 1000
+
+/**
+ * 记一笔在线。整表读改写没有条件写，并发时后写者会覆盖先写者 ——
+ * 每分钟一次心跳、五分钟窗口，丢一两次不影响判定，故不做分片。
+ *
+ * 隔离实例内再加一层内存节流：同一台设备一分钟内只落盘一次，
+ * 这样高频接口（下载取票等）不会为了运营统计每次都读一遍在线表。
+ */
+const ONLINE_MEMO = new Map()
+const ONLINE_MEMO_CAP = 2000
+
+async function touchOnline(kv, device, now) {
+  const memo = ONLINE_MEMO.get(device)
+  if (memo && now - memo < ONLINE_TOUCH_MS - 5000) return false
+
+  const table = (await kvJson(kv, ONLINE_KEY)) || {}
+  const prev = Number(table[device]) || 0
+  if (prev && now - prev < ONLINE_TOUCH_MS) {
+    ONLINE_MEMO.set(device, prev)
+    return false
+  }
+  for (const key of Object.keys(table)) {
+    const ts = Number(table[key]) || 0
+    if (!ts || now - ts > ONLINE_WINDOW_MS) delete table[key]
+  }
+  table[device] = now
+  await kvSave(kv, ONLINE_KEY, table)
+
+  if (ONLINE_MEMO.size >= ONLINE_MEMO_CAP) ONLINE_MEMO.clear()
+  ONLINE_MEMO.set(device, now)
+  return true
+}
+
 /** 每来源每天最多登记多少台“首次出现”的设备，挡住随机设备码刷存储。 */
 const LIC_DEV_REG_PER_IP_DAY = 500
 
@@ -4742,7 +4797,14 @@ async function licTouchDevice(env, request) {
   const regMax = Math.max(1, Number(S.licDeviceRegPerIpDay) || LIC_DEV_REG_PER_IP_DAY)
 
   const prev = await kvJson(kv, LIC_DEVICE_KEY + device)
-  if (prev && now - (Number(prev.at) || 0) < touchTtlMs) return
+  const lastAt = Number(prev && prev.at) || 0
+
+  // 在线状态与档案刷新解耦：在线判定要分钟级精度，档案只记首次出现与构建号。
+  try {
+    await touchOnline(kv, device, now)
+  } catch {}
+
+  if (prev && now - lastAt < touchTtlMs) return
 
   // 只有“首次出现”的设备才消耗配额；老设备刷新不计数
   if (!prev) {
@@ -4806,6 +4868,8 @@ const REP_TIER_BASE = [
   ['/api/echocave', 'repEchoMin', 'repEchoDay', 20, 200],
   ['/api/feedback', 'repFeedbackMin', 'repFeedbackDay', 10, 100],
   ['/api/license/activate', 'repActivateMin', 'repActivateDay', 10, 60],
+  // 在线心跳：客户端 60 秒一次，留足重连余量；它没有业务副作用，但不能被当成免限速的探测口
+  ['/api/ping', 'repPingMin', 'repPingDay', 12, 2000],
 ]
 
 /** 先按路径找到这一档（不读设置），命中后再算生效值。 */
@@ -7336,12 +7400,26 @@ async function handleAdminDevices(request, env) {
   for (const it of await riskIndexGet(kv)) {
     if (it && it.k === 'd' && it.id) riskByDevice.set(String(it.id), it)
   }
+
+  // 在线状态：索引里的 at 是 6 小时粒度，只能说明「最近来过」，
+  // 「此刻在不在」要看在线表。两张表在这里才合流。
+  const live = (await kvJson(kv, ONLINE_KEY).catch(() => null)) || {}
   const rows = devices.map((d) => {
-    const item = riskByDevice.get(String((d && d.d) || ''))
-    if (!item) return d
+    const code = String((d && d.d) || '')
+    const seen = Number(live[code]) || 0
+    const base = {
+      ...d,
+      // 索引里的 at 受 6 小时节流约束，只说明「什么时候刷过档案」；
+      // 在线表的时间戳才是真正的最近活动，两者取较大值才不会把「刚用过」显示成「3 小时前」
+      at: Math.max(Number(d && d.at) || 0, seen),
+      online: !!seen && now - seen <= ADM_ONLINE_WINDOW_MS,
+      seen,
+    }
+    const item = riskByDevice.get(code)
+    if (!item) return base
     const s = riskCombinedFresh(item, now)
     return {
-      ...d,
+      ...base,
       risk: {
         s,
         level: riskLevelOf(s),
@@ -7355,7 +7433,7 @@ async function handleAdminDevices(request, env) {
       },
     }
   })
-  return admJson({ ok: true, devices: rows, backfilled, riskAt: now })
+  return admJson({ ok: true, devices: rows, backfilled, riskAt: now, onlineWindow: ADM_ONLINE_WINDOW_MS })
 }
 
 /** GET /api/admin/risk?kind=d|i —— 风险清单（设备 / IP），按当前折算分数排序。 */
@@ -9049,38 +9127,75 @@ async function kvListKeys(kv, prefix) {
 }
 
 /**
- * 在线窗口。客户端默认 30 秒一轮，连续失败会退避到 120 秒；
- * 心跳本身按 ANN_TOUCH_MS 节流落盘，所以实际可见的最近心跳会再晚 60 秒。
- * 取 300 秒 = 退避上限 + 节流 + 一个周期余量，避免把「网络抖动但还活着」的设备判成离线。
+ * GET /api/ping —— 客户端在线心跳。
+ *
+ * 真正的在线登记在请求入口的 licTouchDevice 里完成（凡带设备码的接口请求都会记一笔），
+ * 这里只回一个时间戳，不读写存储：整间机房的客户端会同时心跳，这个端点不能有额外成本。
+ */
+function handlePing(request, env) {
+  const device = deviceIdOf(request)
+  return json({ ok: true, ts: Date.now(), identified: device ? 1 : 0 }, 200, request, env)
+}
+
+/**
+ * 在线窗口。客户端心跳 60 秒一次（见客户端 PresenceService），
+ * 落盘本身也按 ONLINE_TOUCH_MS 节流，取 300 秒容纳连续丢包与写冲突。
  */
 const ADM_ONLINE_WINDOW_MS = 300 * 1000
 
-/** 在线设备 = 教室喊话轮询（ann-poll）心跳仍在窗口内的设备，按配对码分组。 */
+/**
+ * 在线设备 = 在线表里仍在窗口内的设备，按配对码补充教室信息。
+ *
+ * 两个来源合并：
+ *   · dev:live —— 所有带设备码的接口请求都会写，是「在线」的主口径；
+ *   · gate:ann:d:<code> —— 教室喊话的注册表，只提供配对码与机器名，
+ *     没开喊话的设备不在里面，但它在 dev:live 里，照样算在线。
+ */
 async function admOnlineDevices(kv) {
-  const keys = await kvListKeys(kv, 'gate:ann:d:')
   const now = Date.now()
-  const pairs = keys
+  const pairs = (await kvListKeys(kv, 'gate:ann:d:'))
     .map((key) => ({ key, pair: key.slice('gate:ann:d:'.length) }))
     .filter((it) => /^\d{6}$/.test(it.pair))
+
   // 多间教室各自一个配对码：逐个 await 会把延迟叠成「配对码数 × 单次往返」，并行读
-  const regs = await Promise.all(
-    pairs.map((it) => kvJson(kv, it.key).catch(() => null))
-  )
-  const out = []
+  const [liveRaw, regs] = await Promise.all([
+    kvJson(kv, ONLINE_KEY).catch(() => null),
+    Promise.all(pairs.map((it) => kvJson(kv, it.key).catch(() => null))),
+  ])
+
+  const meta = new Map()
   regs.forEach((reg, i) => {
     if (!reg || typeof reg !== 'object') return
     const pair = pairs[i].pair
     for (const [dev, v] of Object.entries(reg)) {
       const ts = Number(v && typeof v === 'object' ? v.t : v)
-      if (!Number.isFinite(ts) || now - ts > ADM_ONLINE_WINDOW_MS) continue
-      out.push({
-        d: dev,
+      if (!Number.isFinite(ts)) continue
+      meta.set(dev, {
         pair,
         name: String((v && typeof v === 'object' && v.n) || '').slice(0, 32),
         ts,
       })
     }
   })
+
+  const live = liveRaw && typeof liveRaw === 'object' ? liveRaw : {}
+  const out = []
+  // 两个来源要取并集：喊话心跳走查询参数（不是请求头），不会进在线表；
+  // 只按在线表遍历会把「开了喊话但没打过其它接口」的设备漏掉。
+  for (const dev of new Set([...Object.keys(live), ...meta.keys()])) {
+    const tsLive = Number(live[dev]) || 0
+    const m = meta.get(dev)
+    const ts = Math.max(tsLive, (m && m.ts) || 0)
+    if (!ts || now - ts > ADM_ONLINE_WINDOW_MS) continue
+    out.push({
+      d: dev,
+      pair: (m && m.pair) || '',
+      name: (m && m.name) || '',
+      ts,
+      // announce = 开了教室喊话，能收消息；heartbeat = 只上报在线，收不到喊话
+      via: m && m.pair ? 'announce' : 'heartbeat',
+    })
+  }
   out.sort((a, b) => b.ts - a.ts)
   return out
 }
@@ -9130,8 +9245,22 @@ async function handleAdminShout(request, env) {
   const wanted = Array.isArray(body?.targets)
     ? new Set(body.targets.map((t) => String(t).trim()).filter(Boolean))
     : null
-  const picked = wanted ? online.filter((d) => wanted.has(d.d)) : online
-  if (picked.length === 0) return admJson({ error: '选中的设备已离线', online: online.length }, 409)
+  const pickedAll = wanted ? online.filter((d) => wanted.has(d.d)) : online
+  if (pickedAll.length === 0) return admJson({ error: '选中的设备已离线', online: online.length }, 409)
+
+  // 没开教室喊话的设备只上报在线，收不到消息：单独计数并回报，不要静默丢弃
+  const picked = pickedAll.filter((d) => d.pair)
+  const unreachable = pickedAll.length - picked.length
+  if (picked.length === 0) {
+    return admJson(
+      {
+        error: `选中的 ${unreachable} 台设备没有开启教室喊话，收不到喊话。请在这些机器上打开「教室喊话」并填写配对码。`,
+        online: online.length,
+        unreachable,
+      },
+      409
+    )
+  }
 
   // 同一配对码下的一条消息可带多个目标；按配对码分组合并投递
   const groups = new Map()
@@ -9161,7 +9290,7 @@ async function handleAdminShout(request, env) {
 console.log(`admin: ${(sess && sess.user) || 'service'} shout ${id} delivered=${delivered} pairs=${groups.size} text=${text.slice(0, 40)}`)
   await admAudit(env, 'shout', { delivered, pairs: groups.size, text: text.slice(0, 120), duration })
 
-  return admJson({ ok: true, id, delivered, pairs: groups.size, failed })
+  return admJson({ ok: true, id, delivered, pairs: groups.size, failed, unreachable })
 }
 
 // ── 参数设置与操作日志 ──────────────────────────────────────────────
@@ -9508,6 +9637,9 @@ async function routeRequest(request, env, ctx) {
     }
 
     if (url.pathname === '/api/status' && request.method === 'GET') return handleStatus(request, env)
+    if (url.pathname === '/api/ping' && (request.method === 'GET' || request.method === 'POST')) {
+      return handlePing(request, env)
+    }
     if (url.pathname === '/api/submit' && request.method === 'POST') {
       return handleSubmit(request, env)
     }

@@ -5,6 +5,11 @@ globalThis.CSH_STATE = {
   async get(k) { return store.has(k) ? store.get(k) : null },
   async put(k, v) { store.set(k, String(v)) },
   async delete(k) { store.delete(Array.isArray(k) ? k[0] : k) },
+  // 前缀列举：后台在线列表要靠它找配对各教室的在线注册表
+  async list(prefix) {
+    const p = typeof prefix === 'string' ? prefix : (prefix && prefix.prefix) || ''
+    return [...store.keys()].filter((k) => k.startsWith(p))
+  },
 }
 
 const mod = await import(path)
@@ -247,6 +252,53 @@ function check(name, cond, extra) {
 
   const r3 = await poll(d1, 'pc-1')
   check('announce 重复轮询仍 204', r3.status === 204, r3.status)
+
+  // 喊话心跳走查询参数、不经过请求头，不会进在线表；后台在线列表必须从注册表补进来
+  const adminEnv = { ...env, CSH_ADMIN_API_TOKEN: 'test-admin-token-0123456789' }
+  const online = await mod.onRequest(ctxOf(new Request('http://t/api/admin/online', {
+    headers: { 'X-CSH-Admin-Token': 'test-admin-token-0123456789' },
+  }), adminEnv))
+  const oj = await online.json().catch(() => ({}))
+  const onlineRow = ((oj && oj.online) || []).find((d) => d.d === d1) || {}
+  check('喊话设备出现在在线列表', online.status === 200 && onlineRow.d === d1, { status: online.status, n: (oj.online || []).length })
+  check('喊话设备标为 announce', onlineRow.via === 'announce', onlineRow.via)
+}
+
+{
+  // 在线统计不依赖教室喊话：只打 /api/ping 的设备同样要进在线表。
+  // 这是「没开喊话就看不到在线」那个问题的回归守卫。
+  const dev = 'ffeeddccbbaa9988'
+  const ping = await mod.onRequest(ctxOf(new Request('http://t/api/ping', {
+    headers: { 'X-CSH-Did': dev },
+  }), env))
+  const pj = await ping.json().catch(() => ({}))
+  check('ping 返回 200', ping.status === 200, ping.status)
+  check('ping 识别到设备码', Number(pj.identified) === 1, pj)
+
+  // 在线登记在入口的 waitUntil 里完成，要等它落盘
+  await Promise.allSettled(waiters)
+  const live = JSON.parse(store.get('dev:live') || '{}')
+  check('ping 后设备进入在线表', Number(live[dev]) > 0, live)
+
+  // 无设备码的请求不应凭空造出条目
+  const anon = await mod.onRequest(ctxOf(new Request('http://t/api/ping', {}), env))
+  await Promise.allSettled(waiters)
+  const live2 = JSON.parse(store.get('dev:live') || '{}')
+  check('无设备码 ping 不写在线表', Object.keys(live2).length === Object.keys(live).length, {
+    before: Object.keys(live).length,
+    after: Object.keys(live2).length,
+  })
+  check('无设备码 ping 仍回 200', anon.status === 200, anon.status)
+
+  // 端到端：只打过 ping、从未参与喊话的设备，必须出现在后台在线列表里
+  const adminEnv = { ...env, CSH_ADMIN_API_TOKEN: 'test-admin-token-0123456789' }
+  const online = await mod.onRequest(ctxOf(new Request('http://t/api/admin/online', {
+    headers: { 'X-CSH-Admin-Token': 'test-admin-token-0123456789' },
+  }), adminEnv))
+  const oj = await online.json().catch(() => ({}))
+  const row = ((oj && oj.online) || []).find((d) => d.d === dev) || null
+  check('后台在线列表包含仅心跳设备', online.status === 200 && !!row, { status: online.status, n: (oj.online || []).length })
+  check('仅心跳设备标为 heartbeat', row && row.via === 'heartbeat', row && row.via)
 }
 
 await Promise.allSettled(waiters)
