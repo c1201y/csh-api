@@ -403,6 +403,8 @@ export function labelOf(ev) {
   if (status === 444) return 1; // nginx 滥用断连
   if (ua.cls === 'scanner' || badMethod) return 1;
   if (suspiciousPath(path, ev.service) || suspiciousQuery(query)) return 1;
+  // 下载/OSS 的 401/403 是签名或 API Key 被拒；浏览器 UA 也不能当成正常流量。
+  if ((ev.service === 'download' || ev.service === 'oss') && (status === 401 || status === 403)) return 1;
   if (ev.service === 'oss' && ev.op === 'auth') return 1; // 无效 API KEY 探测
   if (ev.op === 'auth' && status === 401 && !normalUa) return 1;
   // 下载 200/206 意味着签名已通过；OSS 200 意味着密钥已通过。
@@ -474,6 +476,7 @@ export function eventFromLog(raw, hint = '') {
   }
   headers.host = String(raw.host || '');
   return {
+    id: String(raw.id || raw.request_id || ''),
     ts,
     service,
     method: raw.method || 'GET',
@@ -814,9 +817,12 @@ function splitReal(samples) {
   return sorted.map((s, i) => ({ ...s, split: i < a ? 0 : i < b ? 1 : i < c ? 2 : 3 }));
 }
 
-async function loadReal(inputs) {
+async function loadReal(inputs, manualLabels = [], opts = {}) {
   const samples = [];
   const perFile = {};
+  const seen = new Set();
+  let manualHits = 0;
+  const oversampleOss = Math.max(1, Math.min(20, Number(opts.oversampleOss) || 3));
   for (const input of inputs) {
     for (const file of walkFiles(input)) {
       const hint = serviceHint(file);
@@ -829,12 +835,21 @@ async function loadReal(inputs) {
           try { raw = JSON.parse(line); } catch { continue; }
           const e = eventFromLog(raw, hint);
           if (!e || isPrivateIp(e.ip)) continue;
+          // 同一请求可能同时出现在 site-events 与 requests.jsonl，按事件 ID 去重。
+          const dedupe = e.id ? `${e.service}|${e.id}` : `${e.service}|${e.ts}|${e.ip}|${e.path}|${e.status}`;
+          if (seen.has(dedupe)) continue;
+          seen.add(dedupe);
           // 自测/巡检流量不参与训练：用户本机渗透测试与 csh-check 健康检查。
           if (SELF_TEST_IPS.has(e.ip) || String(e.headers['user-agent'] || '').startsWith('csh-check')) continue;
-          const y = labelOf(e);
+          const manual = manualLabelOf(e, manualLabels);
+          if (manual != null) manualHits++;
+          const y = manual != null ? manual : labelOf(e);
           if (y == null) continue;
-          samples.push({ ev: e, y, ts: e.ts, origin: 0 });
-          n++;
+          // OSS 401 在特征上与普通根路径请求高度重叠（状态码不进特征），少量样本容易被淹没；
+          // 只对人工/弱监督确认的攻击样本做过采样，提高这一面的召回。
+          const repeats = e.service === 'oss' && y === 1 ? oversampleOss : 1;
+          for (let r = 0; r < repeats; r++) samples.push({ ev: e, y, ts: e.ts, origin: 0 });
+          n += repeats;
         }
       } catch (err) {
         console.error(`[warn] 读取失败 ${file}: ${err.message}`);
@@ -842,7 +857,42 @@ async function loadReal(inputs) {
       if (n) perFile[file] = (perFile[file] || 0) + n;
     }
   }
+  if (manualLabels.length) console.log(`人工标签命中 ${manualHits} 条（文件 ${manualLabels.length} 条规则）`);
   return { samples: splitReal(samples), perFile };
+}
+
+function loadManualLabels(file) {
+  if (!file) return [];
+  const rules = [];
+  for (const line of fs.readFileSync(file, 'utf8').split(/\r?\n/)) {
+    const text = line.trim();
+    if (!text || text.startsWith('#')) continue;
+    let rule;
+    try { rule = JSON.parse(text); } catch { continue; }
+    if (!rule || typeof rule !== 'object') continue;
+    if (rule.label !== 0 && rule.label !== 1) continue;
+    if (!rule.id && !rule.ip && !rule.path && !rule.pathPrefix && !rule.ua && !rule.service) continue;
+    rules.push(rule);
+  }
+  return rules;
+}
+
+/** 人工标签优先于弱监督标签；同一事件可被多条规则命中，后写的规则覆盖先写的。 */
+function manualLabelOf(ev, rules) {
+  let out = null;
+  for (const rule of rules) {
+    if (rule.id && String(ev.id || '') !== String(rule.id)) continue;
+    if (rule.ip && String(ev.ip || '') !== String(rule.ip)) continue;
+    if (rule.service && String(ev.service || '') !== String(rule.service)) continue;
+    if (rule.path && String(ev.path || '') !== String(rule.path)) continue;
+    if (rule.pathPrefix && !String(ev.path || '').startsWith(String(rule.pathPrefix))) continue;
+    if (rule.ua) {
+      const ua = String((ev.headers && ev.headers['user-agent']) || '').toLowerCase();
+      if (!ua.includes(String(rule.ua).toLowerCase())) continue;
+    }
+    out = rule.label;
+  }
+  return out;
 }
 
 function buildSynthetic(total, seed) {
@@ -1094,12 +1144,14 @@ function toFeatureMap(model, idxToToken) {
 
 export async function train({
   inputs,
+  labels = '',
   dim = DEFAULT_DIM,
   search = 48,
   bags = 8,
   synthetic = 120000,
   workers = os.availableParallelism ? os.availableParallelism() : os.cpus().length,
   realWeight = 2.5,
+  oversampleOss = 3,
   maxPerClass = 300000,
   minThreshold = 0.75,
   seed = 42,
@@ -1113,7 +1165,8 @@ export async function train({
     synthetic = Math.min(synthetic, 20000);
     workers = Math.min(workers, 2);
   }
-  const real = inputs && inputs.length ? await loadReal(inputs) : { samples: [], perFile: {} };
+  const manualLabels = labels ? loadManualLabels(labels) : [];
+  const real = inputs && inputs.length ? await loadReal(inputs, manualLabels, { oversampleOss }) : { samples: [], perFile: {} };
   const synth = synthetic > 0 ? buildSynthetic(synthetic, seed ^ 0x9e3779b9) : [];
   let samples = [...real.samples, ...synth];
   samples = capByClass(samples, maxPerClass);
@@ -1267,11 +1320,12 @@ async function main() {
   const args = process.argv.slice(2);
   const opt = {
     dim: DEFAULT_DIM, search: 48, bags: 8, synthetic: 120000, workers: os.availableParallelism ? os.availableParallelism() : os.cpus().length,
-    realWeight: 2.5, maxPerClass: 300000, minThreshold: 0.75, seed: 42, quick: false, inputs: [], out: 'risk-model.json',
+    realWeight: 2.5, oversampleOss: 3, maxPerClass: 300000, minThreshold: 0.75, seed: 42, quick: false, inputs: [], labels: '', out: 'risk-model.json',
   };
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === '--input') opt.inputs.push(args[++i]);
+    else if (a === '--labels') opt.labels = args[++i];
     else if (a === '--out') opt.out = args[++i];
     else if (a === '--dim') opt.dim = Number(args[++i]);
     else if (a === '--search') opt.search = Number(args[++i]);
@@ -1279,6 +1333,7 @@ async function main() {
     else if (a === '--synthetic') opt.synthetic = Number(args[++i]);
     else if (a === '--workers') opt.workers = Number(args[++i]);
     else if (a === '--real-weight') opt.realWeight = Number(args[++i]);
+    else if (a === '--oversample-oss') opt.oversampleOss = Number(args[++i]);
     else if (a === '--max-per-class') opt.maxPerClass = Number(args[++i]);
     else if (a === '--min-threshold') opt.minThreshold = Number(args[++i]);
     else if (a === '--seed') opt.seed = Number(args[++i]);

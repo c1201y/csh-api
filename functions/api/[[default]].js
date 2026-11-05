@@ -5216,7 +5216,7 @@ const RISK_STRONG_SIGNALS = new Set([
 
 const RISK_PROBE_RE = /(?:^|\/)(?:\.env|\.git|\.svn|\.hg|\.aws|\.ssh|wp-admin|wp-login|wp-content|phpmyadmin|xmlrpc\.php|cgi-bin|actuator|solr|console|boaform|hnap1|vendor\/phpunit|server-status|docker\.sock)(?:\/|$|\.)|(?:^|\/)\.\.(?:\/|$)|%2e%2e|etc\/passwd|proc\/self\/environ/i
 const RISK_INJECT_RE = /(?:union(?:\s|\+|%20)+(?:all(?:\s|\+|%20)+)?select\b|information_schema|sleep\s*\(|benchmark\s*\(|<script|onerror\s*=|javascript:|\bselect\b.+\bfrom\b|\bdrop\s+table\b|\bor\s+1\s*=\s*1\b)/i
-const RISK_SCANNER_UA_RE = /(sqlmap|nikto|nmap|masscan|zgrab|nuclei|acunetix|nessus|dirbuster|gobuster|wfuzz|ffuf|hydra|wpscan|joomscan|whatweb|pocsuite|xray|goby)/i
+const RISK_SCANNER_UA_RE = /(sqlmap|nikto|nmap|masscan|zgrab|nuclei|acunetix|nessus|dirbuster|gobuster|wfuzz|ffuf|hydra|wpscan|joomscan|whatweb|pocsuite|xray|goby|visionheight|l9scan|zern-scanner|leakix|censys|shodan|expanse|cortex-xpanse|palo alto|binaryedge|netlas|onyphe|internet-measurement|securitytrails|driftnet|w3af|feroxbuster|xsstrike|commix|dirsearch|nmap scripting engine)/i
 const RISK_HEADLESS_UA_RE = /(headlesschrome|phantomjs|puppeteer|playwright|selenium|scrapy)/i
 const RISK_SCRIPT_UA_RE = /(curl\/|wget\/|python-requests|python-urllib|go-http-client|java\/|okhttp|libwww|httpclient|axios\/|node-fetch)/i
 const RISK_BOT_UA_RE = /(semrushbot|ahrefsbot|mj12bot|petalbot|bytespider|dotbot|blexbot|serpstatbot)/i
@@ -8342,11 +8342,15 @@ function riskServerSignalsOfEvent(ev) {
     if (RISK_PROBE_RE.test(ev.path)) out.dl_probe = ev.path.slice(0, 80)
     if (ev.op === 'range-many') out.dl_range_abuse = ev.path.slice(0, 80)
     if (ev.op === 'hotlink') out.dl_hotlink = ev.path.slice(0, 80)
+    if (RISK_SCANNER_UA_RE.test(ev.ua)) out.scanner_ua = String(ev.ua).slice(0, 60)
+    else if (RISK_HEADLESS_UA_RE.test(ev.ua)) out.headless_ua = String(ev.ua).slice(0, 60)
   } else if (ev.src === 'mirror') {
     if (RISK_PROBE_RE.test(ev.path)) out.mirror_path = ev.path.slice(0, 80)
     if (ev.status >= 400 && ev.status < 500 && (/^\/[^/]+\/[^/]+\//.test(ev.path) || /\.git/.test(ev.path))) {
       out.mirror_repo_probe = `${ev.status} ${ev.path}`.slice(0, 80)
     }
+    if (RISK_SCANNER_UA_RE.test(ev.ua)) out.scanner_ua = String(ev.ua).slice(0, 60)
+    else if (RISK_HEADLESS_UA_RE.test(ev.ua)) out.headless_ua = String(ev.ua).slice(0, 60)
   } else if (ev.src === 'site') {
     // 全站代理：444 是 nginx 主动断连，扫描器/无头浏览器与敏感路径直接计强信号。
     if (ev.status === 444) out.site_drop = ev.path.slice(0, 80) || '444'
@@ -8923,8 +8927,8 @@ function riskServerHitCount(src, sig, n) {
   if (src === 'ssh') return has('ssh_brute', 'ssh_invalid_user', 'ssh_root_attempt', 'ssh_sudo_fail') ? n : 0
   if (src === 'oss') return has('oss_auth_fail', 'oss_list_abuse', 'oss_delete') ? n : 0
   // 多范围请求可能是下载器的分段策略，不计入硬命中，只按异常 Range 累计分数。
-  if (src === 'download') return has('dl_sign_fail', 'dl_probe', 'dl_hotlink') ? n : 0
-  if (src === 'mirror') return has('mirror_path', 'mirror_repo_probe') ? n : 0
+  if (src === 'download') return has('dl_sign_fail', 'dl_probe', 'dl_hotlink', 'scanner_ua', 'headless_ua') ? n : 0
+  if (src === 'mirror') return has('mirror_path', 'mirror_repo_probe', 'scanner_ua', 'headless_ua') ? n : 0
   // 401/403 在授权过期、站点维护时也会成批出现，不能单独触发封禁；只保留明确攻击特征。
   // 无头浏览器 UA 也可能来自正常自动化/巡检，同样只累计分数，由多类证据决定动作。
   if (src === 'site') return has('site_drop', 'probe_path', 'sensitive_query', 'scanner_ua') ? n : 0
