@@ -1,4 +1,7 @@
 
+// 搜索引擎蜘蛛识别：UA 只说明“声称是谁”，静态官方段或 DNS 验证结果才决定放行。
+import { crawlerEngineOfUa, crawlerStaticEngine, CRAWLER_ENGINE_NAMES } from './crawler-guard.js'
+
 // 必须与站点 软件数据/categories.json 的 key 保持一致（2026-10 前端改版后为以下六类）
 const CATEGORIES = ['classroom', 'office', 'system', 'media', 'network', 'utility']
 
@@ -6360,6 +6363,45 @@ const riskIpBanCache = new Map()
 const RISK_IP_BAN_CACHE_MS = 15 * 1000
 const riskMlHits = new Map()
 
+// ── 搜索引擎放行 ──────────────────────────────────────────────────────
+// 静态：Google/Bing/Apple 官方 IP 段；动态：gh-dash 对百度/搜狗/360/字节等做 DNS 正反查后写入。
+const CRAWLER_VERIFIED_PREFIX = 'crawl:verified:'
+const CRAWLER_VERIFIED_TTL = 7 * 86400000
+
+async function crawlerVerified(ip, ua, kv, cache) {
+  const engine = crawlerEngineOfUa(ua)
+  if (!engine) return ''
+  if (crawlerStaticEngine(ip, ua)) return engine
+  if (cache && cache.has(ip)) return cache.get(ip)
+  let out = ''
+  try {
+    if (kv) {
+      const hash = await riskIpHash(ip)
+      const rec = hash ? await kvJson(kv, CRAWLER_VERIFIED_PREFIX + hash) : null
+      if (rec && rec.engine === engine && alive(rec)) out = engine
+    }
+  } catch {}
+  if (cache) cache.set(ip, out)
+  return out
+}
+
+function crawlerVerifiedPut(kv, ip, engine, verified, by) {
+  return riskIpHash(ip).then(async (hash) => {
+    if (!hash) return false
+    if (!verified) {
+      await kv.delete(CRAWLER_VERIFIED_PREFIX + hash)
+      return true
+    }
+    await kvSave(kv, CRAWLER_VERIFIED_PREFIX + hash, {
+      engine: String(engine).slice(0, 24),
+      at: Date.now(),
+      by: String(by || 'dns').slice(0, 32),
+      _exp: Date.now() + CRAWLER_VERIFIED_TTL,
+    })
+    return true
+  })
+}
+
 function riskIpHash(ip) {
   const key = String(ip || '')
   if (!key) return Promise.resolve('')
@@ -8964,6 +9006,25 @@ async function riskDeviceBanApply(kv, env, device, opts) {
 }
 
 /**
+ * POST /api/admin/crawler/verify { ip, engine, verified? }
+ * 观测台用 DNS 正反查确认真实搜索引擎 IP 后回写；仅服务令牌可用。
+ */
+async function handleAdminCrawlerVerify(request, env) {
+  if (!admServiceOk(request, env)) return admJson({ error: '未登录' }, 401)
+  let body
+  try { body = await request.json() } catch { return admJson({ error: '请求格式错误' }, 400) }
+  const ip = String((body && body.ip) || '').trim().slice(0, 64)
+  const engine = String((body && body.engine) || '').trim().toLowerCase().slice(0, 24)
+  if (!ip || !CRAWLER_ENGINE_NAMES.includes(engine)) return admJson({ error: '缺少 IP 或未知引擎' }, 400)
+  const kv = await gateKv()
+  if (!kv) return admJson({ error: '状态存储不可用' }, 503)
+  const verified = body && body.verified === false ? false : true
+  await crawlerVerifiedPut(kv, ip, engine, verified, 'dns')
+  await admAudit(env, verified ? 'crawler_verify' : 'crawler_unverify', { ip, engine }).catch(() => {})
+  return admJson({ ok: true, ip, engine, verified })
+}
+
+/**
  * POST /api/admin/risk/report { source:'ssh'|'oss'|'download'|'mirror'|'site', events:[...] }
  * 观测台的近实时上报入口：事件先入历史风险，再按统一动作线决定“标记/建议限流/封禁”。
  * 只对“本次新入账”的事件做动作判定，重复上报不会不断升级封禁时长。
@@ -8986,8 +9047,11 @@ async function handleAdminRiskReport(request, env) {
 
   const now = Date.now()
   const byIp = new Map()
+  const crawlerCache = new Map()
   let ignored = 0
   for (const raw of list) {
+    // 真实搜索引擎（官方 IP 段或 DNS 已验证）不进入风险账本，避免抓取被当成扫描。
+    if (raw && raw.ua && await crawlerVerified(raw.ip, raw.ua, kv, crawlerCache)) { ignored++; continue }
     const ev = riskServerEvent({ ...raw, src: source }, source)
     if (!ev || ev.ts > now + 5 * 60000 || ev.ts < now - 7 * 86400000) { ignored++; continue }
     if (!byIp.has(ev.ip)) byIp.set(ev.ip, [])
@@ -9456,7 +9520,18 @@ async function workerFetch(request, env, ctx) {
 
     if (url.pathname === LIC_ACTIVATE_PATH) return handleLicenseActivate(request, env)
 
-    const isClientApi = url.pathname.startsWith('/api/') && !url.pathname.startsWith('/api/admin/')
+    let isClientApi = url.pathname.startsWith('/api/') && !url.pathname.startsWith('/api/admin/')
+
+    // 搜索引擎蜘蛛（官方 IP 段 / DNS 已验证）不参与限流、模型评分与自动封禁。
+    if (isClientApi) {
+      try {
+        const ua = request.headers.get('user-agent') || ''
+        if (crawlerEngineOfUa(ua)) {
+          const kv = await gateKv()
+          if (await crawlerVerified(reqIp(request), ua, kv)) isClientApi = false
+        }
+      } catch {}
+    }
 
     // 凡带设备码的客户端请求都登记一笔（激活接口自己会记，这里跳过）；异步写，不阻塞响应
     if (isClientApi) {
@@ -9610,6 +9685,7 @@ async function routeRequest(request, env, ctx) {
       if (url.pathname === '/api/admin/online' && request.method === 'GET') return handleAdminOnline(request, env)
       if (url.pathname === '/api/admin/risk' && request.method === 'GET') return handleAdminRisk(request, env)
       if (url.pathname === '/api/admin/risk/report' && request.method === 'POST') return handleAdminRiskReport(request, env)
+      if (url.pathname === '/api/admin/crawler/verify' && request.method === 'POST') return handleAdminCrawlerVerify(request, env)
       if (url.pathname === '/api/admin/risk/backfill' && (request.method === 'GET' || request.method === 'POST')) {
         return handleAdminRiskBackfill(request, env)
       }

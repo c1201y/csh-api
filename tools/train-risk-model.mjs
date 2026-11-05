@@ -18,6 +18,7 @@ import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { Worker } from 'node:worker_threads';
 import { sigmoid, summarize, bestThreshold, highThreshold, metricsAt } from './risk-metrics.mjs';
+import { crawlerStaticEngine } from '../functions/api/crawler-guard.js';
 
 export const FEATURE_VERSION = 'risk-request-v3';
 export const DEFAULT_DIM = 4096;
@@ -400,6 +401,8 @@ export function labelOf(ev) {
   const badMethod = !['GET', 'HEAD', 'POST', 'OPTIONS', 'PUT', 'DELETE', 'PATCH'].includes(method);
   const normalUa = ua.cls.startsWith('browser') || ['curl', 'wget', 'python', 'go', 'java', 'node', 'git', 'pkg', 'container'].includes(ua.cls);
 
+  // 官方 IP 段验证过的搜索引擎蜘蛛是硬负样本；仅 UA 声称不算。
+  if (crawlerStaticEngine(ev.ip, headers['user-agent'] || headers['User-Agent'])) return 0;
   if (status === 444) return 1; // nginx 滥用断连
   if (ua.cls === 'scanner' || badMethod) return 1;
   if (suspiciousPath(path, ev.service) || suspiciousQuery(query)) return 1;
