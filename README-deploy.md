@@ -183,3 +183,13 @@ SSH 日志由观测台近实时上报（`source=ssh`），失败量达标同样�
 - Win7 桌面端 `MirrorSign.cs` 端点数组首位替换为新域。
 - 网页端 `githubMirror.ts` 的 `fetchSelfSignedUrl` 同步加新域。
 - Win10 端按 `win10-sign-domain-handoff.md` 同步。
+
+## 搜索引擎蜘蛛放行
+
+- Google / Bing / Apple 使用官方 IP 段：`functions/api/crawler-ranges.js`，由
+  `tools/fetch-crawler-ranges.mjs` 生成；`.github/workflows/crawler-ranges.yml` 每周一自动拉取并提交。
+- 百度 / 搜狗 / 360 / 字节 / DuckDuckGo 没有稳定官方 JSON：观测台按 UA 识别后做 DNS 正反查
+  （PTR 落在对应域名后缀且正向解析回同一 IP），验证通过后调用
+  `POST /api/admin/crawler/verify {ip,engine}` 写入边缘 KV，csh-api 在风险入账前直接忽略。
+- 只有 **UA + IP 验证** 同时成立才放行；伪造 Googlebot 等 UA 的探测路径仍按普通扫描处理。
+
