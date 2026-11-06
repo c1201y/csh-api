@@ -5040,6 +5040,11 @@ const RISK_IP_BAN_INDEX_CAP = 300
 const RISK_IP_BAN_RETAIN_MS = 7 * 86400000
 const RISK_ML_HIT_WINDOW_MS = 10 * 60 * 1000
 const RISK_ML_HIT_CAP = 40
+// 凭据文件快速通道：扫描器往往每次只探一个路径、分多批上报，
+// 因此按 IP 在窗口内累计“不同凭据路径”，达到阈值立即封禁。
+const RISK_CRIT_PATH_PREFIX = 'lic:risk:crit:'
+const RISK_CRIT_PATH_WINDOW_MS = 15 * 60 * 1000
+const RISK_CRIT_PATH_CAP = 24
 // 误报信任名单：管理员解封并标记误报后短期不参与自动封禁，用于压低误报。
 const RISK_TRUST_PREFIX = 'lic:risk:trust:'
 const RISK_TRUST_INDEX_KEY = 'lic:risk:trust:idx'
@@ -5293,7 +5298,7 @@ const RISK_STRONG_SIGNALS = new Set([
 
 const RISK_PROBE_RE = /(?:^|\/)(?:\.env|\.git|\.svn|\.hg|\.aws|\.ssh|wp-admin|wp-login|wp-content|phpmyadmin|xmlrpc\.php|cgi-bin|actuator|solr|console|boaform|hnap1|vendor\/phpunit|server-status|docker\.sock)(?:\/|$|\.)|(?:^|\/)\.\.(?:\/|$)|%2e%2e|etc\/passwd|proc\/self\/environ/i
 // 凭据/密钥文件：正常用户不会请求，2 个不同路径即可快速封禁。
-const RISK_CRITICAL_RE = /(?:^|\/)(?:\.aws\/(?:credentials|config)|\.git\/(?:config|credentials)|\.git-credentials|\.docker\/config\.json|\.npmrc|\.netrc|\.pypirc|\.env(?:\.[a-z0-9]+)?|id_rsa|\.ssh\/(?:id_rsa|id_ed25519|config)|\.azure\/accessTokens\.json|\.config\/containers\/auth\.json|\.codex\/auth\.json|\.claude\/\.credentials\.json|\.continue\/config\.json|\.vscode\/mcp\.json|\.cursor\/mcp\.json|\.mcp\.json|credentials\.json|firebaseServiceAccountKey\.json|terraform\.tfstate|secret\.ya?ml|\.htpasswd)(?:\/|$|\.)/i
+const RISK_CRITICAL_RE = /(?:^|\/)(?:\.aws\/(?:credentials|config)|\.git\/(?:config|credentials)|\.git-credentials|\.docker\/config\.json|\.npmrc|\.netrc|\.pypirc|\.cargo\/credentials(?:\.toml)?|\.env(?:\.[a-z0-9]+)?|id_rsa|\.ssh\/(?:id_rsa|id_ed25519|config)|\.azure\/accessTokens\.json|\.config\/containers\/auth\.json|\.codex\/auth\.json|\.claude\/\.credentials\.json|\.continue\/config\.json|\.vscode\/mcp\.json|\.cursor\/mcp\.json|\.mcp\.json|credentials\.json|firebaseServiceAccountKey\.json|terraform\.tfstate|secret\.ya?ml|\.htpasswd)(?:\/|$|\.)/i
 const RISK_INJECT_RE = /(?:union(?:\s|\+|%20)+(?:all(?:\s|\+|%20)+)?select\b|information_schema|sleep\s*\(|benchmark\s*\(|<script|onerror\s*=|javascript:|\bselect\b.+\bfrom\b|\bdrop\s+table\b|\bor\s+1\s*=\s*1\b)/i
 const RISK_SCANNER_UA_RE = /(sqlmap|nikto|nmap|masscan|zgrab|nuclei|acunetix|nessus|dirbuster|gobuster|wfuzz|ffuf|hydra|wpscan|joomscan|whatweb|pocsuite|xray|goby|visionheight|l9scan|zern-scanner|leakix|censys|shodan|expanse|cortex-xpanse|palo alto|binaryedge|netlas|onyphe|internet-measurement|securitytrails|driftnet|w3af|feroxbuster|xsstrike|commix|dirsearch|nmap scripting engine)/i
 const RISK_HEADLESS_UA_RE = /(headlesschrome|phantomjs|puppeteer|playwright|selenium|scrapy)/i
@@ -6509,6 +6514,28 @@ function riskIpHash(ip) {
     }
   }
   return task
+}
+
+/**
+ * 记录该 IP 在窗口内命中过的凭据路径，返回合并后的路径表。
+ * 只存路径字符串，不存内容；条数封顶，避免被大量伪造路径刷存储。
+ */
+async function riskCriticalPathsMerge(kv, key, paths, now) {
+  let rec = null
+  try { rec = await kvJson(kv, RISK_CRIT_PATH_PREFIX + key) } catch {}
+  const stored = rec && rec.paths && typeof rec.paths === 'object' ? rec.paths : {}
+  const merged = {}
+  for (const [p, ts] of Object.entries(stored)) {
+    const t = Number(ts) || 0
+    if (t >= now - RISK_CRIT_PATH_WINDOW_MS) merged[String(p).slice(0, 160)] = t
+  }
+  for (const p of paths) merged[String(p || '').slice(0, 160)] = now
+  const out = {}
+  for (const p of Object.keys(merged).sort((a, b) => merged[b] - merged[a]).slice(0, RISK_CRIT_PATH_CAP)) out[p] = merged[p]
+  try {
+    await kvSave(kv, RISK_CRIT_PATH_PREFIX + key, { at: now, paths: out, _exp: now + RISK_CRIT_PATH_WINDOW_MS + 60000 })
+  } catch {}
+  return out
 }
 
 /** 管理员标记误报并解封后，该 IP 在指定时长内不参与自动封禁。 */
@@ -9258,19 +9285,26 @@ async function handleAdminRiskReport(request, env) {
         const decision = riskDecisionOf(conf, strong.size, paths.size, cfg)
         // 登录成功也可：先有失败、后成功，说明可能已被爆破成功。
         const invalidHit = source === 'ssh' && invalidHits >= cfg.sshInvalidHits
-        const criticalHit = source === 'site' && criticalPaths.size >= cfg.siteCriticalHits
+        // 凭据路径按窗口跨批次累计；扫描器每条路径常被拆成多批上报，
+        // 只看单批会漏掉，最后退化成等普通 hits 阈值。
+        let criticalCount = criticalPaths.size
+        if (source === 'site' && criticalPaths.size) {
+          const merged = await riskCriticalPathsMerge(kv, key, criticalPaths, now)
+          criticalCount = Object.keys(merged).length
+        }
+        const criticalHit = source === 'site' && criticalCount >= cfg.siteCriticalHits
         const hardHit = hits >= policy.hits || invalidHit || criticalHit || (source === 'ssh' && accepted && hits >= 2)
         const tier = hardHit ? 'ban' : decision.tier
         if (tier !== 'none') {
           tiers.push({
-            ip, src: source, tier, conf, hits, invalidHits, criticalHits: criticalPaths.size, evidence: strong.size, paths: paths.size,
+            ip, src: source, tier, conf, hits, invalidHits, criticalHits: criticalCount, evidence: strong.size, paths: paths.size,
             reasons: [...strong].slice(0, 6), at: newest || now,
           })
         }
         if (!cfg.on || !policy.on || riskIpAllowlisted(env, ip, cfg.allow)) continue
         if (tier !== 'ban') continue
         const rec = await riskIpBanApply(kv, env, ip, {
-          reason: hardHit ? (invalidHit ? `ssh-invalid:${invalidHits}次` : criticalHit ? `site-critical:${criticalPaths.size}类` : `${source}:${hits}次`) : `risk:${conf}/${strong.size}类`,
+          reason: hardHit ? (invalidHit ? `ssh-invalid:${invalidHits}次` : criticalHit ? `site-critical:${criticalCount}类` : `${source}:${hits}次`) : `risk:${conf}/${strong.size}类`,
           score: Math.min(100, Math.max(conf, Math.round(Math.min(100, hits * 6)))),
           signals: [...strong].slice(0, 8).concat(hardHit ? (invalidHit ? ['ssh_invalid_user', 'ssh_hits'] : criticalHit ? ['site_critical', 'site_hits'] : [`${source}_hits`]) : []),
           src: source,
@@ -9280,6 +9314,8 @@ async function handleAdminRiskReport(request, env) {
           cfg,
         })
         if (rec && !rec.skipped) {
+          // 已封禁则清空路径集合，避免管理员解封后旧证据立刻再次触发。
+          if (criticalHit) { try { await kv.delete(RISK_CRIT_PATH_PREFIX + key) } catch {} }
           actions.push({
             ip, until: rec.until, reason: rec.reason, failN: hits, conf,
             tier: 'ban', accepted, at: newest,
