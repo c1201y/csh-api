@@ -1356,6 +1356,17 @@ const SETTING_FIELDS = [
     hint: '全站代理扫描/探测在统计窗口内达到该次数即封禁。',
   },
   {
+    key: 'riskSiteCriticalHits',
+    group: 'risk',
+    label: '凭据文件快速封禁阈值',
+    type: 'num',
+    min: 1,
+    max: 20,
+    unit: '个路径',
+    def: (env) => riskEnvNum(env, 'CSH_RISK_SITE_CRITICAL_HITS', 2, 1, 20),
+    hint: '同一 IP 请求不同凭据/密钥文件（.aws、.git、.env、.npmrc 等）达到该数量即快速封禁。',
+  },
+  {
     key: 'riskDeviceLink',
     group: 'risk',
     label: '封禁联动设备码',
@@ -5104,6 +5115,7 @@ function riskAutoBanCfg(env, S) {
   cfg.dlHits = clamp(pick('riskDlHits', riskEnvNum(env, 'CSH_RISK_DL_HITS', 8, 2, 500)), 2, 500, 8)
   cfg.mirrorHits = clamp(pick('riskMirrorHits', riskEnvNum(env, 'CSH_RISK_MIRROR_HITS', 6, 2, 500)), 2, 500, 6)
   cfg.siteHits = clamp(pick('riskSiteHits', riskEnvNum(env, 'CSH_RISK_SITE_HITS', 6, 2, 500)), 2, 500, 6)
+  cfg.siteCriticalHits = clamp(pick('riskSiteCriticalHits', riskEnvNum(env, 'CSH_RISK_SITE_CRITICAL_HITS', 2, 1, 20)), 1, 20, 2)
   cfg.ossBanMin = clamp(pick('riskOssBanMin', riskEnvNum(env, 'CSH_RISK_OSS_BAN_MIN', 60, 1, 1440)), 1, 1440, 60)
   cfg.dlBanMin = clamp(pick('riskDlBanMin', riskEnvNum(env, 'CSH_RISK_DL_BAN_MIN', 30, 1, 1440)), 1, 1440, 30)
   cfg.mirrorBanMin = clamp(pick('riskMirrorBanMin', riskEnvNum(env, 'CSH_RISK_MIRROR_BAN_MIN', 30, 1, 1440)), 1, 1440, 30)
@@ -5181,6 +5193,7 @@ const RISK_WEIGHTS = {
   err4xx: 8,
   oss_list: 4,
   site_drop: 20,
+  site_critical: 60,
   // 模型只作辅助证据：阈值以上给基础分，高置信再加一档，仍不足以单独判高风险。
   ml_anomaly: 10,
   ml_high: 18,
@@ -5201,7 +5214,7 @@ const RISK_SIGNAL_CAP = {
   bad_method: 24, banned_hit: 40, ssh_brute: 45, auth_brute: 45,
   oss_auth_fail: 40, oss_delete: 40, dl_sign_fail: 40,
   ssh_invalid_user: 40, ssh_root_attempt: 40, ssh_sudo_fail: 40, ssh_accepted: 40,
-  site_drop: 40, path_sweep: 40,
+  site_drop: 40, path_sweep: 40, site_critical: 80,
 }
 const RISK_SIGNAL_CAP_DEFAULT = 40
 
@@ -5258,6 +5271,7 @@ const RISK_LABELS = {
   mirror_path: '镜像路径穿越',
   mirror_repo_probe: '镜像仓库探测',
   site_drop: '站点异常断连',
+  site_critical: '凭据/密钥文件探测',
   ml_anomaly: '模型判定异常请求',
   ml_high: '模型高置信异常',
   ml_repeat: '模型高置信重复',
@@ -5271,10 +5285,12 @@ const RISK_STRONG_SIGNALS = new Set([
   ...RISK_AUTOBAN_STRONG,
   'oss_auth_fail', 'oss_list_abuse', 'oss_delete',
   'ssh_invalid_user', 'ssh_root_attempt', 'ssh_sudo_fail', 'ssh_accepted',
-  'mirror_repo_probe', 'dl_sign_fail', 'dl_hotlink', 'site_drop',
+  'mirror_repo_probe', 'dl_sign_fail', 'dl_hotlink', 'site_drop', 'site_critical',
 ])
 
 const RISK_PROBE_RE = /(?:^|\/)(?:\.env|\.git|\.svn|\.hg|\.aws|\.ssh|wp-admin|wp-login|wp-content|phpmyadmin|xmlrpc\.php|cgi-bin|actuator|solr|console|boaform|hnap1|vendor\/phpunit|server-status|docker\.sock)(?:\/|$|\.)|(?:^|\/)\.\.(?:\/|$)|%2e%2e|etc\/passwd|proc\/self\/environ/i
+// 凭据/密钥文件：正常用户不会请求，2 个不同路径即可快速封禁。
+const RISK_CRITICAL_RE = /(?:^|\/)(?:\.aws\/(?:credentials|config)|\.git\/(?:config|credentials)|\.git-credentials|\.docker\/config\.json|\.npmrc|\.netrc|\.pypirc|\.env(?:\.[a-z0-9]+)?|id_rsa|\.ssh\/(?:id_rsa|id_ed25519|config)|\.azure\/accessTokens\.json|\.config\/containers\/auth\.json|\.codex\/auth\.json|\.claude\/\.credentials\.json|\.continue\/config\.json|\.vscode\/mcp\.json|\.cursor\/mcp\.json|\.mcp\.json|credentials\.json|firebaseServiceAccountKey\.json|terraform\.tfstate|secret\.ya?ml|\.htpasswd)(?:\/|$|\.)/i
 const RISK_INJECT_RE = /(?:union(?:\s|\+|%20)+(?:all(?:\s|\+|%20)+)?select\b|information_schema|sleep\s*\(|benchmark\s*\(|<script|onerror\s*=|javascript:|\bselect\b.+\bfrom\b|\bdrop\s+table\b|\bor\s+1\s*=\s*1\b)/i
 const RISK_SCANNER_UA_RE = /(sqlmap|nikto|nmap|masscan|zgrab|nuclei|acunetix|nessus|dirbuster|gobuster|wfuzz|ffuf|hydra|wpscan|joomscan|whatweb|pocsuite|xray|goby|visionheight|l9scan|zern-scanner|leakix|censys|shodan|expanse|cortex-xpanse|palo alto|binaryedge|netlas|onyphe|internet-measurement|securitytrails|driftnet|w3af|feroxbuster|xsstrike|commix|dirsearch|nmap scripting engine)/i
 const RISK_HEADLESS_UA_RE = /(headlesschrome|phantomjs|puppeteer|playwright|selenium|scrapy)/i
@@ -8454,6 +8470,7 @@ function riskServerSignalsOfEvent(ev) {
   } else if (ev.src === 'site') {
     // 全站代理：444 是 nginx 主动断连，扫描器/无头浏览器与敏感路径直接计强信号。
     if (ev.status === 444) out.site_drop = ev.path.slice(0, 80) || '444'
+    if (RISK_CRITICAL_RE.test(ev.path)) out.site_critical = ev.path.slice(0, 80)
     if (RISK_PROBE_RE.test(ev.path)) out.probe_path = ev.path.slice(0, 80)
     if (RISK_INJECT_RE.test(ev.path)) out.sensitive_query = ev.path.slice(0, 80)
     if (RISK_SCANNER_UA_RE.test(ev.ua)) out.scanner_ua = String(ev.ua).slice(0, 60)
@@ -9031,7 +9048,7 @@ function riskServerHitCount(src, sig, n) {
   if (src === 'mirror') return has('mirror_path', 'mirror_repo_probe', 'scanner_ua', 'headless_ua') ? n : 0
   // 401/403 在授权过期、站点维护时也会成批出现，不能单独触发封禁；只保留明确攻击特征。
   // 无头浏览器 UA 也可能来自正常自动化/巡检，同样只累计分数，由多类证据决定动作。
-  if (src === 'site') return has('site_drop', 'probe_path', 'sensitive_query', 'scanner_ua') ? n : 0
+  if (src === 'site') return has('site_drop', 'probe_path', 'sensitive_query', 'scanner_ua', 'site_critical') ? n : 0
   return 0
 }
 
@@ -9149,10 +9166,12 @@ async function handleAdminRiskReport(request, env) {
         const paths = new Set()
         const devices = new Set()
         const downloadTargets = new Set()
+        const criticalPaths = new Set()
         for (const ev of fresh) {
           if (ev.device) devices.add(ev.device)
           if (ev.ts < now - windowMs) continue
           const sig = ev._signals || {}
+          if (source === 'site' && sig.site_critical) criticalPaths.add(String(ev.path || ''))
           // 下载面的 206/304 是多线程分片/缓存命中，完全不计入动作判定。
           if (source === 'download' && (ev.status === 206 || ev.status === 304)) {
             newest = Math.max(newest, ev.ts)
@@ -9186,20 +9205,21 @@ async function handleAdminRiskReport(request, env) {
         const decision = riskDecisionOf(conf, strong.size, paths.size, cfg)
         // 登录成功也可：先有失败、后成功，说明可能已被爆破成功。
         const invalidHit = source === 'ssh' && invalidHits >= cfg.sshInvalidHits
-        const hardHit = hits >= policy.hits || invalidHit || (source === 'ssh' && accepted && hits >= 2)
+        const criticalHit = source === 'site' && criticalPaths.size >= cfg.siteCriticalHits
+        const hardHit = hits >= policy.hits || invalidHit || criticalHit || (source === 'ssh' && accepted && hits >= 2)
         const tier = hardHit ? 'ban' : decision.tier
         if (tier !== 'none') {
           tiers.push({
-            ip, src: source, tier, conf, hits, invalidHits, evidence: strong.size, paths: paths.size,
+            ip, src: source, tier, conf, hits, invalidHits, criticalHits: criticalPaths.size, evidence: strong.size, paths: paths.size,
             reasons: [...strong].slice(0, 6), at: newest || now,
           })
         }
         if (!cfg.on || !policy.on || riskIpAllowlisted(env, ip, cfg.allow)) continue
         if (tier !== 'ban') continue
         const rec = await riskIpBanApply(kv, env, ip, {
-          reason: hardHit ? (invalidHit ? `ssh-invalid:${invalidHits}次` : `${source}:${hits}次`) : `risk:${conf}/${strong.size}类`,
+          reason: hardHit ? (invalidHit ? `ssh-invalid:${invalidHits}次` : criticalHit ? `site-critical:${criticalPaths.size}类` : `${source}:${hits}次`) : `risk:${conf}/${strong.size}类`,
           score: Math.min(100, Math.max(conf, Math.round(Math.min(100, hits * 6)))),
-          signals: [...strong].slice(0, 8).concat(hardHit ? (invalidHit ? ['ssh_invalid_user', 'ssh_hits'] : [`${source}_hits`]) : []),
+          signals: [...strong].slice(0, 8).concat(hardHit ? (invalidHit ? ['ssh_invalid_user', 'ssh_hits'] : criticalHit ? ['site_critical', 'site_hits'] : [`${source}_hits`]) : []),
           src: source,
           by: `${source}-report`,
           fixedMin: policy.min,
