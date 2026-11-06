@@ -1288,12 +1288,34 @@ const SETTING_FIELDS = [
     hint: 'OSS 鉴权失败/越权列举达到阈值时封禁来源 IP；纯下载量不会触发。',
   },
   {
+    key: 'riskOssHits',
+    group: 'risk',
+    label: 'OSS 失败次数阈值',
+    type: 'num',
+    min: 2,
+    max: 500,
+    unit: '次',
+    def: (env) => riskEnvNum(env, 'CSH_RISK_OSS_HITS', 4, 2, 500),
+    hint: 'OSS 401/403、越权列举或删除在统计窗口内达到该次数即封禁。',
+  },
+  {
     key: 'riskDlBan',
     group: 'risk',
     label: '下载面联动封禁',
     type: 'bool',
     def: (env) => riskEnvFlag(env, 'CSH_RISK_DL_BAN', true),
     hint: '签名失败、路径探测、盗链达到阈值时封禁；多线程分段下载不计入。',
+  },
+  {
+    key: 'riskDlHits',
+    group: 'risk',
+    label: '下载面失败次数阈值',
+    type: 'num',
+    min: 2,
+    max: 500,
+    unit: '次',
+    def: (env) => riskEnvNum(env, 'CSH_RISK_DL_HITS', 8, 2, 500),
+    hint: '下载面签名失败、探测或盗链在统计窗口内达到该次数即封禁。',
   },
   {
     key: 'riskMirrorBan',
@@ -1304,12 +1326,34 @@ const SETTING_FIELDS = [
     hint: '镜像路径穿越/仓库探测达到阈值时封禁来源 IP。',
   },
   {
+    key: 'riskMirrorHits',
+    group: 'risk',
+    label: '镜像面失败次数阈值',
+    type: 'num',
+    min: 2,
+    max: 500,
+    unit: '次',
+    def: (env) => riskEnvNum(env, 'CSH_RISK_MIRROR_HITS', 6, 2, 500),
+    hint: '镜像面探测在统计窗口内达到该次数即封禁。',
+  },
+  {
     key: 'riskSiteBan',
     group: 'risk',
     label: '全站代理联动封禁',
     type: 'bool',
     def: (env) => riskEnvFlag(env, 'CSH_RISK_SITE_BAN', true),
     hint: '全站代理的扫描器探测、敏感路径与 444 断连达到阈值时封禁。',
+  },
+  {
+    key: 'riskSiteHits',
+    group: 'risk',
+    label: '全站代理失败次数阈值',
+    type: 'num',
+    min: 2,
+    max: 500,
+    unit: '次',
+    def: (env) => riskEnvNum(env, 'CSH_RISK_SITE_HITS', 6, 2, 500),
+    hint: '全站代理扫描/探测在统计窗口内达到该次数即封禁。',
   },
   {
     key: 'riskDeviceLink',
@@ -5056,10 +5100,10 @@ function riskAutoBanCfg(env, S) {
   cfg.siteOn = pick('riskSiteBan', riskEnvFlag(env, 'CSH_RISK_SITE_BAN', true)) !== false
   cfg.deviceLink = pick('riskDeviceLink', riskEnvFlag(env, 'CSH_RISK_DEVICE_LINK', true)) !== false
   // 分面阈值与联动时长：只统计窗口内的新增证据，调大更保守。
-  cfg.ossHits = clamp(pick('riskOssHits', riskEnvNum(env, 'CSH_RISK_OSS_HITS', 12, 2, 500)), 2, 500, 12)
+  cfg.ossHits = clamp(pick('riskOssHits', riskEnvNum(env, 'CSH_RISK_OSS_HITS', 4, 2, 500)), 2, 500, 4)
   cfg.dlHits = clamp(pick('riskDlHits', riskEnvNum(env, 'CSH_RISK_DL_HITS', 8, 2, 500)), 2, 500, 8)
   cfg.mirrorHits = clamp(pick('riskMirrorHits', riskEnvNum(env, 'CSH_RISK_MIRROR_HITS', 6, 2, 500)), 2, 500, 6)
-  cfg.siteHits = clamp(pick('riskSiteHits', riskEnvNum(env, 'CSH_RISK_SITE_HITS', 10, 2, 500)), 2, 500, 10)
+  cfg.siteHits = clamp(pick('riskSiteHits', riskEnvNum(env, 'CSH_RISK_SITE_HITS', 6, 2, 500)), 2, 500, 6)
   cfg.ossBanMin = clamp(pick('riskOssBanMin', riskEnvNum(env, 'CSH_RISK_OSS_BAN_MIN', 60, 1, 1440)), 1, 1440, 60)
   cfg.dlBanMin = clamp(pick('riskDlBanMin', riskEnvNum(env, 'CSH_RISK_DL_BAN_MIN', 30, 1, 1440)), 1, 1440, 30)
   cfg.mirrorBanMin = clamp(pick('riskMirrorBanMin', riskEnvNum(env, 'CSH_RISK_MIRROR_BAN_MIN', 30, 1, 1440)), 1, 1440, 30)
