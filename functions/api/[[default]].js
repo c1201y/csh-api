@@ -1,6 +1,9 @@
 
 // 搜索引擎蜘蛛识别：UA 只说明“声称是谁”，静态官方段或 DNS 验证结果才决定放行。
-import { crawlerEngineOfUa, crawlerStaticEngine, CRAWLER_ENGINE_NAMES } from './crawler-guard.js'
+import {
+  crawlerEngineOfUa, crawlerStaticEngine, CRAWLER_ENGINE_NAMES,
+  crawlerSanitizeRanges, crawlerApplyRanges, crawlerRangesDoc,
+} from './crawler-guard.js'
 
 // 必须与站点 软件数据/categories.json 的 key 保持一致（2026-10 前端改版后为以下六类）
 const CATEGORIES = ['classroom', 'office', 'system', 'media', 'network', 'utility']
@@ -6440,8 +6443,24 @@ const riskMlHits = new Map()
 // 静态：Google/Bing/Apple 官方 IP 段；动态：gh-dash 对百度/搜狗/360/字节等做 DNS 正反查后写入。
 const CRAWLER_VERIFIED_PREFIX = 'crawl:verified:'
 const CRAWLER_VERIFIED_TTL = 7 * 86400000
+// 官方 IP 段放 KV，运行时热更新；不再靠提交代码触发 EdgeOne 重新构建。
+const CRAWLER_RANGES_KEY = 'lic:crawler:ranges'
+const CRAWLER_RANGES_TTL = 10 * 60 * 1000
+let crawlerRangesCache = { at: 0, appliedAt: 0 }
+
+async function crawlerRangesRefresh(kv) {
+  const now = Date.now()
+  if (now - crawlerRangesCache.at < CRAWLER_RANGES_TTL) return
+  crawlerRangesCache.at = now
+  if (!kv) return
+  try {
+    const doc = await kvJson(kv, CRAWLER_RANGES_KEY)
+    if (doc && crawlerApplyRanges(doc)) crawlerRangesCache.appliedAt = Number(doc.at) || now
+  } catch {}
+}
 
 async function crawlerVerified(ip, ua, kv, cache) {
+  await crawlerRangesRefresh(kv)
   const engine = crawlerEngineOfUa(ua)
   if (!engine) return ''
   if (crawlerStaticEngine(ip, ua)) return engine
@@ -9100,6 +9119,40 @@ async function handleAdminCrawlerVerify(request, env) {
 }
 
 /**
+ * GET  /api/admin/crawler/ranges —— 当前生效的官方 IP 段与来源（kv/bundled）
+ * POST /api/admin/crawler/ranges { ranges: { googlebot: { v4: [...], v6: [...] }, ... } }
+ * 运行时热更新，只写 KV，不触发 EdgeOne 代码构建/发布。
+ */
+async function handleAdminCrawlerRanges(request, env) {
+  if (!admServiceOk(request, env)) {
+    const sess = await admSession(request, env)
+    if (!sess) return admJson({ error: '未登录' }, 401)
+  }
+  const kv = await gateKv()
+  if (!kv) return admJson({ error: '状态存储不可用' }, 503)
+  if (request.method === 'GET') {
+    const doc = await kvJson(kv, CRAWLER_RANGES_KEY)
+    return admJson({
+      ok: true,
+      stored: !!doc,
+      at: Number(doc && doc.at) || 0,
+      source: doc ? 'kv' : 'bundled',
+      ranges: crawlerRangesDoc(),
+    })
+  }
+  let body
+  try { body = await request.json() } catch { return admJson({ error: '请求格式错误' }, 400) }
+  const ranges = crawlerSanitizeRanges(body && body.ranges)
+  if (!ranges) return admJson({ error: 'ranges 为空或格式错误' }, 400)
+  const at = Date.now()
+  await kvSave(kv, CRAWLER_RANGES_KEY, { at, ranges, by: admUser(env), src: 'feed' })
+  crawlerApplyRanges({ ranges })
+  crawlerRangesCache = { at, appliedAt: at }
+  await admAudit(env, 'crawler_ranges', { engines: Object.keys(ranges).length }).catch(() => {})
+  return admJson({ ok: true, at, engines: Object.keys(ranges).length, ranges })
+}
+
+/**
  * POST /api/admin/risk/report { source:'ssh'|'oss'|'download'|'mirror'|'site', events:[...] }
  * 观测台的近实时上报入口：事件先入历史风险，再按统一动作线决定“标记/建议限流/封禁”。
  * 只对“本次新入账”的事件做动作判定，重复上报不会不断升级封禁时长。
@@ -9785,6 +9838,9 @@ async function routeRequest(request, env, ctx) {
       if (url.pathname === '/api/admin/risk' && request.method === 'GET') return handleAdminRisk(request, env)
       if (url.pathname === '/api/admin/risk/report' && request.method === 'POST') return handleAdminRiskReport(request, env)
       if (url.pathname === '/api/admin/crawler/verify' && request.method === 'POST') return handleAdminCrawlerVerify(request, env)
+      if (url.pathname === '/api/admin/crawler/ranges' && (request.method === 'GET' || request.method === 'POST')) {
+        return handleAdminCrawlerRanges(request, env)
+      }
       if (url.pathname === '/api/admin/risk/backfill' && (request.method === 'GET' || request.method === 'POST')) {
         return handleAdminRiskBackfill(request, env)
       }

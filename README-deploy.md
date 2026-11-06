@@ -186,10 +186,34 @@ SSH 日志由观测台近实时上报（`source=ssh`），失败量达标同样�
 
 ## 搜索引擎蜘蛛放行
 
-- Google / Bing / Apple 使用官方 IP 段：`functions/api/crawler-ranges.js`，由
-  `tools/fetch-crawler-ranges.mjs` 生成；`.github/workflows/crawler-ranges.yml` 每周一自动拉取并提交。
+- Google / Bing / Apple 使用官方 IP 段：仓库内 `functions/api/crawler-ranges.js` 只作**兜底**；
+  运行时优先读取 KV `lic:crawler:ranges`（10 分钟缓存），通过
+  `GET/POST /api/admin/crawler/ranges` 热更新。
+- `.github/workflows/crawler-ranges.yml` 每周一拉取官方段后**直接写 KV**（`--upload --no-file`），
+  不再提交代码，因此不会触发 EdgeOne 构建/发布。
 - 百度 / 搜狗 / 360 / 字节 / DuckDuckGo 没有稳定官方 JSON：观测台按 UA 识别后做 DNS 正反查
   （PTR 落在对应域名后缀且正向解析回同一 IP），验证通过后调用
   `POST /api/admin/crawler/verify {ip,engine}` 写入边缘 KV，csh-api 在风险入账前直接忽略。
 - 只有 **UA + IP 验证** 同时成立才放行；伪造 Googlebot 等 UA 的探测路径仍按普通扫描处理。
+
+## 运行时数据与发布边界（降低 EdgeOne 重建频率）
+
+EdgeOne Pages 的 Git 集成会在**每次 push 生产分支**时重新构建并发布函数代码，构建次数有月度配额。
+因此运行期会变的数据一律放 KV，只有代码逻辑变更才 push：
+
+| 数据 | 存储位置 | 更新方式 | 触发重建 |
+|---|---|---|---|
+| IP 封禁 / 解封 | `lic:banip:<hash>` + `lic:banip:idx` | `POST /api/admin/ip-ban` / `ip-unban`、风险引擎自动写入 | 否 |
+| 风险阈值 / 白名单 / 信任期 | `cfg:settings`（KV） | `POST /api/admin/settings` | 否 |
+| 风险模型权重 | `lic:risk:model` / `lic:risk:model:prev` | 观测台上传、自学习、回滚 | 否 |
+| 搜索引擎 IP 段 | `lic:crawler:ranges` | 每周工作流写 KV / 后台 API | 否 |
+| DNS 验证的蜘蛛 IP | `crawl:verified:<hash>`（7 天） | `POST /api/admin/crawler/verify` | 否 |
+| 函数逻辑 / 新端点 | `functions/` | push 后 Git 集成构建 | **是** |
+| 环境变量 | EdgeOne 控制台 | 改完需再触发一次部署才注入 | **是** |
+
+- 两台服务器上的 `csh-edge-bans` 每 10 秒请求 `GET /api/admin/ip-bans`，只在清单变化时重写
+  nginx deny 并 reload；它**不调用** EdgeOne API，也不会触发函数重新发布。
+- 10 秒轮询在免费额度内的量级：2 台 × 8640 次/天 ≈ 1.7 万次/天（约 52 万次/月），
+  属于边缘函数请求计数，但不是同步/部署费用。
+- 建议把同一批改动合并成一次 push；功能性发布与数据/配置调整分开，避免把数据变更做成代码发布。
 

@@ -5,6 +5,58 @@ import { CRAWLER_RANGES, CRAWLER_UA_PATTERNS, CRAWLER_DNS_SUFFIXES } from './cra
 const UA_RULES = CRAWLER_UA_PATTERNS.map((x) => ({ engine: x.engine, re: new RegExp(x.pattern, 'i') }))
 export const CRAWLER_ENGINE_NAMES = UA_RULES.map((x) => x.engine)
 
+// 官方 IP 段会变，但没有必要时时刻刻改代码重发布：运行时可从 KV 覆盖，
+// 内置 crawler-ranges.js 只作兜底。覆盖值只在引擎名已存在时生效，避免被写入任意键。
+let LIVE_RANGES = CRAWLER_RANGES
+const CIDR_RE = /^[0-9a-fA-F:.]{2,64}\/\d{1,3}$/
+const CRAWLER_RANGE_MAX = 8000
+
+function sanitizeRanges(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return null
+  const known = new Set(CRAWLER_ENGINE_NAMES)
+  const out = {}
+  let total = 0
+  for (const [engine, value] of Object.entries(input)) {
+    if (!known.has(engine) || !value || typeof value !== 'object') continue
+    const v4 = []
+    const v6 = []
+    for (const [bucket, list] of [['v4', value.v4], ['v6', value.v6]]) {
+      if (!Array.isArray(list)) continue
+      for (const raw of list) {
+        if (total >= CRAWLER_RANGE_MAX) break
+        const cidr = String(raw == null ? '' : raw).trim()
+        if (!CIDR_RE.test(cidr)) continue
+        if (bucket === 'v4' ? !cidr.includes('.') : !cidr.includes(':')) continue
+        const target = bucket === 'v4' ? v4 : v6
+        if (target.includes(cidr)) continue
+        target.push(cidr)
+        total += 1
+      }
+    }
+    if (v4.length || v6.length) out[engine] = { v4, v6 }
+  }
+  return Object.keys(out).length ? out : null
+}
+
+/** 校验并返回可落库的 IP 段；空/非法返回 null。 */
+export function crawlerSanitizeRanges(input) {
+  return sanitizeRanges(input)
+}
+
+/** 用 KV 里的文档覆盖运行时 IP 段；返回是否生效。 */
+export function crawlerApplyRanges(doc) {
+  const ranges = sanitizeRanges(doc && doc.ranges)
+  if (!ranges) return false
+  // 按引擎合并：某个官方源拉取失败时继续沿用上一版，不会把该引擎整个丢掉。
+  LIVE_RANGES = { ...LIVE_RANGES, ...ranges }
+  return true
+}
+
+/** 当前生效的 IP 段（用于后台查看/导出）。 */
+export function crawlerRangesDoc() {
+  return LIVE_RANGES
+}
+
 /** 按 UA 判断声称的搜索引擎；未知返回空字符串。 */
 export function crawlerEngineOfUa(ua) {
   const text = String(ua || '')
@@ -76,7 +128,7 @@ function cidrMatch(ip, cidr) {
 export function crawlerStaticEngine(ip, ua) {
   const engine = crawlerEngineOfUa(ua)
   if (!engine) return ''
-  const ranges = CRAWLER_RANGES[engine]
+  const ranges = LIVE_RANGES[engine]
   if (!ranges) return ''
   const list = [...(ranges.v4 || []), ...(ranges.v6 || [])]
   for (const cidr of list) if (cidrMatch(ip, cidr)) return engine
@@ -88,5 +140,5 @@ export function crawlerIsStatic(ip, ua) {
 }
 
 export function crawlerRangeCount() {
-  return Object.values(CRAWLER_RANGES).reduce((n, x) => n + (x.v4 || []).length + (x.v6 || []).length, 0)
+  return Object.values(LIVE_RANGES).reduce((n, x) => n + (x.v4 || []).length + (x.v6 || []).length, 0)
 }
