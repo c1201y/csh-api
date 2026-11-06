@@ -9148,11 +9148,29 @@ async function handleAdminRiskReport(request, env) {
         const strong = new Set()
         const paths = new Set()
         const devices = new Set()
+        const downloadTargets = new Set()
         for (const ev of fresh) {
           if (ev.device) devices.add(ev.device)
           if (ev.ts < now - windowMs) continue
           const sig = ev._signals || {}
-          hits += riskServerHitCount(source, sig, ev.n)
+          // 下载面的 206/304 是多线程分片/缓存命中，完全不计入动作判定。
+          if (source === 'download' && (ev.status === 206 || ev.status === 304)) {
+            newest = Math.max(newest, ev.ts)
+            continue
+          }
+          if (source === 'download') {
+            // 同一目标文件无论多少分片/并发只算一次；不同目标才累计。
+            const target = String(ev.path || '-')
+            if (!downloadTargets.has(target)) {
+              const n = riskServerHitCount(source, sig, ev.n)
+              if (n > 0) {
+                downloadTargets.add(target)
+                hits += 1
+              }
+            }
+          } else {
+            hits += riskServerHitCount(source, sig, ev.n)
+          }
           if (source === 'ssh' && sig.ssh_invalid_user) invalidHits += Math.max(1, Number(ev.n) || 1)
           for (const name of Object.keys(sig)) if (RISK_STRONG_SIGNALS.has(name)) strong.add(name)
           if (ev.path) paths.add(ev.path)
