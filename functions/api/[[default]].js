@@ -1183,6 +1183,17 @@ const SETTING_FIELDS = [
     hint: '统计窗口内累计失败次数达到该值即封禁。',
   },
   {
+    key: 'riskSshInvalidHits',
+    group: 'risk',
+    label: 'SSH 无效用户名阈值',
+    type: 'num',
+    min: 1,
+    max: 100,
+    unit: '次',
+    def: (env) => riskEnvNum(env, 'CSH_RISK_SSH_INVALID_HITS', 3, 1, 100),
+    hint: '使用不存在的用户名尝试登录时，达到该次数即加速封禁，通常应低于总失败阈值。',
+  },
+  {
     key: 'riskSshBanMin',
     group: 'risk',
     label: 'SSH 联动封禁时长',
@@ -5015,6 +5026,7 @@ function riskAutoBanCfg(env, S) {
     maxMin: pick('riskBanMaxMin', riskEnvNum(env, 'CSH_RISK_AUTOBAN_MAX_MIN', 60, 1, 1440)),
     sshOn: pick('riskSshBan', riskEnvFlag(env, 'CSH_RISK_SSH_BAN', true)),
     sshHits: pick('riskSshHits', riskEnvNum(env, 'CSH_RISK_SSH_BAN_HITS', 8, 2, 500)),
+    sshInvalidHits: pick('riskSshInvalidHits', riskEnvNum(env, 'CSH_RISK_SSH_INVALID_HITS', 3, 1, 100)),
     sshMin: pick('riskSshBanMin', riskEnvNum(env, 'CSH_RISK_SSH_BAN_MIN', 60, 1, 1440)),
     sshWindowMs: Number.isFinite(winMin) && winMin > 0
       ? Math.max(60000, Math.min(86400000, Math.round(winMin * 60000)))
@@ -5024,6 +5036,7 @@ function riskAutoBanCfg(env, S) {
       .map((s) => s.trim())
       .filter(Boolean),
   }
+  cfg.sshInvalidHits = Math.max(1, Math.min(cfg.sshHits, Number(cfg.sshInvalidHits) || 3))
   const clamp = (n, lo, hi, fb) => {
     const v = Number(n)
     return Number.isFinite(v) ? Math.max(lo, Math.min(hi, v)) : fb
@@ -9085,6 +9098,7 @@ async function handleAdminRiskReport(request, env) {
         if (r.rec) indexEntries.push({ kind: 'i', id: ip, rec: r.rec })
 
         let hits = 0
+        let invalidHits = 0
         let accepted = false
         let newest = 0
         const strong = new Set()
@@ -9095,6 +9109,7 @@ async function handleAdminRiskReport(request, env) {
           if (ev.ts < now - windowMs) continue
           const sig = ev._signals || {}
           hits += riskServerHitCount(source, sig, ev.n)
+          if (source === 'ssh' && sig.ssh_invalid_user) invalidHits += Math.max(1, Number(ev.n) || 1)
           for (const name of Object.keys(sig)) if (RISK_STRONG_SIGNALS.has(name)) strong.add(name)
           if (ev.path) paths.add(ev.path)
           if (sig.ssh_accepted) accepted = true
@@ -9108,20 +9123,21 @@ async function handleAdminRiskReport(request, env) {
         const conf = riskCombinedFresh(r.rec || prev, now)
         const decision = riskDecisionOf(conf, strong.size, paths.size, cfg)
         // 登录成功也可：先有失败、后成功，说明可能已被爆破成功。
-        const hardHit = hits >= policy.hits || (source === 'ssh' && accepted && hits >= 2)
+        const invalidHit = source === 'ssh' && invalidHits >= cfg.sshInvalidHits
+        const hardHit = hits >= policy.hits || invalidHit || (source === 'ssh' && accepted && hits >= 2)
         const tier = hardHit ? 'ban' : decision.tier
         if (tier !== 'none') {
           tiers.push({
-            ip, src: source, tier, conf, hits, evidence: strong.size, paths: paths.size,
+            ip, src: source, tier, conf, hits, invalidHits, evidence: strong.size, paths: paths.size,
             reasons: [...strong].slice(0, 6), at: newest || now,
           })
         }
         if (!cfg.on || !policy.on || riskIpAllowlisted(env, ip, cfg.allow)) continue
         if (tier !== 'ban') continue
         const rec = await riskIpBanApply(kv, env, ip, {
-          reason: hardHit ? `${source}:${hits}次` : `risk:${conf}/${strong.size}类`,
+          reason: hardHit ? (invalidHit ? `ssh-invalid:${invalidHits}次` : `${source}:${hits}次`) : `risk:${conf}/${strong.size}类`,
           score: Math.min(100, Math.max(conf, Math.round(Math.min(100, hits * 6)))),
-          signals: [...strong].slice(0, 8).concat(hardHit ? [`${source}_hits`] : []),
+          signals: [...strong].slice(0, 8).concat(hardHit ? (invalidHit ? ['ssh_invalid_user', 'ssh_hits'] : [`${source}_hits`]) : []),
           src: source,
           by: `${source}-report`,
           fixedMin: policy.min,
